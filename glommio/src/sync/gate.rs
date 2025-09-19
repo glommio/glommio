@@ -24,6 +24,36 @@ pub struct Pass {
     gate: Rc<GateInner>,
 }
 
+impl Pass {
+    /// A new pass is attempted to be retrieved from the same gate as this pass, honoring
+    /// the request on the gate to close.
+    ///
+    /// # Errors
+    ///
+    /// If the gate was requested to close, this returns an error. If you want to
+    /// clone unconditionally and forcefully delay closure, use [`Self::clone_ignoring_gate_closure`].
+    pub fn try_clone(&self) -> Result<Self, GlommioError<()>> {
+        self.gate.enter().map(|()| Self {
+            gate: self.gate.clone(),
+        })
+    }
+
+    /// Unlike [`Self::try_clone`], this will forcibly cause a new pass to be created
+    /// even if a closure was requested. This isn't explicitly [Clone] to avoid accidentally
+    /// cloning a pass without realizing that it prolongs the lifetime of the gate while
+    /// ignoring any ongoing closure attempt. If you want to honor the gate closure,
+    /// then use [`Self::try_clone`]. The resulting gate is then extended by the additional
+    /// lifetime the cloned [Pass] is held for (if it's held for longer than all other
+    /// passes already handed out).
+    pub fn clone_ignoring_gate_closure(&self) -> Self {
+        let cloned = Self {
+            gate: self.gate.clone(),
+        };
+        cloned.gate.force_increment();
+        cloned
+    }
+}
+
 impl Drop for Pass {
     fn drop(&mut self) {
         self.gate.leave()
@@ -89,7 +119,8 @@ impl Gate {
     ///
     /// NOTE: After this function returns, [is_open](Self::is_open) returns false and any subsequent attempts to acquire
     /// a pass will fail, even if you drop the future. The future will return an error if and only if the gate is
-    /// already fully closed
+    /// already fully closed. The only way to acquire a new pass in this state is to call
+    /// [Pass::clone_ignoring_gate_closure] on an existing [Pass] handle.
     pub fn close(&self) -> impl Future<Output = Result<(), GlommioError<()>>> {
         self.inner.close()
     }
@@ -124,6 +155,10 @@ impl GateInner {
             self.count.set(self.count.get() + 1);
         }
         open
+    }
+
+    fn force_increment(&self) {
+        self.count.set(self.count.get() + 1);
     }
 
     pub fn enter(&self) -> Result<(), GlommioError<()>> {
@@ -211,6 +246,8 @@ mod tests {
     use crate::sync::Semaphore;
     use crate::{enclose, timer::timeout, LocalExecutor};
     use futures::{join, FutureExt};
+    use futures_lite::pin;
+    use std::task::{Context, Waker};
     use std::time::Duration;
 
     #[test]
@@ -411,5 +448,45 @@ mod tests {
             std::mem::drop(pass);
             close1.await.expect("Closure signal should still arrive");
         })
+    }
+
+    #[test]
+    fn pass_is_cloneable_if_ignoring_pending_closure() {
+        LocalExecutor::default().run(async {
+            let gate = Gate::new();
+            let pass1 = gate.enter().unwrap();
+            let pass2 = pass1.try_clone().unwrap();
+            assert_eq!(2, gate.inner.count.get());
+
+            let closure = gate.close();
+            pin!(closure);
+
+            assert!(pass2.try_clone().is_err());
+            assert_eq!(2, gate.inner.count.get());
+            let pass3 = pass2.clone_ignoring_gate_closure();
+            assert_eq!(3, gate.inner.count.get());
+            drop(pass3);
+
+            let dummy_waker = Waker::noop();
+            let cx = &mut Context::from_waker(dummy_waker);
+            assert!(closure.as_mut().poll(cx).is_pending());
+            assert!(!gate.is_open());
+            assert!(pass1.try_clone().is_err());
+            assert!(pass2.try_clone().is_err());
+
+            assert_eq!(2, gate.inner.count.get());
+
+            drop(pass1);
+
+            assert_eq!(1, gate.inner.count.get());
+            assert!(!gate.is_closed());
+            assert!(closure.as_mut().poll(cx).is_pending());
+
+            drop(pass2);
+
+            assert_eq!(0, gate.inner.count.get());
+            assert!(gate.is_closed());
+            assert!(closure.as_mut().poll(cx).is_ready());
+        });
     }
 }

@@ -5,7 +5,7 @@ use glommio::{
     io::{ImmutableFile, ImmutableFileBuilder},
     Latency, LocalExecutorBuilder, Placement, Shares,
 };
-use rand::Rng;
+use rand::RngExt;
 use std::{
     cell::{Cell, RefCell},
     path::PathBuf,

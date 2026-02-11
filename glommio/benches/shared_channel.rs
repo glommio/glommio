@@ -1,5 +1,5 @@
 use glommio::{channels::shared_channel, enclose, prelude::*};
-use rand::Rng;
+use rand::RngExt;
 use std::{sync::mpsc::sync_channel, time::Instant};
 
 fn test_spsc(capacity: usize) {

@@ -111,18 +111,18 @@ struct ReceiverState<V: Send + Sized> {
     buffer: Consumer<V>,
 }
 
-struct Connector<T: BufferHalf + Clone> {
+struct Connector<T: BufferHalf> {
     buffer: T,
     reactor: Weak<Reactor>,
 }
 
-impl<T: BufferHalf + Clone> Connector<T> {
+impl<T: BufferHalf> Connector<T> {
     fn new(buffer: T, reactor: Weak<Reactor>) -> Self {
         Self { buffer, reactor }
     }
 }
 
-impl<T: BufferHalf + Clone> Future for Connector<T> {
+impl<T: BufferHalf> Future for Connector<T> {
     type Output = Arc<SleepNotifier>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let reactor = self.reactor.upgrade().unwrap();
@@ -173,7 +173,7 @@ impl<T: 'static + Send + Sized> SharedSender<T> {
         }}));
 
         let reactor = Rc::downgrade(&reactor);
-        let peer = Connector::new(state.buffer.clone(), reactor.clone());
+        let peer = Connector::new(state.buffer.clone_internal(), reactor.clone());
         let notifier = peer.await;
         ConnectedSender {
             id,
@@ -338,7 +338,7 @@ impl<T: 'static + Send + Sized> SharedReceiver<T> {
         }}));
 
         let reactor = Rc::downgrade(&reactor);
-        let peer = Connector::new(state.buffer.clone(), reactor.clone());
+        let peer = Connector::new(state.buffer.clone_internal(), reactor.clone());
         let notifier = peer.await;
         ConnectedReceiver {
             id,

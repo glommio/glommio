@@ -80,27 +80,80 @@ impl<T> fmt::Debug for Buffer<T> {
             .finish()
     }
 }
+unsafe impl<T: Sync> Sync for Buffer<T> {}
 
-/// A handle to the queue which allows consuming values from the buffer
+/// A handle to the queue which allows consuming values from the buffer.
+///
+/// # SPSC Guarantee
+///
+/// This type does NOT implement `Clone`. The queue is designed as a
+/// Single-Producer-Single-Consumer (SPSC) queue, and allowing multiple
+/// consumers would violate memory safety guarantees.
+///
+/// Cloning the consumer would allow multiple threads to concurrently call
+/// `try_pop()`, which uses `Ordering::Relaxed` and assumes exclusive access.
+/// This can lead to:
+/// - Multiple consumers reading the same value from the queue
+/// - Double-free when both consumers drop the same value
+/// - Heap corruption and undefined behavior
+///
+/// See issue #700 for details.
 pub struct Consumer<T> {
     pub(crate) buffer: Arc<Buffer<T>>,
 }
 
-impl<T> Clone for Consumer<T> {
-    fn clone(&self) -> Self {
+impl<T> Consumer<T> {
+    /// Internal cloning method for use within glommio.
+    ///
+    /// # Safety
+    ///
+    /// This is intentionally NOT exposed via the Clone trait to prevent
+    /// external code from creating multiple consumers, which would violate
+    /// SPSC guarantees and cause memory corruption.
+    ///
+    /// Internal use within glommio (e.g., shared_channel) must ensure that
+    /// only one consumer is actually active at any time, even if multiple
+    /// Consumer handles exist temporarily during handoff.
+    pub(crate) fn clone_internal(&self) -> Self {
         Consumer {
             buffer: self.buffer.clone(),
         }
     }
 }
 
-/// A handle to the queue which allows adding values onto the buffer
+/// A handle to the queue which allows adding values onto the buffer.
+///
+/// # SPSC Guarantee
+///
+/// This type does NOT implement `Clone`. The queue is designed as a
+/// Single-Producer-Single-Consumer (SPSC) queue, and allowing multiple
+/// producers would violate memory safety guarantees.
+///
+/// Cloning the producer would allow multiple threads to concurrently call
+/// `try_push()`, which uses `Ordering::Relaxed` and assumes exclusive access.
+/// This can lead to:
+/// - Multiple producers writing to the same slot
+/// - Values being overwritten without being dropped (memory leak)
+/// - Lost updates and data corruption
+///
+/// See issue #700 for details.
 pub struct Producer<T> {
     pub(crate) buffer: Arc<Buffer<T>>,
 }
 
-impl<T> Clone for Producer<T> {
-    fn clone(&self) -> Self {
+impl<T> Producer<T> {
+    /// Internal cloning method for use within glommio.
+    ///
+    /// # Safety
+    ///
+    /// This is intentionally NOT exposed via the Clone trait to prevent
+    /// external code from creating multiple producers, which would violate
+    /// SPSC guarantees and cause memory corruption.
+    ///
+    /// Internal use within glommio (e.g., shared_channel) must ensure that
+    /// only one producer is actually active at any time, even if multiple
+    /// Producer handles exist temporarily during handoff.
+    pub(crate) fn clone_internal(&self) -> Self {
         Producer {
             buffer: self.buffer.clone(),
         }

@@ -15,6 +15,34 @@ contributors.
 If you are interested in understanding these motivations a bit better, you can check out
 [this article.](https://medium.com/@glaubercosta_11125/the-linux-development-process-is-it-worth-the-hassle-4f09d7ff09a2)
 
+## Tooling and Formatting
+
+This project uses several tools to maintain code quality and consistency:
+
+### Cargo Sort
+We use `cargo sort` to keep our dependencies sorted in `Cargo.toml` files. This ensures consistent ordering for better readability and easier diff views.
+
+Install with:
+```bash
+cargo install cargo-sort
+```
+
+### Taplo
+We use [Taplo](https://taplo.tamasfe.dev/) for formatting and validating TOML files, including `Cargo.toml`. It ensures consistent formatting across all TOML configurations in this repository.
+
+Install with:
+```bash
+cargo install taplo-cli --locked
+```
+
+### ClIFF
+We use [ClIFF](https://github.com/orhun/cliff) for generating changelogs. This tool helps maintain consistent and automated changelog generation from git history.
+
+Install with:
+```bash
+cargo install git-cliff
+```
+
 ## Pull Request Process
 
 As of today (September 2021), this is the set of rules that materialize the principles above:

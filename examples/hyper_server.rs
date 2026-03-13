@@ -126,11 +126,10 @@ mod hyper_compat {
                     let io = HyperStream(stream);
                     glommio::spawn_local(enclose! {(conn_control) async move {
                         let _permit = conn_control.acquire_permit(1).await;
-                        if let Err(err) = hyper::server::conn::http1::Builder::new().serve_connection(io, service_fn(service)).await {
-                            if !err.is_incomplete_message() {
+                        if let Err(err) = hyper::server::conn::http1::Builder::new().serve_connection(io, service_fn(service)).await
+                            && !err.is_incomplete_message() {
                                 eprintln!("Stream from {addr:?} failed with error {err:?}");
                             }
-                        }
                     }}).detach();
                 }
             }
@@ -160,11 +159,10 @@ mod hyper_compat {
                     let io = HyperStream(stream);
                     glommio::spawn_local(enclose! {(conn_control) async move {
                         let _permit = conn_control.acquire_permit(1).await;
-                        if let Err(err) = hyper::server::conn::http2::Builder::new(HyperExecutor).serve_connection(io, service_fn(service)).await {
-                            if !err.is_incomplete_message() {
+                        if let Err(err) = hyper::server::conn::http2::Builder::new(HyperExecutor).serve_connection(io, service_fn(service)).await
+                            && !err.is_incomplete_message() {
                                 eprintln!("Stream from {addr:?} failed with error {err:?}");
                             }
-                        }
                     }}).detach();
                 }
             }

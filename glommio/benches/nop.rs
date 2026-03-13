@@ -98,7 +98,7 @@ async fn run_bench_tasks(num_tasks: u32, num_events: u32) -> Measurement {
         let task_duration = handle.await;
         task_duration_sum += task_duration;
     }
-    let average_task_duration = task_duration_sum / num_tasks as u32;
+    let average_task_duration = task_duration_sum / num_tasks;
     Measurement {
         total_events: num_events,
         total_tasks: num_tasks,

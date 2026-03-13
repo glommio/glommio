@@ -10,9 +10,9 @@ on:
     branches: [ main ]
 
 jobs:
+
   doc:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -29,9 +29,19 @@ jobs:
       - name: Validate links
         run: cargo deadlinks --dir target/doc/glommio
 
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Cache setup
+      uses: ./.github/actions/cache-setup
+    - run: cargo fmt --all -- --check
+    - run: cargo clippy --all --all-targets --all-features
+    - run: cargo install cargo-sort
+    - run: cargo sort -w -c 
+
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -44,7 +54,6 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v3

@@ -1,6 +1,7 @@
 use std::{env, path::*, process::Command};
 
 use cc::Build;
+use rustc_version::Channel;
 
 fn main() {
     let project = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
@@ -47,4 +48,10 @@ fn main() {
         .flag("-D_GNU_SOURCE")
         .include(&configured_include)
         .compile("rusturing");
+    if rustc_version::version_meta()
+        .map(|meta| Channel::Nightly == meta.channel)
+        .unwrap_or(false)
+    {
+        println!("cargo:rustc-cfg=nightly");
+    }
 }

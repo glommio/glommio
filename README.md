@@ -1,15 +1,19 @@
 # glommio
 
-[![crates.io](https://img.shields.io/crates/v/glommio)](https://crates.io/crates/glommio)
-[![docs.rs](https://docs.rs/glommio/badge.svg)](https://docs.rs/glommio/latest/glommio/)
-![license](https://img.shields.io/crates/l/glommio)
-[![project chat](https://img.shields.io/badge/zulip-join_chat-brightgreen.svg)](https://glommio.zulipchat.com)
-[![CI](https://github.com/DataDog/glommio/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/DataDog/glommio/actions/workflows/ci.yml)
+<!--toc:start-->
+- [glommio](#glommio)
+  - [New Fork](#new-fork)
+  - [What is Glommio?](#what-is-glommio)
+  - [Supported Rust Versions](#supported-rust-versions)
+  - [Supported Linux kernels](#supported-linux-kernels)
+  - [Contributing](#contributing)
+  - [License](#license)
+<!--toc:end-->
 
-## Join our Zulip community!
+## New Fork
 
-If you are interested in Glommio, consider joining our [Zulip](https://glommio.zulipchat.com) community. Tell us about
-exciting applications you are building, ask for help, or just chat with friends 😃
+Welcome to the new hard fork of Glommio. Some story why it was forked can be found [here](https://github.com/DataDog/glommio/issues/707),
+while TL;DR is - in this fork we are going to keep glommio up to date with fresh versions of io_uring and other dependencies.
 
 ## What is Glommio?
 
@@ -64,13 +68,13 @@ $ ulimit -l
 
 ## Contributing
 
-See [Contributing.](CONTRIBUTING.md)
+See [](/CONTRIBUTING.md)
 
 ## License
 
 Licensed under either of
 
-* Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-* MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+* Apache License, Version 2.0 ([](/LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license ([](/LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.

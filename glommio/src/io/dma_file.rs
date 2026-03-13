@@ -610,7 +610,7 @@ impl DmaFile {
     /// ([`allocated_file_size`])
     ///
     /// [`fallocate`]: https://man7.org/linux/man-pages/man2/fallocate.2.html
-    /// [`allocated_file_size`]: struct.Stat.html#structfield.alloc_dma_buffer
+    /// [`allocated_file_size`]: struct.reactor::Reactor.html#method.alloc_dma_buffer
     pub async fn deallocate(&self, offset: u64, size: u64) -> Result<()> {
         self.file.deallocate(offset, size).await
     }

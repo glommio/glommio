@@ -1676,7 +1676,7 @@ impl Reactor {
             &mut *self.ring_for_source(source),
             source,
             UringOpDescriptor::Nop,
-            &mut *self.source_map.borrow_mut(),
+            &mut self.source_map.borrow_mut(),
         );
     }
 

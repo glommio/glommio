@@ -1,7 +1,7 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the MIT/Apache-2.0 License, at your convenience
 //
-// This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
+// This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //
 use crate::io::{
     dma_file::{DmaFile, Result},
@@ -91,7 +91,7 @@ impl OpenOptions {
     /// [man page].
     ///
     /// [`dma_open`]: struct.OpenOptions.html#method.dma_open
-    /// [`write_at`]: ../struct.DmaFile.html#method.write_at
+    /// [`write_at`]: struct.DmaFile.html#method.write_at
     /// [man page]: https://man7.org/linux/man-pages/man2/open.2.html
     pub fn append(&mut self, append: bool) -> &mut Self {
         self.append = append;

@@ -160,7 +160,7 @@ mod ref_count {
                 drop(handle);
                 yield_now().await;
                 let waker = task.take_waker().unwrap();
-                waker.clone().wake();
+                waker.wake_by_ref();
                 yield_now().await;
                 assert_eq!(2, TaskDebugger::task_count());
                 waker.wake();
@@ -180,7 +180,7 @@ mod ref_count {
                 drop(handle);
                 yield_now().await;
                 let waker = task.take_waker().unwrap();
-                waker.clone().wake();
+                waker.wake_by_ref();
                 yield_now().await;
                 assert_eq!(2, TaskDebugger::task_count());
                 drop(waker);

@@ -1,0 +1,11 @@
+allowed_blank_lines      = 1
+always_trailing_comma    = false
+compact_arrays           = false
+compact_inline_tables    = false
+crlf                     = false
+indent_count             = 2
+key_value_newlines       = true
+max_array_line_len       = 80
+multiline_trailing_comma = true
+space_around_eq          = true
+trailing_newline         = true

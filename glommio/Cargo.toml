@@ -1,127 +1,135 @@
 [package]
 name = "glommio"
-version = "0.9.0"
+version = "0.10.0"
 authors = [
-    "Glauber Costa <glommer@gmail.com>",
-    "Hippolyte Barraud <hippolyte.barraud@datadoghq.com>",
-    "DataDog <info@datadoghq.com>",
+  "DataDog <info@datadoghq.com>",
+  "Glauber Costa <glommer@gmail.com>",
+  "Hippolyte Barraud <hippolyte.barraud@datadoghq.com>",
 ]
-edition = "2021"
+categories = ["asynchronous", "concurrency", "filesystem", "network-programming", "os"]
 description = "Glommio is a thread-per-core crate that makes writing highly parallel asynchronous applications in a thread-per-core architecture easier for rustaceans."
+edition = "2021"
+homepage = "https://github.com/glommio/glommio"
+keywords = ["async", "iouring", "linux", "rust", "thread-per-core"]
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/DataDog/glommio"
-homepage = "https://github.com/DataDog/glommio"
-keywords = ["linux", "rust", "async", "iouring", "thread-per-core"]
-categories = ["asynchronous", "concurrency", "os", "filesystem", "network-programming"]
 readme = "../README.md"
+repository = "https://github.com/glommio/glommio"
 # This is also documented in the README.md under "Supported Rust Versions"
 rust-version = "1.92"
 
 [features]
-bench = []
+bench     = []
 debugging = []
 
 # Unstable features based on nightly
 native-tls = []
-nightly = ["native-tls"]
+nightly    = ["native-tls"]
 
 [dependencies]
-ahash = "0.8"
-backtrace = { version = "0.3" }
-bencher = "0.1.5"
-bitflags = "2.10"
-bitmaps = "3.2"
-buddy-alloc = "0.6"
-concurrent-queue = "2.5"
-crossbeam = "0.8"
-enclose = "1.2"
-flume = { version = "0.12", features = ["async"] }
-futures-lite = "2.6"
+ahash                 = "0.8"
+backtrace             = { version = "0.3" }
+bencher               = "0.1.5"
+bitflags              = "2.10"
+bitmaps               = "3.2"
+buddy-alloc           = "0.6"
+concurrent-queue      = "2.5"
+crossbeam             = "0.8"
+enclose               = "1.2"
+flume                 = { version = "0.12", features = ["async"] }
+futures-lite          = "2.6"
 intrusive-collections = "0.10"
-lazy_static = "1.5"
-libc = "0.2"
-log = "0.4"
-nix = { version = "0.30", features = ["event", "fs", "ioctl", "mman", "net", "poll", "sched", "time"] }
-pin-project-lite = "0.2"
-rlimit = "0.10"
-scoped-tls = "1.0"
-scopeguard = "1.2"
-signal-hook = { version = "0.4" }
-sketches-ddsketch = "0.3"
-smallvec = { version = "1.15", features = ["union"] }
-socket2 = { version = "0.6", features = ["all"] }
-tracing = "0.1"
-typenum = "1.19"
+lazy_static           = "1.5"
+libc                  = "0.2"
+log                   = "0.4"
+nix                   = { version = "0.30", features = ["event", "fs", "ioctl", "mman", "net", "poll", "sched", "time"] }
+pin-project-lite      = "0.2"
+rlimit                = "0.10"
+scoped-tls            = "1.0"
+scopeguard            = "1.2"
+signal-hook           = { version = "0.4" }
+sketches-ddsketch     = "0.3"
+smallvec              = { version = "1.15", features = ["union"] }
+socket2               = { version = "0.6", features = ["all"] }
+tracing               = "0.1"
+typenum               = "1.19"
 
 [build-dependencies]
 cc = "1.2"
 
 [dev-dependencies]
-fastrand = "2.3"
-futures = "0.3"
-hdrhistogram = "7.5"
-pretty_env_logger = "0.5"
-rand = "0.9"
-tokio = { version = "1.49", default-features = false, features = ["rt", "macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+fastrand            = "2.3"
+futures             = "0.3"
+hdrhistogram        = "7.5"
+pretty_env_logger   = "0.5"
+rand                = "0.9"
+tokio               = { version = "1.49", default-features = false, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[bench]]
-name = "executor"
 harness = false
+name    = "executor"
 
 [[bench]]
-name = "semaphore"
 harness = false
+name    = "semaphore"
 
 [[bench]]
-name = "local_channel"
 harness = false
+name    = "local_channel"
 
 [[bench]]
-name = "shared_channel"
 harness = false
+name    = "shared_channel"
 
 [[bench]]
-name = "preempt"
 harness = false
+name    = "preempt"
 
 [[bench]]
-name = "tcp"
 harness = false
+name    = "tcp"
 
 [[bench]]
-name = "tokio_tcp"
 harness = false
+name    = "tokio_tcp"
 
 [[bench]]
-name = "udp"
 harness = false
+name    = "udp"
 
 [[bench]]
-name = "nop"
-harness = false
+harness           = false
+name              = "nop"
 required-features = ["bench"]
 
 [[bench]]
-name = "sharding"
 harness = false
+name    = "sharding"
 
 [[bench]]
-name = "spsc_queue"
 harness = false
+name    = "spsc_queue"
 
 [[bench]]
-name = "foreign_wake"
 harness = false
+name    = "foreign_wake"
 
 [[bench]]
-name = "proxy"
 harness = false
+name    = "proxy"
 
 [[bench]]
-name = "echo"
 harness = false
+name    = "echo"
 
 [[bench]]
-name = "competing_io"
 harness = false
+name    = "competing_io"

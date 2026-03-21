@@ -26,9 +26,8 @@ jobs:
       - name: Generate documentation
         run: cargo doc --all
 
-    # temporarily disabled.
-    # - name: Validate links
-    #   run: cargo deadlinks --dir target/doc/glommio
+      - name: Validate links
+        run: cargo deadlinks --dir target/doc/glommio
 
   build:
     runs-on: ubuntu-latest

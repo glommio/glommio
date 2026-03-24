@@ -990,18 +990,29 @@ mod test {
     });
 
     #[test]
-    fn test_stdin_fuse() {
-        use futures::StreamExt;
+    fn test_stream_reader_fuse() {
+        for dir in make_test_directories("test_stream_reader_fuse") {
+            let path = dir.path.clone();
+            test_executor!(async move {
+                let filename = path.join("testfile");
+                let new_file = BufferedFile::create(&filename).await.unwrap();
+                new_file.write_at(vec![1, 2, 3, 4, 5], 0).await.unwrap();
+                new_file.close().await.unwrap();
 
-        test_executor!(async move {
-            let mut si = StreamExt::fuse(stdin().lines());
-            let fut =
-                crate::timer::timeout(Duration::from_millis(1), async move {
-                    StreamExt::next(&mut si).await.ok_or(GlommioError::IoError(
-                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "stdin closed"),
-                    ))
-                });
-            assert!(matches!(fut.await, Err(GlommioError::TimedOut(_))));
-        });
+                let file = BufferedFile::open(&filename).await.unwrap();
+                let reader = StreamReaderBuilder::new(file).build();
+                let mut si = futures_lite::StreamExt::fuse(reader.lines());
+                let result = crate::timer::timeout(Duration::from_millis(100), async move {
+                    si.next().await.ok_or_else(|| {
+                        GlommioError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "stream closed",
+                        ))
+                    })
+                })
+                .await;
+                assert!(result.is_ok());
+            });
+        }
     }
 }

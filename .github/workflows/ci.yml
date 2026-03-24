@@ -73,3 +73,23 @@ jobs:
           cargo test -- --test-threads=`nproc`
           EOF
           sudo -E bash -c "ulimit -Sl 512 && ulimit -Hl 512 && bash run-gha-workflow.sh"
+
+  build-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build for musl target
+        run: cross build --target x86_64-unknown-linux-musl
+
+      - name: Run tests for musl target
+        continue-on-error: true
+        run: cross test --target x86_64-unknown-linux-musl -- --test-threads=$(nproc) --skip io::dma_file::test

@@ -13,17 +13,16 @@ license = "Apache-2.0 OR MIT"
 name = "glommio"
 readme = "../README.md"
 repository = "https://github.com/glommio/glommio"
-version = "0.10.0"
+version = "0.11.0"
 # This is also documented in the README.md under "Supported Rust Versions"
 rust-version = "1.92"
 
 [features]
-bench     = []
-debugging = []
-
-# Unstable features based on nightly
-native-tls = []
-nightly    = ["native-tls"]
+bench                 = []
+debugging             = []
+native-tls            = []
+nightly               = ["native-tls"]
+version-compatibility = []
 
 [dependencies]
 ahash                 = "0.8"
@@ -58,11 +57,15 @@ cc            = "1.2"
 rustc_version = "0.4.1"
 
 [dev-dependencies]
+cargo-semver-checks = "0.3.0"
 fastrand = "2.3"
 futures = "0.3"
 hdrhistogram = "7.5"
 pretty_env_logger = "0.5"
+public-api = "0.51.0"
 rand = "0.9"
+rustdoc-json = "0.9.9"
+rustup-toolchain = "0.1.10"
 tokio = { version = "1.49", default-features = false, features = [
   "io-util",
   "macros",

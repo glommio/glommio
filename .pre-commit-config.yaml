@@ -1,0 +1,64 @@
+# Pre-commit configuration for Glommio
+# See https://pre-commit.com/ for more information
+
+repos:
+  # Check for common mistakes
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0.1
+    hooks:
+      - id: fmt
+      - id: cargo-clippy
+        args: ['-- -D warnings']
+
+  # Check Rust code formatting
+  - repo: https://github.com/rust-lang/rustfmt
+    rev: v1.7.1
+    hooks:
+      - id: rustfmt
+
+  # Check for common mistakes
+  - repo: https://github.com/rust-lang/rust-clippy
+    rev: v1.73.0
+    hooks:
+      - id: clippy
+        args: ['-- -D warnings']
+
+  # Check for correct commit messages
+  - repo: https://github.com/compilerla/conventional-commit-pre-commit-hook
+    rev: v3.4.0
+    hooks:
+      - id: conventional-commit
+        stages: [commit-msg]
+        args: [--type, 'fix,feat,docs,style,refactor,test,chore,perf,ci,build,security']
+
+  # Check for broken links in documentation
+  - repo: https://github.com/rhysd/action-link-checker
+    rev: v3.12.0
+    hooks:
+      - id: link-checker
+        args:
+          - --fail-on-warnings
+          - --enable-jobs=4
+          - --scope=docs.rs
+          - --scope=github.com
+
+  # Ensure files are sorted
+  - repo: https://github.com/dsansone/cargo-sort
+    rev: v1.4.0
+    hooks:
+      - id: cargo-sort
+        args: ['--check']
+
+  # Check for TODO/FIXME comments
+  - repo: https://github.com/PyCQA/flake8
+    rev: v7.1.1
+    hooks:
+      - id: flake8
+        args: ['--ignore=E501,W503']
+
+# Pre-commit hooks configuration
+default_stages: [commit]
+
+# Default language version
+default_language_version:
+  rust: stable

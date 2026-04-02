@@ -1,0 +1,87 @@
+name: Release Compatibility Check
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  release-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Run semantic versioning checks
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          echo "Checking compatibility for version ${VERSION}"
+
+          # Generate rustdoc for current version
+          cargo rustdoc --package glommio
+
+          # Run semantic versioning checks
+          cargo semver-checks --package glommio
+
+      - name: Check API compatibility
+        run: |
+          # Generate API snapshot
+          cargo rustdoc --package glommio
+          cargo public-api --package glommio > glommio/tests/snapshots/public-api.txt
+
+          # Run API compatibility test
+          cargo test --package glommio public_api
+
+      - name: Run all tests
+        run: |
+          cargo test -- --test-threads=$(nproc)
+
+      - name: Check for breaking changes
+        run: |
+          echo "Checking for breaking changes..."
+
+          # Run semver checks to detect breaking changes
+          cargo semver-checks --package glommio --allow-dirty
+
+          echo "✓ No breaking changes detected"
+
+      - name: Verify documentation
+        run: |
+          cargo doc --package glommio
+          cargo deadlinks --dir target/doc/glommio
+
+      - name: Upload release artifacts
+        if: success()
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-artifacts
+          path: |
+            target/doc/
+            target/release/
+            glommio/tests/snapshots/
+
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

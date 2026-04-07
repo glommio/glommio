@@ -42,15 +42,15 @@ jobs:
           BREAKING_CHANGES=0
           NEW_FEATURES=0
           BUG_FIXES=0
-          git log --format="%s" HEAD~10..HEAD | while read commit_msg; do
-            if echo "$commit_msg" | grep -qE '^feat:'; then
+          while read commit_msg; do
+            if echo "$commit_msg" | grep -qE '(BREAKING|breaking)'; then
+              BREAKING_CHANGES=$((BREAKING_CHANGES + 1))
+            elif echo "$commit_msg" | grep -qE '^feat:'; then
               NEW_FEATURES=$((NEW_FEATURES + 1))
             elif echo "$commit_msg" | grep -qE '^fix:'; then
               BUG_FIXES=$((BUG_FIXES + 1))
-            elif echo "$commit_msg" | grep -qE '(BREAKING|breaking)'; then
-              BREAKING_CHANGES=$((BREAKING_CHANGES + 1))
             fi
-          done
+          done < <(git log --format="%s" HEAD~10..HEAD)
           echo "Commit analysis:"
           echo "- New features: $NEW_FEATURES"
           echo "- Bug fixes: $BUG_FIXES"

@@ -21,6 +21,12 @@ jobs:
       - name: Install cargo-semver-checks
         run: cargo install cargo-semver-checks
 
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api
+
+      - name: Install cargo-deadlinks
+        run: cargo install cargo-deadlinks
+
       - name: Extract version from tag
         id: version
         run: |

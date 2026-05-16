@@ -74,7 +74,7 @@ Glommio uses [semantic versioning](https://semver.org/) with the following rules
 - **MINOR version**: Backward-compatible feature additions
 - **PATCH version**: Backward-compatible bug fixes
 
-For detailed versioning guidelines, see [docs/VERSIONING.md](docs/VERSIONING.md). For backward compatibility guidelines, see [docs/BACKWARD_COMPATIBILITY.md](docs/BACKWARD_COMPATIBILITY.md).
+For backward compatibility and versioning guidelines, see [docs/BACKWARD_COMPATIBILITY.md](docs/BACKWARD_COMPATIBILITY.md).
 
 ## Release Process
 

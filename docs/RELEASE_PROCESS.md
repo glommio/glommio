@@ -14,6 +14,7 @@ This checklist ensures all necessary steps are completed when releasing a new ve
 ### 2. Testing
 - [ ] Run full test suite: `cargo test`
 - [ ] Run API compatibility tests: `cargo test --package glommio public_api`
+- [ ] Update API snapshot if needed: `UPDATE_SNAPSHOTS=yes cargo test --package glommio public_api`
 - [ ] Run semantic versioning checks: `cargo semver-checks --package glommio`
 - [ ] Run linters: `cargo clippy --all-targets --all-features`
 - [ ] Check formatting: `cargo fmt --all -- --check`
@@ -148,5 +149,4 @@ For questions or issues with the release process, contact the maintainers.
 ## References
 
 - [Semantic Versioning](https://semver.org/)
-- [VERSIONING.md](./VERSIONING.md)
 - [BACKWARD_COMPATIBILITY.md](./BACKWARD_COMPATIBILITY.md)

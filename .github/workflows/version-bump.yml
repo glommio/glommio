@@ -50,7 +50,7 @@ jobs:
             elif echo "$commit_msg" | grep -qE '^fix:'; then
               BUG_FIXES=$((BUG_FIXES + 1))
             fi
-          done < <(git log --format="%s" HEAD~10..HEAD)
+          done < <(git log --format="%s" "${{ github.event.before }}..${{ github.sha }}")
           echo "Commit analysis:"
           echo "- New features: $NEW_FEATURES"
           echo "- Bug fixes: $BUG_FIXES"

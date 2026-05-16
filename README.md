@@ -66,6 +66,20 @@ $ ulimit -l
 512
 ```
 
+## Version Compatibility
+
+Glommio uses [semantic versioning](https://semver.org/) with the following rules:
+
+- **MAJOR version**: Incompatible API changes
+- **MINOR version**: Backward-compatible feature additions
+- **PATCH version**: Backward-compatible bug fixes
+
+For backward compatibility and versioning guidelines, see [docs/BACKWARD_COMPATIBILITY.md](docs/BACKWARD_COMPATIBILITY.md).
+
+## Release Process
+
+See [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md) for information about the release process.
+
 ## Contributing
 
 See [](/CONTRIBUTING.md)

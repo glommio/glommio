@@ -1,0 +1,70 @@
+name: Version Bump Check
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+
+  check-version-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+      - name: Check version changes
+        run: |
+          echo "Checking for version changes..."
+          if git diff HEAD~1 glommio/Cargo.toml | grep -qE '^\+version = '; then
+            echo "::warning::Version was updated in glommio/Cargo.toml"
+            NEW_VERSION=$(git diff HEAD~1 glommio/Cargo.toml | grep '^+' | grep 'version' | sed -E 's/^\+version = "([0-9]+\.[0-9]+\.[0-9]+)"/\1/')
+            if [[ -n "$NEW_VERSION" ]]; then
+              echo "New version: $NEW_VERSION"
+            fi
+          fi
+          if git diff HEAD~1 README.md | grep -qE '^\+.*Version'; then
+            echo "::warning::Version was updated in README.md"
+          fi
+          echo "✓ Version change check complete"
+
+  suggest-version-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Suggest version bump
+        run: |
+          echo "Checking commit messages to suggest version bump..."
+          BREAKING_CHANGES=0
+          NEW_FEATURES=0
+          BUG_FIXES=0
+          while read commit_msg; do
+            if echo "$commit_msg" | grep -qE '(BREAKING|breaking)'; then
+              BREAKING_CHANGES=$((BREAKING_CHANGES + 1))
+            elif echo "$commit_msg" | grep -qE '^feat:'; then
+              NEW_FEATURES=$((NEW_FEATURES + 1))
+            elif echo "$commit_msg" | grep -qE '^fix:'; then
+              BUG_FIXES=$((BUG_FIXES + 1))
+            fi
+          done < <(git log --format="%s" "${{ github.event.before }}..${{ github.sha }}")
+          echo "Commit analysis:"
+          echo "- New features: $NEW_FEATURES"
+          echo "- Bug fixes: $BUG_FIXES"
+          echo "- Breaking changes: $BREAKING_CHANGES"
+          if [[ $BREAKING_CHANGES -gt 0 ]]; then
+            echo ""
+            echo "::notice::Suggested version bump: MAJOR"
+            echo "Reason: Breaking changes detected in this PR"
+          elif [[ $NEW_FEATURES -gt 0 ]]; then
+            echo ""
+            echo "::notice::Suggested version bump: MINOR"
+            echo "Reason: New features added"
+          else
+            echo ""
+            echo "::notice::Suggested version bump: PATCH"
+            echo "Reason: Bug fixes and improvements"
+          fi

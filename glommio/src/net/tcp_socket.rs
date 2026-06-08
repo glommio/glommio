@@ -436,6 +436,25 @@ impl FromRawFd for TcpStream {
     }
 }
 
+impl IntoRawFd for TcpStream<NonBuffered> {
+    fn into_raw_fd(self) -> RawFd {
+        self.stream.into_raw_fd()
+    }
+}
+
+impl TcpStream<NonBuffered> {
+    /// Converts this TcpStream back into an AcceptedTcpStream that can be
+    /// transferred to another executor.
+    ///
+    /// This properly cleans up glommio internal state (reactor sources,
+    /// timers) while keeping the underlying file descriptor open.
+    pub fn into_accepted(self) -> AcceptedTcpStream {
+        AcceptedTcpStream {
+            fd: self.into_raw_fd(),
+        }
+    }
+}
+
 fn make_tcp_socket(addr: &SocketAddr) -> io::Result<Socket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -1330,5 +1349,124 @@ mod tests {
             let s = TcpStream::connect(addr).await.unwrap();
             assert_eq!(s.local_addr().unwrap(), peer_addr.await);
         });
+    }
+
+    #[test]
+    fn tcp_stream_into_raw_fd() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let original_fd = stream.as_raw_fd();
+
+            let raw_fd = stream.into_raw_fd();
+            assert_eq!(original_fd, raw_fd);
+
+            let restored_stream = unsafe { TcpStream::from_raw_fd(raw_fd) };
+            assert_eq!(restored_stream.as_raw_fd(), raw_fd);
+
+            std::mem::drop(restored_stream);
+        });
+    }
+
+    #[test]
+    fn tcp_stream_into_raw_fd_with_timeouts() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let stream = TcpStream::connect(addr).await.unwrap();
+
+            // Set timeouts to verify they get cleaned up
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+
+            assert_eq!(stream.read_timeout(), Some(Duration::from_secs(30)));
+            assert_eq!(stream.write_timeout(), Some(Duration::from_secs(30)));
+
+            let original_fd = stream.as_raw_fd();
+
+            let raw_fd = stream.into_raw_fd();
+            assert_eq!(original_fd, raw_fd);
+
+            // Create a new stream and verify timeouts are reset
+            let restored_stream = unsafe { TcpStream::from_raw_fd(raw_fd) };
+            assert_eq!(restored_stream.read_timeout(), None);
+            assert_eq!(restored_stream.write_timeout(), None);
+
+            std::mem::drop(restored_stream);
+        });
+    }
+
+    #[test]
+    fn tcp_stream_into_accepted_round_trip() {
+        // A connection is accepted and used on one executor, converted back to
+        // an AcceptedTcpStream with into_accepted(), migrated to a second
+        // executor, and resumed there - all on the same underlying fd.
+        let (stream_sender, stream_receiver) = shared_channel::new_bounded(1);
+        let (addr_sender, addr_receiver) = shared_channel::new_bounded(1);
+
+        // ex1: accept, do the first exchange, then hand the live connection off.
+        let ex1 = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let stream_sender = stream_sender.connect().await;
+                let addr_sender = addr_sender.connect().await;
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                addr_sender
+                    .try_send(listener.local_addr().unwrap())
+                    .unwrap();
+
+                let mut stream = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"ping");
+                stream.write_all(b"pong").await.unwrap();
+
+                // Dispose of glommio state but keep the fd open, then migrate it.
+                stream_sender.try_send(stream.into_accepted()).unwrap();
+            })
+            .unwrap();
+
+        // ex2: bind the migrated connection and resume the same TCP session.
+        let ex2 = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let stream_receiver = stream_receiver.connect().await;
+                let accepted = stream_receiver.recv().await.unwrap();
+                let mut stream = accepted.bind_to_executor();
+
+                let mut buf = [0u8; 5];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello");
+                stream.write_all(b"world").await.unwrap();
+            })
+            .unwrap();
+
+        // ex3: client driving both stages over a single connection.
+        let ex3 = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let addr_receiver = addr_receiver.connect().await;
+                let addr = addr_receiver.recv().await.unwrap();
+                let mut client = TcpStream::connect(addr).await.unwrap();
+
+                client.write_all(b"ping").await.unwrap();
+                let mut buf = [0u8; 4];
+                client.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"pong");
+
+                client.write_all(b"hello").await.unwrap();
+                let mut buf = [0u8; 5];
+                client.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"world");
+            })
+            .unwrap();
+
+        ex1.join().unwrap();
+        ex2.join().unwrap();
+        ex3.join().unwrap();
     }
 }

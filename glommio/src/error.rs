@@ -357,6 +357,15 @@ impl<T> GlommioError<T> {
             kind: QueueErrorKind::NotFound,
         })
     }
+
+    pub fn into_inner(self) -> Option<T> {
+        match self {
+            GlommioError::Closed(ResourceType::Channel(t)) => Some(t),
+            GlommioError::WouldBlock(ResourceType::Channel(t)) => Some(t),
+            GlommioError::CanNotBeClosed(ResourceType::Channel(t), _) => Some(t),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for QueueErrorKind {

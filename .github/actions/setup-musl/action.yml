@@ -1,0 +1,57 @@
+name: Set up musl
+description: Install musl, the Rust target, and Linux UAPI headers
+
+runs:
+  using: composite
+  steps:
+    - name: Install packages and Rust target
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        sudo apt-get update
+        sudo apt-get install --yes \
+          build-essential \
+          musl-tools \
+          linux-libc-dev
+
+        rustup target add x86_64-unknown-linux-musl
+
+    - name: Expose Linux UAPI headers
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        musl_include=/usr/include/x86_64-linux-musl
+
+        sudo ln -sfn \
+          /usr/include/linux \
+          "${musl_include}/linux"
+
+        sudo ln -sfn \
+          /usr/include/asm-generic \
+          "${musl_include}/asm-generic"
+
+        sudo ln -sfn \
+          /usr/include/x86_64-linux-gnu/asm \
+          "${musl_include}/asm"
+
+    - name: Configure musl compiler
+      shell: bash
+      run: |
+        {
+          echo 'CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc'
+          echo 'CC_x86_64_unknown_linux_musl=musl-gcc'
+          echo 'AR_x86_64_unknown_linux_musl=ar'
+        } >>"${GITHUB_ENV}"
+
+    - name: Validate Linux UAPI headers
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        printf '#include <linux/swab.h>\n' |
+          musl-gcc -E -x c - >/dev/null
+
+        printf '#include <linux/io_uring.h>\n' |
+          musl-gcc -E -x c - >/dev/null

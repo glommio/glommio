@@ -248,7 +248,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Device or resource busy")]
+    #[cfg_attr(target_env = "musl", should_panic(expected = "Resource busy"))]
+    #[cfg_attr(
+        not(target_env = "musl"),
+        should_panic(expected = "Device or resource busy")
+    )]
     fn double_register() {
         let ring = IoUring::new(1).unwrap();
         let _ = ring.registrar().register_files(&[1]).unwrap();

@@ -4,92 +4,120 @@ permissions: write-all
 
 on:
   pull_request:
-    branches: [ main ]
-    types: [ "opened", "synchronize" ]
+    branches: [main]
+    types: [opened, synchronize, reopened]
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-
   doc:
+    name: Documentation
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # See https://github.com/rust-lang/rust/issues/148431
+      - name: Use Rust 1.93 for documentation
+        run: rustup override set 1.93.0
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
 
       - name: Install cargo-deadlinks
-        run: which deadlinks || cargo install cargo-deadlinks
+        run: which cargo-deadlinks || cargo install --locked cargo-deadlinks
 
       - name: Generate documentation
-        run: cargo doc --all
+        env:
+          RUSTDOCFLAGS: >-
+            --cfg zerocopy_unstable_ptr
+            -D rustdoc::broken_intra_doc_links
+        run: |
+          cargo clean --doc
+          cargo doc --workspace --all-features --locked
 
       - name: Validate links
         run: cargo deadlinks --dir target/doc/glommio
 
   lint:
+    name: Lint
     runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Cache setup
-      uses: ./.github/actions/cache-setup
-    - run: cargo fmt --all -- --check
-    - run: cargo clippy --all --all-targets --all-features
-    - run: cargo install cargo-sort
-    - run: cargo sort -w -c 
 
-  build:
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+      - name: Install cargo-sort
+        run: which cargo-sort || cargo install --locked cargo-sort
+
+      - name: Check Cargo.toml ordering
+        run: cargo sort --workspace --check
+
+  build-and-test:
+    name: Build and Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: glibc
+            target: ""
+            musl: false
+
+          - name: musl
+            target: x86_64-unknown-linux-musl
+            musl: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Set up musl
+        if: matrix.musl
+        uses: ./.github/actions/setup-musl
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup
 
       - name: Build all targets
-        run: cargo build --all --all-targets
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Cache setup
-        uses: ./.github/actions/cache-setup
-
-      - name: Install cargo helpers and test all targets
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          cat << EOF > "run-gha-workflow.sh"
-          PATH=$PATH:/usr/share/rust/.cargo/bin
-          echo "`nproc` CPU(s) available"
-          rustup install 1.92
-          rustup show
-          rustup default stable
-          cargo install cargo-sort
-          cargo test -- --test-threads=`nproc`
-          EOF
-          sudo -E bash -c "ulimit -Sl 512 && ulimit -Hl 512 && bash run-gha-workflow.sh"
+          set -euo pipefail
 
-  build-musl:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          submodules: recursive
+          args=(
+            build
+            --workspace
+            --all-targets
+            --locked
+          )
 
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
+          if [[ -n "${TARGET}" ]]; then
+            args+=(--target "${TARGET}")
+          fi
 
-      - name: Build for musl target
-        run: cross build --target x86_64-unknown-linux-musl
+          cargo "${args[@]}"
 
-      - name: Run tests for musl target
-        continue-on-error: true
-        run: cross test --target x86_64-unknown-linux-musl -- --test-threads=$(nproc) --skip io::dma_file::test
+      - name: Run tests
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: .github/scripts/run-tests.sh "${TARGET}"

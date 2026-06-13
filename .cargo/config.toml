@@ -1,2 +1,5 @@
 [net]
 git-fetch-with-cli = true
+
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"

@@ -35,6 +35,20 @@ macro_rules! raw_syscall {
     }};
 }
 
+macro_rules! raw_syscall_buf {
+    ($fn:ident $args:tt, $buf:expr) => {{
+        let res = unsafe { libc::$fn $args };
+        if res == -1 {
+            BlockingThreadResult::SyscallBuf(
+                -std::io::Error::last_os_error().raw_os_error().unwrap() as i64,
+                $buf,
+            )
+        } else {
+            BlockingThreadResult::SyscallBuf(res as i64, $buf, )
+        }
+    }};
+}
+
 fn to_result(res: i64) -> io::Result<usize> {
     if res < 0 {
         Err(std::io::Error::from_raw_os_error(-res as i32))
@@ -125,6 +139,7 @@ impl BlockingThreadOp {
 #[derive(Debug)]
 pub(super) enum BlockingThreadResult {
     Syscall(i64),
+    SyscallBuf(i64, Box<[u8]>),
     Fn,
 }
 
@@ -135,6 +150,7 @@ impl TryFrom<BlockingThreadResult> for std::io::Result<usize> {
         match value {
             BlockingThreadResult::Syscall(x) => Ok(to_result(x)),
             BlockingThreadResult::Fn => Ok(Ok(0)),
+            BlockingThreadResult::SyscallBuf(x, _) => Ok(to_result(x)),
         }
     }
 }
@@ -265,10 +281,24 @@ impl BlockingThreadPool {
 
             let src = waiters.remove(&id).unwrap();
             let mut inner_source = src.borrow_mut();
-            inner_source.wakers.result.replace(
-                res.try_into()
-                    .expect("not a valid blocking operation's result"),
-            );
+
+            match res {
+                BlockingThreadResult::Syscall(_) | BlockingThreadResult::Fn => {
+                    inner_source.wakers.result.replace(
+                        res.try_into()
+                            .expect("not a valid blocking operation's result"),
+                    );
+                }
+                BlockingThreadResult::SyscallBuf(raw, buf) => {
+                    match &mut inner_source.source_type {
+                        SourceType::GetDents(_fd, buf_slot) => {
+                            *buf_slot = Some(buf);
+                        }
+                        _ => panic!(),
+                    }
+                    inner_source.wakers.result.replace(to_result(raw));
+                }
+            }
             inner_source.wakers.wake_waiters();
 
             woke += 1;

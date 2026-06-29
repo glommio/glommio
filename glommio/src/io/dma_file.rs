@@ -5,16 +5,12 @@
 //
 use crate::{
     io::{
-        bulk_io::{
+        ScheduledSource, bulk_io::{
             CoalescedReads, IoVec, MergedBufferLimit, OrderedBulkIo, ReadAmplificationLimit,
             ReadManyArgs, ReadManyResult,
-        },
-        glommio_file::GlommioFile,
-        open_options::OpenOptions,
-        read_result::ReadResult,
-        ScheduledSource,
+        }, glommio_file::GlommioFile, open_options::OpenOptions, read_result::ReadResult
     },
-    sys::{self, sysfs, DirectIo, DmaBuffer, DmaSource, PollableStatus},
+    sys::{self, DirectIo, DmaBuffer, DmaSource, PollableStatus, Statx, sysfs},
 };
 use futures_lite::{Stream, StreamExt};
 use nix::sys::statfs::*;
@@ -679,6 +675,11 @@ impl DmaFile {
     /// Returns the size of the filesystem cluster, in bytes
     pub async fn stat(&self) -> Result<Stat> {
         self.file.statx().await.map(Into::into)
+    }
+
+    /// Performs a statx operation on a file
+    pub async fn statx(&self) -> Result<Statx> {
+        self.file.statx().await
     }
 
     /// Tries to acquire a process-wide advisory shared lock on this file instance. If an exclusive advisory lock is

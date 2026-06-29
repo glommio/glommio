@@ -1,6 +1,6 @@
 use crate::{
     executor::bind_to_cpu_set,
-    sys::{InnerSource, SleepNotifier},
+    sys::{InnerSource, SleepNotifier, SourceType},
     PoolPlacement,
 };
 use ahash::AHashMap;
@@ -35,6 +35,20 @@ macro_rules! raw_syscall {
     }};
 }
 
+macro_rules! raw_syscall_buf {
+    ($fn:ident $args:tt, $buf:expr) => {{
+        let res = unsafe { libc::$fn $args };
+        if res == -1 {
+            BlockingThreadResult::SyscallBuf(
+                -std::io::Error::last_os_error().raw_os_error().unwrap() as i64,
+                $buf,
+            )
+        } else {
+            BlockingThreadResult::SyscallBuf(res as i64, $buf, )
+        }
+    }};
+}
+
 fn to_result(res: i64) -> io::Result<usize> {
     if res < 0 {
         Err(std::io::Error::from_raw_os_error(-res as i32))
@@ -64,6 +78,7 @@ pub(super) enum BlockingThreadOp {
     CreateDir(PathBuf, libc::c_int),
     Truncate(RawFd, i64),
     CopyFileRange(RawFd, i64, RawFd, i64, usize),
+    GetDents(RawFd, Box<[u8]>),
     Fn(Box<dyn FnOnce() + Send + 'static>),
 }
 
@@ -80,6 +95,9 @@ impl Debug for BlockingThreadOp {
                 f,
                 "copy_file_range `{fd_in}` @ `{off_in}` -> {fd_out} @ `{off_out}` for {len} bytes"
             ),
+            BlockingThreadOp::GetDents(fd, buf) => {
+                write!(f, "getdents on `{fd}` into buffer {buf:?}")
+            }
             BlockingThreadOp::Fn(_) => write!(f, "user function"),
         }
     }
@@ -114,6 +132,11 @@ impl BlockingThreadOp {
                     0
                 ))
             }
+            BlockingThreadOp::GetDents(fd, mut buf) => {
+                let len = buf.len();
+                let pointer = buf.as_mut_ptr() as *mut libc::c_void;
+                raw_syscall_buf!(syscall(libc::SYS_getdents64, fd, pointer, len), buf)
+            }
             BlockingThreadOp::Fn(f) => {
                 f();
                 BlockingThreadResult::Fn
@@ -125,6 +148,7 @@ impl BlockingThreadOp {
 #[derive(Debug)]
 pub(super) enum BlockingThreadResult {
     Syscall(i64),
+    SyscallBuf(i64, Box<[u8]>),
     Fn,
 }
 
@@ -135,6 +159,7 @@ impl TryFrom<BlockingThreadResult> for std::io::Result<usize> {
         match value {
             BlockingThreadResult::Syscall(x) => Ok(to_result(x)),
             BlockingThreadResult::Fn => Ok(Ok(0)),
+            BlockingThreadResult::SyscallBuf(x, _) => Ok(to_result(x)),
         }
     }
 }
@@ -265,10 +290,24 @@ impl BlockingThreadPool {
 
             let src = waiters.remove(&id).unwrap();
             let mut inner_source = src.borrow_mut();
-            inner_source.wakers.result.replace(
-                res.try_into()
-                    .expect("not a valid blocking operation's result"),
-            );
+
+            match res {
+                BlockingThreadResult::Syscall(_) | BlockingThreadResult::Fn => {
+                    inner_source.wakers.result.replace(
+                        res.try_into()
+                            .expect("not a valid blocking operation's result"),
+                    );
+                }
+                BlockingThreadResult::SyscallBuf(raw, buf) => {
+                    match &mut inner_source.source_type {
+                        SourceType::GetDents(_fd, buf_slot) => {
+                            *buf_slot = Some(buf);
+                        }
+                        _ => panic!(),
+                    }
+                    inner_source.wakers.result.replace(to_result(raw));
+                }
+            }
             inner_source.wakers.wake_waiters();
 
             woke += 1;

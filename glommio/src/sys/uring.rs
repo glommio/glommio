@@ -18,7 +18,7 @@ use std::{
     ffi::CStr,
     fmt,
     future::Future,
-    io,
+    io::{self, Read},
     ops::Range,
     os::unix::io::RawFd,
     panic,
@@ -1617,6 +1617,21 @@ impl Reactor {
 
         let op = BlockingThreadOp::Remove(path);
         self.enqueue_blocking_request(source.inner.clone(), op)
+    }
+
+    pub(crate) fn get_dents(&self, source: &Source) -> impl Future<Output = ()> {
+        let inner = source.inner.clone();
+        let (fd, buf) = match &mut *source.source_type_mut() {
+            SourceType::GetDents(fd, buf) => (
+                *fd,
+                buf.take().expect("get_dents call not provided with buffer"),
+            ),
+            _ => panic!("Unexpected source for getdents operation"),
+        };
+
+        let op = BlockingThreadOp::GetDents(fd, buf);
+
+        self.enqueue_blocking_request(inner, op)
     }
 
     pub(crate) fn run_blocking(

@@ -64,6 +64,7 @@ pub(crate) enum SourceType {
     BlockingFn,
     Invalid,
     CopyFileRange(RawFd, u64, usize),
+    GetDents(RawFd, Option<Box<[u8]>>),
     #[cfg(feature = "bench")]
     Noop,
 }

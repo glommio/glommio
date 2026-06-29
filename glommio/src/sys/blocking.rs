@@ -1,6 +1,6 @@
 use crate::{
     executor::bind_to_cpu_set,
-    sys::{InnerSource, SleepNotifier},
+    sys::{InnerSource, SleepNotifier, SourceType},
     PoolPlacement,
 };
 use ahash::AHashMap;
@@ -78,6 +78,7 @@ pub(super) enum BlockingThreadOp {
     CreateDir(PathBuf, libc::c_int),
     Truncate(RawFd, i64),
     CopyFileRange(RawFd, i64, RawFd, i64, usize),
+    GetDents(RawFd, Box<[u8]>),
     Fn(Box<dyn FnOnce() + Send + 'static>),
 }
 
@@ -94,6 +95,9 @@ impl Debug for BlockingThreadOp {
                 f,
                 "copy_file_range `{fd_in}` @ `{off_in}` -> {fd_out} @ `{off_out}` for {len} bytes"
             ),
+            BlockingThreadOp::GetDents(fd, buf) => {
+                write!(f, "getdents on `{fd}` into buffer {buf:?}")
+            }
             BlockingThreadOp::Fn(_) => write!(f, "user function"),
         }
     }
@@ -127,6 +131,11 @@ impl BlockingThreadOp {
                     len,
                     0
                 ))
+            }
+            BlockingThreadOp::GetDents(fd, mut buf) => {
+                let len = buf.len();
+                let pointer = buf.as_mut_ptr() as *mut libc::c_void;
+                raw_syscall_buf!(syscall(libc::SYS_getdents64, fd, pointer, len), buf)
             }
             BlockingThreadOp::Fn(f) => {
                 f();

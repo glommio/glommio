@@ -659,6 +659,16 @@ impl Reactor {
         }
     }
 
+    pub(crate) fn get_dents(&self, fd: RawFd, buf: Box<[u8]>) -> impl Future<Output = Source> {
+        let source = self.new_source(-1, SourceType::GetDents(fd, Some(buf)), None);
+        let waiter = self.sys.get_dents(&source);
+
+        async move {
+            waiter.await;
+            source
+        }
+    }
+
     pub(crate) fn run_blocking(
         &self,
         func: Box<dyn FnOnce() + Send + 'static>,

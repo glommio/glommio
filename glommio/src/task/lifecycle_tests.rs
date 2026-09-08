@@ -13,6 +13,24 @@ use std::{
 
 use super::test_support::{completed_waker, executor, AllocationProbe, DropGuard, DropProbe};
 
+fn drop_after_shutdown<const N: usize>(foreign: bool) {
+    let executor = executor();
+    let (waker, allocation, future_drop) = completed_waker::<N>(&executor);
+    drop(executor);
+
+    if foreign {
+        thread::spawn(move || drop(waker))
+            .join()
+            .expect("foreign waker drop panicked");
+    } else {
+        // The owner is still this OS thread, although no executor is installed.
+        drop(waker);
+    }
+
+    future_drop.assert_dropped_once();
+    allocation.assert_freed();
+}
+
 fn drop_while_running<const N: usize>() {
     let executor = executor();
     let (waker, allocation, future_drop) = completed_waker::<N>(&executor);
@@ -20,6 +38,29 @@ fn drop_while_running<const N: usize>() {
     drop(executor);
     future_drop.assert_dropped_once();
     allocation.assert_freed();
+}
+
+fn drop_while_idle<const N: usize>() {
+    let executor = executor();
+    let (waker, allocation, future_drop) = completed_waker::<N>(&executor);
+    drop(waker);
+    // A completed task must not need another run() to reclaim its allocation.
+    allocation.assert_freed();
+    future_drop.assert_dropped_once();
+    drop(executor);
+}
+
+fn drop_while_another_executor_runs<const N: usize>() {
+    let owner = executor();
+    let (waker, allocation, future_drop) = completed_waker::<N>(&owner);
+    let other = executor();
+    assert_ne!(owner.id(), other.id());
+    other.run(async move { drop(waker) });
+    // Running a different executor on this thread must not redirect cleanup to it.
+    allocation.assert_freed();
+    future_drop.assert_dropped_once();
+    drop(other);
+    drop(owner);
 }
 
 fn exercise_late_waker(waker: Waker) {
@@ -93,6 +134,22 @@ fn late_wakes<const N: usize>(foreign: bool, shutdown: bool) {
     allocation.assert_freed();
 }
 
+fn owner_thread_exits<const N: usize>() {
+    let (waker, allocation, future_drop) = thread::spawn(|| {
+        let executor = executor();
+        let observed = completed_waker::<N>(&executor);
+        drop(executor);
+        observed
+    })
+    .join()
+    .expect("owning executor thread panicked");
+
+    allocation.assert_live();
+    exercise_late_waker(waker);
+    future_drop.assert_dropped_once();
+    allocation.assert_freed();
+}
+
 macro_rules! test_sizes {
     ($inline:ident, $boxed:ident, $body:ident $(, $arg:expr)*) => {
         #[test]
@@ -103,9 +160,31 @@ macro_rules! test_sizes {
 }
 
 test_sizes!(
+    completed_task_is_destroyed_after_executor_shutdown_on_original_thread_inline,
+    completed_task_is_destroyed_after_executor_shutdown_on_original_thread_boxed,
+    drop_after_shutdown,
+    false
+);
+test_sizes!(
+    completed_task_is_destroyed_after_executor_shutdown_on_foreign_thread_inline,
+    completed_task_is_destroyed_after_executor_shutdown_on_foreign_thread_boxed,
+    drop_after_shutdown,
+    true
+);
+test_sizes!(
     completed_task_is_destroyed_while_executor_is_running_inline,
     completed_task_is_destroyed_while_executor_is_running_boxed,
     drop_while_running
+);
+test_sizes!(
+    completed_task_is_destroyed_while_executor_is_idle_inline,
+    completed_task_is_destroyed_while_executor_is_idle_boxed,
+    drop_while_idle
+);
+test_sizes!(
+    completed_task_is_destroyed_with_another_executor_active_inline,
+    completed_task_is_destroyed_with_another_executor_active_boxed,
+    drop_while_another_executor_runs
 );
 test_sizes!(
     late_owner_wakes_after_completion_inline,
@@ -120,4 +199,23 @@ test_sizes!(
     late_wakes,
     true,
     false
+);
+test_sizes!(
+    late_owner_wakes_after_shutdown_inline,
+    late_owner_wakes_after_shutdown_boxed,
+    late_wakes,
+    false,
+    true
+);
+test_sizes!(
+    late_foreign_wakes_after_shutdown_inline,
+    late_foreign_wakes_after_shutdown_boxed,
+    late_wakes,
+    true,
+    true
+);
+test_sizes!(
+    wakers_outlive_owner_os_thread_inline,
+    wakers_outlive_owner_os_thread_boxed,
+    owner_thread_exits
 );

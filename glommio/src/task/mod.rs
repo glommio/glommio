@@ -55,9 +55,13 @@ pub mod debugging;
 pub(crate) mod header;
 pub(crate) mod join_handle;
 #[cfg(test)]
+mod lifecycle_race_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod ownership_tests;
+#[cfg(test)]
+mod payload_tests;
 #[cfg(test)]
 mod public_spawn_tests;
 pub(crate) mod raw;

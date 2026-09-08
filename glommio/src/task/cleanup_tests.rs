@@ -6,7 +6,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
     rc::Rc,
-    sync::mpsc,
+    sync::{mpsc, Arc, Barrier},
     task::{Context, Poll, Waker},
     thread,
     time::Duration,
@@ -96,6 +96,60 @@ fn synchronous_schedule<const N: usize>(run: bool, panic: bool) {
         schedule_drops.assert_dropped_once();
         allocation.assert_freed();
     });
+}
+
+fn owned_schedule_after_shutdown<const N: usize>() {
+    let ex = executor();
+    let future_drops = DropProbe::new();
+    let schedule_drops = DropProbe::new();
+    let future = CleanupFuture::<N>::new(true, future_drops.guard());
+    let polls = future.polls.clone();
+    let schedule_guard = schedule_drops.guard();
+    let scheduled = Rc::new(RefCell::new(None));
+    let schedule_slot = scheduled.clone();
+    let scheduled_once = Cell::new(false);
+    let (task, handle) = ex.run(async {
+        let (task, handle) = task_impl::spawn_local(
+            ex.id(),
+            future,
+            move |task| {
+                let _ = &schedule_guard;
+                assert!(
+                    !scheduled_once.replace(true),
+                    "schedule closure invoked after executor shutdown"
+                );
+                *schedule_slot.borrow_mut() = Some(task);
+            },
+            false,
+        );
+        task.schedule();
+        let task = scheduled
+            .borrow_mut()
+            .take()
+            .expect("initial runnable was not scheduled");
+        (task, handle)
+    });
+    let allocation = AllocationProbe::track_handle(&handle);
+    future_drops.assert_not_dropped();
+    schedule_drops.assert_not_dropped();
+
+    drop(ex);
+    assert_eq!(polls.get(), 0, "shutdown polled an unscheduled future");
+    future_drops.assert_dropped_once();
+    schedule_drops.assert_dropped_once();
+    allocation.assert_live();
+
+    drop(handle);
+    allocation.assert_live();
+    task.schedule();
+    assert_eq!(
+        polls.get(),
+        0,
+        "scheduling after shutdown polled the future"
+    );
+    future_drops.assert_dropped_once();
+    schedule_drops.assert_dropped_once();
+    allocation.assert_freed();
 }
 
 struct NestedScheduleFuture<const N: usize> {
@@ -257,6 +311,43 @@ fn cleanup_notification_before_foreign_release<const N: usize>() {
 }
 
 /// Drives last-waker cleanup through the reactor while the task owns a channel.
+fn foreign_cleanup_drops_connected_channel<const N: usize>() {
+    let ex = executor();
+    let future_drops = DropProbe::new();
+    let future = CleanupFuture::<N>::new(true, future_drops.guard());
+    let saved_waker = future.waker.clone();
+    let polls = future.polls.clone();
+
+    ex.run(async {
+        let (sender, receiver) = crate::channels::shared_channel::new_bounded::<u8>(1);
+        let (sender, receiver) = futures::future::join(sender.connect(), receiver.connect()).await;
+        let handle = crate::spawn_local(async move {
+            future.await;
+            drop(sender);
+        })
+        .detach();
+        let allocation = AllocationProbe::track_handle(&handle);
+        drop(handle);
+        let waker = saved_waker
+            .borrow_mut()
+            .take()
+            .expect("task was not polled");
+        thread::spawn(move || drop(waker))
+            .join()
+            .expect("foreign waker drop panicked");
+
+        crate::executor()
+            .reactor()
+            .spin_poll_io()
+            .expect("failed to process the cleanup notification through the reactor");
+        futures_lite::future::yield_now().await;
+
+        assert_eq!(polls.get(), 1, "abandoned future was polled again");
+        future_drops.assert_dropped_once();
+        allocation.assert_freed();
+        drop(receiver);
+    });
+}
 
 /// A final foreign waker can arrive during the reactor's last check before sleep.
 #[test]
@@ -367,6 +458,127 @@ fn abandoned_future_destructor_can_spawn_io() {
     });
 }
 
+/// Thread-local executors can outlive the debugger's thread-local state.
+#[cfg(feature = "debugging")]
+#[test]
+fn tls_executor_shutdown_with_debugger() {
+    thread_local! {
+        static OWNER: crate::LocalExecutor = executor();
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        OWNER.with(|ex| {
+            ex.run(async move {
+                let handle = crate::spawn_local(futures_lite::future::poll_fn(move |cx| {
+                    sender
+                        .send(cx.waker().clone())
+                        .expect("test stopped waiting for the task's waker");
+                    Poll::<()>::Pending
+                }))
+                .detach();
+                drop(handle);
+            });
+        });
+    });
+    let waker = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("task was not polled");
+    worker
+        .join()
+        .expect("thread-local executor shutdown panicked");
+    drop(waker);
+}
+
+/// Task destructors can spawn tasks after the debugger's thread-local teardown.
+#[cfg(feature = "debugging")]
+#[test]
+fn tls_executor_shutdown_can_spawn_with_debugger() {
+    struct SpawnTaskOnDrop(mpsc::Sender<()>);
+
+    impl Drop for SpawnTaskOnDrop {
+        fn drop(&mut self) {
+            let sender = self.0.clone();
+            let handle = crate::spawn_local(async move {
+                sender.send(()).expect("test stopped waiting for cleanup");
+            })
+            .detach();
+            drop(handle);
+        }
+    }
+
+    thread_local! {
+        static OWNER: crate::LocalExecutor = executor();
+    }
+
+    let (sender, receiver) = mpsc::channel();
+    let (cleaned_tx, cleaned_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        OWNER.with(|ex| {
+            ex.run(async move {
+                let guard = SpawnTaskOnDrop(cleaned_tx);
+                let handle = crate::spawn_local(futures_lite::future::poll_fn(move |cx| {
+                    let _ = &guard;
+                    sender
+                        .send(cx.waker().clone())
+                        .expect("test stopped waiting for the task's waker");
+                    Poll::<()>::Pending
+                }))
+                .detach();
+                drop(handle);
+            });
+        });
+    });
+    let waker = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("task was not polled");
+    worker
+        .join()
+        .expect("thread-local executor shutdown panicked");
+    cleaned_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("task destructor did not spawn during thread-local shutdown");
+    drop(waker);
+}
+
+/// Dropping an idle handle must preserve the future destructor's owner context.
+#[test]
+#[expect(
+    clippy::async_yields_async,
+    reason = "The handle must leave run() so it can be dropped while its executor is idle."
+)]
+fn idle_handle_drop_preserves_executor_context() {
+    struct RecordContext(Rc<RefCell<Vec<Option<usize>>>>);
+
+    impl Drop for RecordContext {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push(crate::executor::executor_id());
+        }
+    }
+
+    let owner = executor();
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let guard = RecordContext(observed.clone());
+    let handle = owner.run(async move {
+        crate::spawn_local(async move {
+            pending::<()>().await;
+            drop(guard);
+        })
+        .detach()
+    });
+    let allocation = AllocationProbe::track_handle(&handle);
+
+    drop(handle);
+    owner.run(async {});
+
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &[Some(owner.id())],
+        "the future destructor must run exactly once in its owning executor",
+    );
+    allocation.assert_freed();
+}
+
 /// Cleanup can release the last executor reference while destroying its task.
 #[test]
 fn last_handle_drop_with_captured_executor_finishes() {
@@ -390,6 +602,53 @@ fn last_handle_drop_with_captured_executor_finishes() {
         .recv_timeout(Duration::from_secs(10))
         .expect("dropping the last handle did not finish while destroying its executor");
     worker.join().expect("executor-drop test worker panicked");
+}
+
+/// A removed queue drops canceled runnables synchronously, including their executor.
+#[test]
+fn cancel_after_queue_removal_can_release_executor() {
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let owner = Rc::new(executor());
+        let weak_owner = Rc::downgrade(&owner);
+        let captured_owner = owner.clone();
+        let (handle, queue) = owner.run(async move {
+            let queue = crate::executor().create_task_queue(
+                crate::Shares::default(),
+                crate::Latency::NotImportant,
+                "removed",
+            );
+            let (started_tx, started_rx) = futures::channel::oneshot::channel();
+            let handle = crate::spawn_local_into(
+                async move {
+                    started_tx.send(()).expect("start receiver disappeared");
+                    pending::<()>().await;
+                    drop(captured_owner);
+                },
+                queue,
+            )
+            .expect("spawn failed")
+            .detach();
+            started_rx.await.expect("task did not start");
+            (handle, queue)
+        });
+        let allocation = AllocationProbe::track_handle(&handle);
+        owner
+            .remove_task_queue(queue)
+            .expect("queue removal failed");
+        drop(owner);
+
+        handle.cancel();
+        drop(handle);
+
+        assert!(weak_owner.upgrade().is_none(), "task retained its executor");
+        allocation.assert_freed();
+        finished_tx.send(()).expect("test stopped waiting");
+    });
+    finished_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("cancellation reentered executor shutdown and hung");
+    worker.join().expect("cancellation test worker panicked");
 }
 
 /// Replacing a timer's last task waker must permit timer use during cleanup.
@@ -450,6 +709,40 @@ fn replacing_timer_waker_allows_timer_use_in_destructor() {
     allocation.assert_freed();
 }
 
+fn handle_and_waker_release_race<const N: usize>() {
+    let ex = executor();
+    ex.run(async {
+        for _ in 0..64 {
+            let future_drops = DropProbe::new();
+            let future = CleanupFuture::<N>::new(true, future_drops.guard());
+            let saved_waker = future.waker.clone();
+            let polls = future.polls.clone();
+            let (task, handle) = task_impl::spawn_local(ex.id(), future, drop, false);
+            let allocation = AllocationProbe::track_handle(&handle);
+            task.run_right_away();
+            let waker = saved_waker
+                .borrow_mut()
+                .take()
+                .expect("task was not polled");
+            let barrier = Arc::new(Barrier::new(2));
+            let worker_barrier = barrier.clone();
+            let worker = thread::spawn(move || {
+                worker_barrier.wait();
+                drop(waker);
+            });
+            barrier.wait();
+            drop(handle);
+            worker.join().expect("foreign waker drop panicked");
+            crate::sys::get_sleep_notifier_for(ex.id())
+                .unwrap()
+                .process_foreign_wakes();
+            assert_eq!(polls.get(), 1, "abandoned future was polled again");
+            future_drops.assert_dropped_once();
+            allocation.assert_freed();
+        }
+    });
+}
+
 fn sole_waker_completes_detached_future<const N: usize>(foreign: bool, by_ref: bool) {
     let ex = executor();
     let future_drops = DropProbe::new();
@@ -505,12 +798,78 @@ fn sole_waker_completes_detached_future<const N: usize>(foreign: bool, by_ref: b
     });
 }
 
-fn panicking_scheduler<const N: usize>() {
+struct RacePending<const N: usize> {
+    sender: Option<mpsc::Sender<Waker>>,
+    barrier: Arc<Barrier>,
+    _guard: DropGuard,
+    _padding: [u8; N],
+}
+
+impl<const N: usize> Future for RacePending<N> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        this.sender
+            .take()
+            .expect("abandoned future was polled again")
+            .send(cx.waker().clone())
+            .expect("foreign waker worker exited");
+        this.barrier.wait();
+        Poll::Pending
+    }
+}
+
+fn runnable_and_waker_release_race<const N: usize>() {
+    let ex = executor();
+    ex.run(async {
+        for _ in 0..64 {
+            let future_drops = DropProbe::new();
+            let (sender, receiver) = mpsc::channel::<Waker>();
+            let barrier = Arc::new(Barrier::new(2));
+            let worker_barrier = barrier.clone();
+            let worker = thread::spawn(move || {
+                let waker = receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("owner did not poll the future");
+                worker_barrier.wait();
+                drop(waker);
+            });
+            let future = RacePending::<N> {
+                sender: Some(sender),
+                barrier,
+                _guard: future_drops.guard(),
+                _padding: [0; N],
+            };
+            assert_eq!(std::mem::size_of_val(&future) >= 2048, N >= 2048);
+            let (task, handle) = task_impl::spawn_local(ex.id(), future, drop, false);
+            let allocation = AllocationProbe::track_handle(&handle);
+            drop(handle);
+            // The foreign waker release races the runnable release after Pending.
+            task.run_right_away();
+            worker.join().expect("foreign waker drop panicked");
+            crate::sys::get_sleep_notifier_for(ex.id())
+                .unwrap()
+                .process_foreign_wakes();
+            future_drops.assert_dropped_once();
+            allocation.assert_freed();
+        }
+    });
+}
+
+enum SchedulePanicTrigger {
+    Poll,
+    Wake,
+    Drop,
+}
+
+fn panicking_scheduler<const N: usize>(trigger: SchedulePanicTrigger) {
     let ex = executor();
     let future_drops = DropProbe::new();
     let schedule_drops = DropProbe::new();
     let schedule_guard = schedule_drops.guard();
-    let future = CleanupFuture::<N>::new(true, future_drops.guard());
+    let mut future = CleanupFuture::<N>::new(true, future_drops.guard());
+    future.wake_on_poll = matches!(trigger, SchedulePanicTrigger::Poll);
     let saved_waker = future.waker.clone();
     let polls = future.polls.clone();
 
@@ -526,12 +885,22 @@ fn panicking_scheduler<const N: usize>() {
         );
         let allocation = AllocationProbe::track_handle(&handle);
         drop(handle);
-        task.run_right_away();
-        let waker = saved_waker
-            .borrow_mut()
-            .take()
-            .expect("task was not polled");
-        let outcome = catch_unwind(AssertUnwindSafe(|| drop(waker)));
+        let outcome = if matches!(trigger, SchedulePanicTrigger::Poll) {
+            catch_unwind(AssertUnwindSafe(|| {
+                task.run_right_away();
+            }))
+        } else {
+            task.run_right_away();
+            let waker = saved_waker
+                .borrow_mut()
+                .take()
+                .expect("task was not polled");
+            catch_unwind(AssertUnwindSafe(|| match trigger {
+                SchedulePanicTrigger::Drop => drop(waker),
+                SchedulePanicTrigger::Wake => waker.wake(),
+                SchedulePanicTrigger::Poll => unreachable!(),
+            }))
+        };
         let panic = outcome.expect_err("scheduler did not panic");
         assert_eq!(
             panic.downcast_ref::<&str>(),
@@ -554,6 +923,11 @@ macro_rules! test_sizes {
     };
 }
 
+test_sizes!(
+    foreign_cleanup_drops_connected_channel_inline,
+    foreign_cleanup_drops_connected_channel_boxed,
+    foreign_cleanup_drops_connected_channel
+);
 test_sizes!(
     synchronous_schedule_run_inline,
     synchronous_schedule_run_boxed,
@@ -581,6 +955,11 @@ test_sizes!(
     synchronous_schedule,
     false,
     true
+);
+test_sizes!(
+    owned_schedule_after_shutdown_inline,
+    owned_schedule_after_shutdown_boxed,
+    owned_schedule_after_shutdown
 );
 test_sizes!(
     nested_synchronous_schedule_inline,
@@ -612,6 +991,16 @@ test_sizes!(
     cleanup_notification_before_foreign_release
 );
 test_sizes!(
+    last_suspended_handle_and_waker_race_inline,
+    last_suspended_handle_and_waker_race_boxed,
+    handle_and_waker_release_race
+);
+test_sizes!(
+    last_suspended_runnable_and_waker_race_inline,
+    last_suspended_runnable_and_waker_race_boxed,
+    runnable_and_waker_release_race
+);
+test_sizes!(
     sole_owner_waker_wakes_detached_future_inline,
     sole_owner_waker_wakes_detached_future_boxed,
     sole_waker_completes_detached_future,
@@ -640,7 +1029,20 @@ test_sizes!(
     true
 );
 test_sizes!(
+    pending_reschedule_panic_releases_runnable_inline,
+    pending_reschedule_panic_releases_runnable_boxed,
+    panicking_scheduler,
+    SchedulePanicTrigger::Poll
+);
+test_sizes!(
+    wake_schedule_panic_releases_consumed_waker_inline,
+    wake_schedule_panic_releases_consumed_waker_boxed,
+    panicking_scheduler,
+    SchedulePanicTrigger::Wake
+);
+test_sizes!(
     cleanup_schedule_panic_releases_last_waker_inline,
     cleanup_schedule_panic_releases_last_waker_boxed,
-    panicking_scheduler
+    panicking_scheduler,
+    SchedulePanicTrigger::Drop
 );

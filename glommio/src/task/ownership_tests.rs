@@ -5,6 +5,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     future::Future,
     panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
@@ -165,6 +166,52 @@ fn run_initial_runnable<const N: usize>(drop_handle_first: bool, right_away: boo
     allocation.assert_freed();
 }
 
+fn reschedule_queued_runnable<const N: usize>() {
+    let ex = executor();
+    let future_drops = DropProbe::new();
+    let output_drops = DropProbe::new();
+    let schedule_drops = DropProbe::new();
+    let schedule_guard = schedule_drops.guard();
+    let (future, polls) = future::<N>(&future_drops, &output_drops, 3, false);
+    let queue = Rc::new(RefCell::new(VecDeque::new()));
+    let schedule_queue = queue.clone();
+    let allocation = ex.run(async {
+        let (task, handle) = task_impl::spawn_local(
+            ex.id(),
+            future,
+            move |task| {
+                let _ = &schedule_guard;
+                schedule_queue.borrow_mut().push_back(task);
+            },
+            false,
+        );
+        let allocation = AllocationProbe::track_handle(&handle);
+        task.schedule();
+        for _ in 0..4 {
+            let task = queue.borrow_mut().pop_front().expect("runnable was lost");
+            task.schedule();
+            assert_eq!(queue.borrow().len(), 1);
+            assert_eq!(polls.get(), 0);
+        }
+        for expected_poll in 1..=4 {
+            let task = queue.borrow_mut().pop_front().expect("wake was lost");
+            assert!(queue.borrow().is_empty());
+            assert_eq!(task.run(), expected_poll < 4);
+            assert_eq!(polls.get(), expected_poll);
+        }
+        assert!(queue.borrow().is_empty());
+        future_drops.assert_dropped_once();
+        allocation.assert_live();
+        drop(handle.await.expect("completed output was lost"));
+        allocation.assert_freed();
+        allocation
+    });
+    future_drops.assert_dropped_once();
+    output_drops.assert_dropped_once();
+    schedule_drops.assert_dropped_once();
+    allocation.assert_freed();
+}
+
 #[derive(Clone, Copy)]
 enum Callback {
     Run,
@@ -313,6 +360,11 @@ both_layouts!(
     run_initial_runnable,
     false,
     true
+);
+both_layouts!(
+    queued_reschedule_inline,
+    queued_reschedule_boxed,
+    reschedule_queued_runnable
 );
 both_layouts!(
     captured_callback_run_inline,

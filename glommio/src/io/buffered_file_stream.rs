@@ -88,9 +88,13 @@ pub fn stdin() -> Stdin {
 
 #[derive(Debug)]
 enum FileStatus {
-    Open,    // Open, can be closed.
-    Closing, // We are closing it.
-    Closed,  // It was closed, but the poll
+    /// Open, can be closed.
+    Open,
+    /// We are closing it.
+    Closing,
+    /// It was closed, but the poll may still need to wake the writer to
+    /// deliver the final result.
+    Closed,
 }
 
 #[derive(Debug)]
@@ -142,17 +146,17 @@ struct Buffer {
     data: Vec<u8>,
 }
 
-// We can use the same implementation for reads and writes but need to
-// be careful: For writes, buffer_pos is how much we have written, so
-// we are always interested in returning 0 -> buffer_pos.
-//
-// For reads, buffer_pos means how much we have consumed, so we are
-// interested in returning buffer_pos -> max_size.
-//
-// To avoid confusion we'll use consumed_bytes() for writes and
-// unconsumed_bytes(). The as_bytes() variant, closer to what one would
-// expect from the standard library give raw access to the entire buffer and
-// are mostly used for filling the buffer
+/// We can use the same implementation for reads and writes but need to be
+/// careful: For writes, `buffer_pos` is how much we have written, so we are
+/// always interested in returning 0 -> `buffer_pos`.
+///
+/// For reads, `buffer_pos` means how much we have consumed, so we are
+/// interested in returning `buffer_pos` -> `max_size`.
+///
+/// To avoid confusion we'll use `consumed_bytes()` for writes and
+/// `unconsumed_bytes()`. The `as_bytes()` variants, closer to what one would
+/// expect from the standard library, give raw access to the entire buffer and
+/// are mostly used for filling the buffer.
 impl Buffer {
     fn new(max_buffer_size: usize) -> Buffer {
         Buffer {
@@ -182,8 +186,8 @@ impl Buffer {
         self.buffer_pos += amt;
     }
 
-    // copies as many bytes as possible from buf to ourselves, return how many bytes
-    // we copied.
+    /// Copies as many bytes as possible from `buf` to ourselves, returning
+    /// how many bytes we copied.
     fn copy_from_buffer(&mut self, buf: &[u8]) -> usize {
         let max_size = self.max_buffer_size;
         let copy_size = std::cmp::min(max_size - self.data.len(), buf.len());
@@ -443,8 +447,6 @@ impl StreamWriter {
                 let file = self.file.take().unwrap();
                 let fd = file.as_raw_fd();
                 let (last_fd, _) = file.discard();
-                // This is really bad and shouldn't happen - we're handling the close event for the FD
-                // even though a reference is held onto it somewhere else. That means fd reuse is possible.
                 assert!(last_fd.is_some(), "Handling inner close for fd {fd} but it's still owned - fd reuse is a real risk");
                 Poll::Ready(Ok(()))
             }
@@ -540,14 +542,14 @@ impl AsyncSeek for StreamWriter {
 }
 
 impl AsyncRead for StreamReader {
+    /// This is by far the most annoying thing about this interface:
+    /// `read_exact` works well if we use the user-provided buffer directly,
+    /// but `read_to_end` resets the buffer between calls.
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        // This is by far the most annoying thing about this interface.
-        // read_exact works well if we use the user-provided buffer directly,
-        // but read_to_end resets the buffer between calls.
         let buffer = ready!(self.as_mut().poll_fill_buf(cx))?;
         let bytes_read = std::cmp::min(buffer.len(), buf.len());
         buf[0..bytes_read].copy_from_slice(&buffer[0..bytes_read]);
@@ -842,7 +844,7 @@ mod test {
 
         let mut buf = Vec::new();
         let x = reader.read_until(0xA, &mut buf).await.unwrap();
-        assert_eq!(x, 0); // remember the extra 0
+        assert_eq!(x, 0, "remember the extra 0");
         reader.close().await.unwrap();
     });
 
@@ -851,11 +853,10 @@ mod test {
 
         let mut buf = Vec::new();
         let x = reader.read_until(0xA, &mut buf).await.unwrap();
-        assert_eq!(x, 0xB); // remember the extra 0
-        // test that the file pos is updated
+        assert_eq!(x, 0xB, "remember the extra 0");
         for _ in 0..16 {
             let x = reader.read_until(0xA, &mut buf).await.unwrap();
-            assert_eq!(x, 256); // the extra 0
+            assert_eq!(x, 256, "the extra 0");
         }
         reader.close().await.unwrap();
     });
@@ -874,7 +875,7 @@ mod test {
 
         let mut buf = String::new();
         let x = reader.read_line(&mut buf).await.unwrap();
-        assert_eq!(x, 0xB); // remember the extra 0
+        assert_eq!(x, 0xB, "remember the extra 0");
         reader.close().await.unwrap();
     });
 
@@ -974,7 +975,6 @@ mod test {
         let mut writer = StreamWriterBuilder::new(file).build();
 
         writer.write_all(&[0, 1, 2, 3, 4]).await.unwrap();
-        // tests that flush is enough to send the data to the underlying file
         writer.flush().await.unwrap();
         let filename = path.join("testfile");
         let file = BufferedFile::open(&filename).await.unwrap();

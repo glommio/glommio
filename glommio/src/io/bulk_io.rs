@@ -137,7 +137,6 @@ impl<V: IoVec> IOVecMerger<V> {
             }
             Some(cur) => {
                 if let Some(gap) = self.max_read_amp {
-                    // if the read gap is > to the max configured, don't merge
                     if u64::saturating_sub(cur.pos(), pos) > gap as u64
                         || u64::saturating_sub(pos, cur.pos() + cur.size() as u64) > gap as u64
                     {
@@ -156,7 +155,6 @@ impl<V: IoVec> IOVecMerger<V> {
                     max(cur.pos() + cur.size() as u64, pos + size as u64),
                 );
                 if merged.1 - merged.0 > self.max_merged_buffer_size as u64 {
-                    // if the merged buffer is too large, don't merge
                     let (pos, size) = self.current.replace((pos, size)).unwrap();
                     self.merged.push_front(io);
 
@@ -212,10 +210,21 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> CoalescedReads<V, S> {
 }
 
 impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V, S> {
-    // CoalescedReads returns the original (offset, size) and the (offset, size) it
-    // was merged in
+    /// `CoalescedReads` returns the original (offset, size) and the
+    /// (offset, size) it was merged in.
     type Item = MergedIOVecs<V>;
 
+    /// Pulls IO requests from the underlying stream and attempts to merge
+    /// them with the previous ones, if any. To avoid adding undo latency, we
+    /// flush whatever is in the merger if the underlying stream returns
+    /// `Poll::Pending`.
+    ///
+    /// When the underlying stream is closed, pull out of the merger whatever
+    /// is there, if anything.
+    ///
+    /// Two subsequent merged IO requests may ask for the exact same data
+    /// (because we align then up and down after merging) so there is one more
+    /// opportunity to deduplicate here.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let align = |mut merged_iovec: MergedIOVecs<V>, alignment: u64| {
             let (pos, size) = (merged_iovec.pos(), merged_iovec.size());
@@ -227,10 +236,6 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
         };
 
         let next_inner = |this: &mut Self, cx: &mut Context<'_>| {
-            // pull IO requests from the underlying stream and attempt to merge them with
-            // the previous ones, if any.
-            // To avoid adding undo latency, we flush whatever is in the merger if the
-            // underlying stream returns Poll::Pending.
             loop {
                 match this.iter.poll_next(cx) {
                     Poll::Ready(Some(io)) => {
@@ -249,8 +254,6 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
                 }
             }
 
-            // the underlying stream is closed so pull out of the merger whatever is there,
-            // if anything
             Poll::Ready(if let Some(mut merger) = this.merger.take() {
                 merger.flush()
             } else {
@@ -264,9 +267,6 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
                 inner = align(inner, alignment);
             }
 
-            // two subsequent merged IO requests may ask for the exact same data (because we
-            // align then up and down after merging) so there is one more opportunity to
-            // deduplicate here
             if let Some(last) = &mut this.last {
                 if let Some(last) = last.deduplicate(inner) {
                     return Poll::Ready(Some(last));
@@ -341,11 +341,21 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
 {
     type Item = (ScheduledSource, U);
 
+    /// Poll the underlying stream and insert the resulting source, if any,
+    /// in the local buffer; poll the local buffer for a fulfilled source, if
+    /// any, and replace it with a new one from the underlying stream.
+    ///
+    /// When we have a source with a result in the buffer, we take it out and
+    /// replace it with a new one from the stream, if any, to keep the buffer
+    /// full. When we have a source in the buffer but it's not ready yet, we
+    /// register the buffer and return.
+    ///
+    /// When the internal buffer is full, we consume it instead of creating
+    /// new ones. Otherwise fill the internal buffer as much as possible, and
+    /// if there is anything we can return immediately, do so.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Poll the underlying stream and insert the resulting source, if any, in the
-        // local buffer
         let poll_inner = |this: &mut Self, cx: &mut Context<'_>| match this.iovs.poll_next(cx) {
             Poll::Ready(Some(res)) => {
                 this.inflight_memory += res.1.size();
@@ -355,12 +365,8 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
             _ => {}
         };
 
-        // poll the local buffer for a fulfilled source, if any, and replace it with a
-        // new one from the underlying stream
         let poll_buffer = |this: &mut Self, cx: &mut Context<'_>| {
             if this.inflight.back_mut().unwrap().0.result().is_some() {
-                // we have a source with a result in the buffer so we take it out and replace it
-                // with a new from the stream, if any, to keep the buffer full
                 let ret = this.inflight.pop_back().unwrap();
                 if !this.terminated {
                     poll_inner(this, cx);
@@ -368,8 +374,6 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
                 this.inflight_memory -= ret.1.size();
                 Poll::Ready(Some(ret))
             } else {
-                // we have a source in the buffer but it's not ready yet to we register the
-                // buffer and return
                 this.inflight
                     .back_mut()
                     .unwrap()
@@ -380,15 +384,12 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
         };
 
         if this.is_full() || (this.terminated && !this.inflight.is_empty()) {
-            // The internal buffer is full so we consume them instead of creating new ones
             poll_buffer(this, cx)
         } else {
-            // fill the internal buffer as much as possible
             while !this.is_full() && !this.terminated {
                 poll_inner(this, cx);
             }
 
-            // if there is anything we can return immediately, do so
             if !this.terminated || !this.inflight.is_empty() {
                 poll_buffer(this, cx)
             } else {

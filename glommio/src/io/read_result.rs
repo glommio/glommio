@@ -21,16 +21,16 @@ impl core::ops::Deref for ReadResult {
 }
 
 #[derive(Clone, Debug)]
+/// This (usage of `NonZeroUsize`) is probably needed to make sure that rustc
+/// doesn't need to reserve additional memory for the surrounding `Option`
+/// enum tag. See also `self::test::equal_struct_size`.
+///
+/// The additionally `ReadResultInner` structure is a good idea as it allows a
+/// cleaner implementation (offset and end/len don't have any meaning if
+/// `buffer.is_none()`).
 struct ReadResultInner {
     buffer: ScheduledSource,
     mem: NonNull<u8>,
-
-    // This (usage of `NonZeroUsize`) is probably needed to make sure that rustc
-    // doesn't need to reserve additional memory for the surrounding Option enum tag.
-    // see also `self::test::equal_struct_size`
-    //
-    // The additionally `ReadResultInner` structure is a good idea as it allows
-    // a cleaner implementation (offset and end/len don't have any meaning if buffer.is_none()).
     len: NonZeroUsize,
 }
 
@@ -66,13 +66,14 @@ impl ReadResult {
     ///
     /// Returns `None` if either offset or offset + len would not fit in the
     /// original buffer.
+    ///
+    /// The `len == 0` branch is needed to make sure that calls to `slice`
+    /// with `len = 0` are handled. If they aren't valid, then `len` should be
+    /// changed to `NonZeroUsize`.
     pub fn slice(this: &Self, extra_offset: usize, len: usize) -> Option<Self> {
         Some(Self(if let Some(len) = NonZeroUsize::new(len) {
             Some(ReadResultInner::slice(this.0.as_ref()?, extra_offset, len)?)
         } else {
-            // This branch is needed to make sure that calls to `slice` with `len = 0` are
-            // handled. If they aren't valid, then `len` should be changed to
-            // `NonZeroUsize`.
             None
         }))
     }

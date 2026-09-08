@@ -97,11 +97,11 @@ pub(crate) struct FileScheduler {
 }
 
 impl Drop for FileScheduler {
+    /// The scheduler owns one `Rc` to this `FileScheduler`, so if the count is
+    /// two or less, then we can remove this file scheduler.
     fn drop(&mut self) {
         if Rc::strong_count(&self.inner) <= 2 {
             if let Some(io_sched) = self.io_scheduler.upgrade() {
-                // the scheduler owns one Rc to this FileScheduler
-                // so if the count is two or less, then we can remove this file scheduler
                 io_sched.remove_file(self)
             }
         }
@@ -226,11 +226,11 @@ impl Deref for ScheduledSource {
 }
 
 impl Drop for ScheduledSource {
+    /// The file scheduler owns one `Rc` to this `ScheduledSource`, so if the
+    /// count is two or less, then we can remove this source.
     fn drop(&mut self) {
         if Rc::strong_count(&self.inner) <= 2 {
             if let Some(file) = self.file.upgrade() {
-                // the file scheduler owns one Rc to this ScheduledSource
-                // so if the count is two or less, then we can remove this source
                 file.remove_source(self)
             }
         }
@@ -323,6 +323,8 @@ pub(crate) mod test {
         assert_eq!(file.inner.sources.borrow().iter().count(), 0);
     }
 
+    /// Tests dropping a `ScheduledSource` with a `ScheduledFile` but no io
+    /// scheduler, with no host `ScheduledFile`, and with neither.
     #[test]
     fn source_sched_drop_orphan() {
         {
@@ -332,7 +334,6 @@ pub(crate) mod test {
                 Source::new(Default::default(), 0, SourceType::Invalid, None, None),
                 0..512,
             );
-            // test dropping a ScheduledSource with a ScheduledFile but no io scheduler
             drop(sched);
         }
 
@@ -343,7 +344,6 @@ pub(crate) mod test {
                 Source::new(Default::default(), 0, SourceType::Invalid, None, None),
                 0..512,
             );
-            // test dropping a ScheduledSource with no host ScheduledFile
             drop(file);
         }
 
@@ -354,7 +354,6 @@ pub(crate) mod test {
                 Source::new(Default::default(), 0, SourceType::Invalid, None, None),
                 0..512,
             );
-            // test dropping a ScheduledSource with no host ScheduledFile and io scheduler
             drop(sched);
             drop(file);
         }
@@ -400,32 +399,42 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let read_buf1 = read_some(new_file.clone(), 0..4096).await;
-        // we expect one IO to have been performed at this point
-        // all buffers are dead so this last read should trigger an IO request
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 1);
+        assert_eq!(
+            io_stats.file_reads().0,
+            1,
+            "we expect one IO to have been performed at this point"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 0);
 
         let read_buf2 = read_some(new_file.clone(), 0..4096).await;
-        // should feed from the first buffer
-        // all buffers are dead so this last read should trigger an IO request
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 0);
+        assert_eq!(
+            io_stats.file_reads().0,
+            0,
+            "should feed from the first buffer"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 1);
 
         drop(read_buf1);
         let read_buf3 = read_some(new_file.clone(), 0..4096).await;
-        // initial buffer lifetime should have been extended
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 0);
+        assert_eq!(
+            io_stats.file_reads().0,
+            0,
+            "initial buffer lifetime should have been extended"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 1);
 
         drop(read_buf2);
         drop(read_buf3);
         let _ = read_some(new_file.clone(), 0..4096).await;
-        // all buffers are dead so this last read should trigger an IO request
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 1);
+        assert_eq!(
+            io_stats.file_reads().0,
+            1,
+            "all buffers are dead so this last read should trigger an IO request"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 0);
 
         new_file.close_rc().await.expect("failed to close file");
@@ -464,9 +473,12 @@ pub(crate) mod test {
 
         join!(read_buf1, read_buf2);
 
-        // should feed from the first buffer
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 1);
+        assert_eq!(
+            io_stats.file_reads().0,
+            1,
+            "should feed from the first buffer"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -499,15 +511,21 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let _first = read_some(new_file.clone(), 0..16384).await;
-        // we expect one IO to have been performed at this point
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 1);
+        assert_eq!(
+            io_stats.file_reads().0,
+            1,
+            "we expect one IO to have been performed at this point"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 0);
 
         let _second = read_some(new_file.clone(), 67..578).await;
-        // should feed from the first buffer
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 0);
+        assert_eq!(
+            io_stats.file_reads().0,
+            0,
+            "should feed from the first buffer"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -588,13 +606,19 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let _first = read_some(new_file.clone(), 0..4096).await;
-        // we expect one IO to have been performed at this point
-        assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 1);
+        assert_eq!(
+            crate::executor().io_stats().all_rings().file_reads().0,
+            1,
+            "we expect one IO to have been performed at this point"
+        );
 
         let _second = read_some(linked_file.clone(), 0..4096).await;
-        // should feed from the first buffer
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 0);
+        assert_eq!(
+            io_stats.file_reads().0,
+            0,
+            "should feed from the first buffer"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
         linked_file.close_rc().await.expect("failed to close file");
@@ -640,13 +664,19 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let _first = read_some(new_file.clone(), 0..4096).await;
-        // we expect one IO to have been performed at this point
-        assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 1);
+        assert_eq!(
+            crate::executor().io_stats().all_rings().file_reads().0,
+            1,
+            "we expect one IO to have been performed at this point"
+        );
 
         let _second = read_some(linked_file.clone(), 0..4096).await;
-        // should feed from the first buffer
         let io_stats = crate::executor().io_stats().all_rings();
-        assert_eq!(io_stats.file_reads().0, 0);
+        assert_eq!(
+            io_stats.file_reads().0,
+            0,
+            "should feed from the first buffer"
+        );
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
         linked_file.close_rc().await.expect("failed to close file");

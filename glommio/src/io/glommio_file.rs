@@ -146,9 +146,9 @@ impl AdvisoryLockStateHolder {
 pub(crate) struct GlommioFile {
     pub(crate) file: Option<Arc<OwnedFd>>,
     pub(crate) lock_state: Option<Arc<AdvisoryLockStateHolder>>,
-    // A file can appear in many paths, through renaming and linking.
-    // If we do that, each path should have its own object. This is to
-    // facilitate error displaying.
+    /// A file can appear in many paths, through renaming and linking. If we
+    /// do that, each path should have its own object. This is to facilitate
+    /// error displaying.
     pub(crate) path: RefCell<Option<PathBuf>>,
     pub(crate) inode: u64,
     pub(crate) dev_major: u32,
@@ -302,6 +302,8 @@ impl GlommioFile {
         }
     }
 
+    /// Separates file descriptors but the same file entry; try taking the
+    /// fd...
     pub(crate) async fn try_take_last_clone_unlocking_guard(
         self,
         guard: OwnedGlommioFile,
@@ -325,7 +327,6 @@ impl GlommioFile {
                 guard.lock_state.as_ref().unwrap()
             ));
 
-            // Seperate file descriptors but the same file entry. Try taking the fd...
             match self.try_take_last_clone() {
                 Ok(took) => {
                     let original: GlommioFile = guard.into();
@@ -337,11 +338,12 @@ impl GlommioFile {
         }
     }
 
+    /// Destruct `self`, signalling to `Drop` that there is no need to async
+    /// close. Similarly, because we're about to close, we don't need to do
+    /// anything with the advisory lock - if this is the last clone of the
+    /// file, then it'll unlock implicitly by closing the fd. And if it's not
+    /// (e.g. a dup exists), then we can't safely unlock yet anyway.
     pub(crate) fn discard(mut self) -> (Option<RawFd>, Option<PathBuf>) {
-        // Destruct `self` signalling to `Drop` that there is no need to async close.
-        // Similarly, because we're about to close, we don't need to do anything with the advisory lock - if this is
-        // the last clone of the file, then it'll unlock implicitly by closing the fd. And if it's not (e.g. a dup
-        // exists), then we can't safely unlock yet anyway.
         self.lock_state.take().unwrap();
 
         let file = self.file.take().unwrap();
@@ -356,7 +358,6 @@ impl GlommioFile {
 
     pub(crate) async fn close(self) -> Result<()> {
         let reactor = self.reactor.upgrade().unwrap();
-        // Destruct `self` into components skipping Drop.
         let (fd, path) = self.discard();
         if let Some(fd) = fd {
             let source = reactor.close(fd);
@@ -398,17 +399,19 @@ impl GlommioFile {
         Ok(())
     }
 
+    /// NOTE: The try variant could just do the syscall directly instead of
+    /// dispatching to a blocking thread. For consistency though it's
+    /// implemented the same way.
     pub(crate) async fn try_lock_shared(&self) -> Result<OwnedGlommioFile> {
-        // NOTE: The try variant could just do the syscall directly instead of dispatching to a blocking thread.
-        // For consistency though it's implemented the same was.
         self.flock("try_lock_shared", libc::LOCK_SH | libc::LOCK_NB)
             .await
             .map(|()| self.clone().into())
     }
 
+    /// NOTE: The try variant could just do the syscall directly instead of
+    /// dispatching to a blocking thread. For consistency though it's
+    /// implemented the same way.
     pub(crate) async fn try_lock_exclusive(&self) -> Result<OwnedGlommioFile> {
-        // NOTE: The try variant could just do the syscall directly instead of dispatching to a blocking thread.
-        // For consistency though it's implemented the same way.
         self.flock("try_lock_exclusive", libc::LOCK_EX | libc::LOCK_NB)
             .await
             .map(|()| self.clone().into())
@@ -559,7 +562,7 @@ impl GlommioFile {
         Ok(())
     }
 
-    // Retrieve file metadata, backed by the statx(2) syscall
+    /// Retrieve file metadata, backed by the statx(2) syscall.
     pub(crate) async fn statx(&self) -> Result<Statx> {
         let source = self.reactor.upgrade().unwrap().statx(self.as_raw_fd());
         source.collect_rw().await.map_err(|source| {
@@ -753,6 +756,8 @@ pub(crate) mod test {
     use crate::{test_utils::*, timer::sleep};
     use std::time::Duration;
 
+    /// The `let _ = { gf };` moves scope and drops, and the sleep forces the
+    /// reactor to run, which will drop the file.
     #[test]
     fn drop_closes_the_file() {
         test_executor!(async move {
@@ -776,10 +781,13 @@ pub(crate) mod test {
                 files
             };
 
-            assert!(file_list().contains(&gf_fd)); // sanity check that file is open
-            let _ = { gf }; // moves scope and drops
-            sleep(Duration::from_millis(10)).await; // forces the reactor to run, which will drop the file
-            assert!(!file_list().contains(&gf_fd)); // file is gone
+            assert!(
+                file_list().contains(&gf_fd),
+                "sanity check that file is open"
+            );
+            let _ = { gf };
+            sleep(Duration::from_millis(10)).await;
+            assert!(!file_list().contains(&gf_fd), "file is gone");
         });
     }
 }

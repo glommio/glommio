@@ -28,13 +28,15 @@ pub struct GlommioDatagram<S: AsRawFd + FromRawFd + From<socket2::Socket>> {
     pub(crate) write_timeout: Cell<Option<Duration>>,
     pub(crate) read_timeout: Cell<Option<Duration>>,
 
-    // you only live once, you've got no time to block! if this is set to true try a direct
-    // non-blocking syscall otherwise schedule for sending later over the ring
-    //
-    // If you are familiar with high throughput networking code you might have seen similar
-    // techniques with names such as "optimistic" "speculative" or things like that. But frankly
-    // "yolo" is such a better name. Calling this "yolo" is likely glommio's biggest
-    // contribution to humankind.
+    /// You only live once, you've got no time to block! If this is set to
+    /// true, try a direct non-blocking syscall; otherwise schedule for
+    /// sending later over the ring.
+    ///
+    /// If you are familiar with high throughput networking code you might
+    /// have seen similar techniques with names such as "optimistic"
+    /// "speculative" or things like that. But frankly "yolo" is such a better
+    /// name. Calling this "yolo" is likely glommio's biggest contribution to
+    /// humankind.
     pub(crate) tx_yolo: Cell<bool>,
     pub(crate) rx_yolo: Cell<bool>,
 

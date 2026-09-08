@@ -709,6 +709,9 @@ mod tests {
     }
 
     #[test]
+    /// We can't rely on how the load balancing will happen, so we just send a
+    /// bunch. There seems to be affinity, so every time we send we create a
+    /// new source address.
     fn multi_executor_bind_works() {
         test_executor!(async move {
             let addr_picker = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -738,9 +741,6 @@ mod tests {
 
             Timer::new(Duration::from_millis(100)).await;
 
-            // Because we can't rely on how the load balancing will happen,
-            // we just send a bunch. There seems to be affinity, so every time
-            // we send we create a new source address
             for _ in 0..1000 {
                 let client = UdpSocket::bind("127.0.0.1:0").unwrap();
                 client.send_to(&[65; 1], addr).await.unwrap();
@@ -787,6 +787,7 @@ mod tests {
         });
     }
 
+    /// Because we are connected, those messages will never arrive.
     #[test]
     fn udp_connected_recv_filter() {
         test_executor!(async move {
@@ -794,7 +795,6 @@ mod tests {
             let other_sender = UdpSocket::bind("127.0.0.1:0").unwrap();
             for _ in 0..10 {
                 sender.send(&[65u8; 1]).await.unwrap();
-                // because we are connected, those messages will never arrive.
                 other_sender
                     .send_to(&[64u8; 1], receiver.local_addr().unwrap())
                     .await
@@ -816,7 +816,6 @@ mod tests {
 
             let recv_handle = crate::spawn_local(async move {
                 let mut buf = [0u8; 10];
-                // try to receive 10 bytes, but will assert that none comes back.
                 let sz = receiver.recv(&mut buf).await.unwrap();
                 assert_eq!(sz, 0);
             })
@@ -855,7 +854,7 @@ mod tests {
         });
     }
 
-    // sends first and then receive, so will hit the nonblocking path.
+    /// Sends first and then receive, so will hit the nonblocking path.
     #[test]
     fn peekfrom_non_blocking() {
         test_executor!(async move {
@@ -872,7 +871,8 @@ mod tests {
         });
     }
 
-    // like the previous test, but recvs first so likely hits the io_uring path
+    /// Like the previous test, but recvs first so likely hits the io_uring
+    /// path.
     #[test]
     fn peekfrom_blocking() {
         test_executor!(async move {
@@ -909,7 +909,7 @@ mod tests {
         });
     }
 
-    // sends first and then receive, so will hit the nonblocking path.
+    /// Sends first and then receive, so will hit the nonblocking path.
     #[test]
     fn recvfrom_non_blocking() {
         test_executor!(async move {
@@ -926,7 +926,8 @@ mod tests {
         });
     }
 
-    // like the previous test, but recvs first so likely hits the io_uring path
+    /// Like the previous test, but recvs first so likely hits the io_uring
+    /// path.
     #[test]
     fn recvfrom_blocking() {
         test_executor!(async move {

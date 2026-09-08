@@ -28,7 +28,7 @@ use crate::{
 
 /// The vtable for a task.
 pub(crate) struct TaskVTable {
-    /// Schedules the task, consuming an existing counted runnable reference.
+    /// Schedules an existing runnable, consuming its counted reference.
     pub(crate) schedule: unsafe fn(*const ()),
 
     /// Returns a pointer to the output stored after completion.
@@ -292,15 +292,22 @@ where
     /// release may run anywhere: no future, output, or schedule closure remains.
     #[inline]
     unsafe fn release(ptr: *const ()) {
+        Self::release_references(ptr, 1);
+    }
+
+    #[inline]
+    unsafe fn release_references(ptr: *const (), count: RefCount) {
         let header = ptr as *const Header;
-        let refs = (*header).references.fetch_sub(1, Ordering::Release);
-        if refs <= 0 {
+        let refs = (*header).references.fetch_sub(count, Ordering::Release);
+        if refs < count {
             abort();
         }
-        if refs == 1 {
+        if refs == count {
             fence(Ordering::Acquire);
             Self::destroy(ptr);
         }
+        // A concurrent final release may free the allocation immediately after
+        // our decrement. Do not access the header on the nonfinal path.
     }
 
     /// Keep our reference while arranging owner cleanup of an abandoned future.
@@ -314,6 +321,13 @@ where
         loop {
             if refs <= 0 {
                 abort();
+            }
+            if refs == 1 {
+                // There are no weak task references: ownership cannot be
+                // recreated without an existing counted reference. This acquire
+                // load proves exclusive ownership and observes prior cleanup.
+                Self::destroy(ptr);
+                return;
             }
             if refs == 2
                 && (*header).active.load(Ordering::Acquire)
@@ -337,13 +351,7 @@ where
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    if refs == 1 {
-                        fence(Ordering::Acquire);
-                        Self::destroy(ptr);
-                    }
-                    return;
-                }
+                Ok(_) => return,
                 Err(current) => refs = current,
             }
         }
@@ -381,35 +389,21 @@ where
         }
     }
 
-    /// Creates and schedules a new runnable for a wake or cancellation request.
+    /// Creates a new runnable when a wake or cancellation needs to schedule it.
     unsafe fn schedule(ptr: *const ()) {
-        Self::schedule_with_reference(ptr, false);
+        Self::increment_references(ptr as *const Header);
+        Self::schedule_owned(ptr);
     }
 
-    /// Schedules an existing counted runnable, transferring its reference.
+    /// Transfers a counted runnable into the schedule closure. The registry's
+    /// reference protects the closure until the guard permits owner cleanup,
+    /// including when the callback runs or drops the task synchronously.
     unsafe fn schedule_owned(ptr: *const ()) {
-        Self::schedule_with_reference(ptr, true);
-    }
-
-    /// A separate counted guard protects the scheduling closure while it runs
-    /// or drops the runnable synchronously, including during unwinding.
-    #[inline]
-    unsafe fn schedule_with_reference(ptr: *const (), owned: bool) {
         let raw = Self::from_ptr(ptr);
         let header = raw.header as *mut Header;
         if (*header).state & SCHEDULE_DROPPED != 0 {
-            if owned {
-                Self::release(ptr);
-            }
+            Self::release(ptr);
             return;
-        }
-
-        // Acquire the callback guard and, unless supplied by the caller, the
-        // runnable reference together.
-        let count = if owned { 1 } else { 2 };
-        let refs = (*header).references.fetch_add(count, Ordering::Relaxed);
-        if refs <= 0 || refs > RefCount::MAX - count {
-            abort();
         }
         let was_scheduling = mem::replace(&mut (*header).scheduling, true);
         let _guard = ScheduleGuard {
@@ -447,9 +441,17 @@ where
         Self::from_ptr(ptr).output as *const ()
     }
 
-    /// Releases owner-only resources and then the registry's reference. Callers
-    /// must retain their own reference across this function and its destructors.
+    /// Releases owner-only resources and then the registry's reference. The
+    /// registry protects all destructor callbacks; its release may free the task.
     unsafe fn finish(ptr: *const ()) {
+        if Self::cleanup_owner(ptr) {
+            Self::release(ptr);
+        }
+    }
+
+    /// Cleans and unlinks the task, returning whether the caller must release
+    /// the registry reference. Keeping it counted lets run combine both releases.
+    unsafe fn cleanup_owner(ptr: *const ()) -> bool {
         let raw = Self::from_ptr(ptr);
         let header = raw.header as *mut Header;
         if (*header).state & SCHEDULE_DROPPED != 0
@@ -457,7 +459,7 @@ where
             || (*header).state & RUNNING != 0
             || (*header).scheduling
         {
-            return;
+            return false;
         }
         (*header).active.store(false, Ordering::Release);
         (*header).scheduling = true;
@@ -471,7 +473,7 @@ where
         if !(*header).prev_link.is_null() {
             TaskRegistry::remove(header);
         }
-        Self::release(ptr);
+        true
     }
 
     /// Cancels without polling. RUNNING also protects the future while its
@@ -535,7 +537,7 @@ where
     /// the !Send output was taken or destroyed before releasing the handle.
     unsafe fn destroy(ptr: *const ()) {
         let header = ptr as *mut Header;
-        // The acquire fence in the final release makes owner cleanup visible.
+        // The acquire load or fence in the final release observes owner cleanup.
         debug_assert_eq!(
             (*header).state & (FUTURE_DROPPED | SCHEDULE_DROPPED | OUTPUT_PRESENT | HANDLE),
             FUTURE_DROPPED | SCHEDULE_DROPPED,
@@ -599,9 +601,13 @@ where
                 }
             }
         }
-        Self::finish(ptr);
+        let release_registry = Self::cleanup_owner(ptr);
         mem::forget(guard);
-        Self::drop_waker(ptr);
+        if release_registry {
+            Self::release_references(ptr, 2);
+        } else {
+            Self::drop_waker(ptr);
+        }
         false
     }
 }
@@ -626,8 +632,8 @@ where
         unsafe {
             let header = self.raw.header as *mut Header;
             (*header).scheduling = self.was_scheduling;
+            // This may release the last reference. Do not access the task again.
             RawTask::<F, R, S>::finish(header as *const ());
-            RawTask::<F, R, S>::drop_waker(header as *const ());
         }
     }
 }

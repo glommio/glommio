@@ -48,13 +48,23 @@
 
 #![warn(missing_docs, missing_debug_implementations)]
 
+#[cfg(test)]
+mod cleanup_tests;
 #[cfg(feature = "debugging")]
 pub mod debugging;
 pub(crate) mod header;
 pub(crate) mod join_handle;
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod ownership_tests;
+#[cfg(test)]
+mod public_spawn_tests;
 pub(crate) mod raw;
 pub(crate) mod state;
 pub(crate) mod task_impl;
+#[cfg(test)]
+mod test_support;
 mod tests;
 pub(crate) mod utils;
 pub(crate) mod waker_fn;

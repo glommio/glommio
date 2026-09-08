@@ -429,6 +429,9 @@ where
             });
 
             // Finally, deallocate the memory reserved by the task.
+            #[cfg(test)]
+            crate::task::test_support::deallocate(ptr as *mut u8, task_layout.layout);
+            #[cfg(not(test))]
             alloc::alloc::dealloc(ptr as *mut u8, task_layout.layout);
         });
     }

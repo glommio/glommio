@@ -20,6 +20,8 @@ use std::{
 
 pub(super) mod blocking;
 pub(crate) mod hardware_topology;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{
@@ -329,6 +331,9 @@ impl SleepNotifier {
                 self.id()
             );
         }
+
+        #[cfg(test)]
+        test_support::after_foreign_wake_queued();
 
         self.notify(force_notify);
     }

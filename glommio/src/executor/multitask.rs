@@ -10,7 +10,7 @@
 
 use crate::{
     executor::{maybe_activate, TaskQueue},
-    task::{task_impl, JoinHandle},
+    task::{registry::TaskRegistry, task_impl, JoinHandle},
     Latency,
 };
 use std::{
@@ -137,6 +137,7 @@ impl LocalExecutor {
     fn spawn<T>(
         &self,
         executor_id: usize,
+        registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> (Runnable, JoinHandle<T>) {
@@ -161,16 +162,17 @@ impl LocalExecutor {
 
         // Create a task, push it into the queue by scheduling it, and return its `Task`
         // handle.
-        task_impl::spawn_local(executor_id, future, schedule, latency_matters)
+        task_impl::spawn_local(executor_id, registry, future, schedule, latency_matters)
     }
 
     pub(crate) fn spawn_and_run<T>(
         &self,
         executor_id: usize,
+        registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
-        let (runnable, handle) = self.spawn(executor_id, tq, future);
+        let (runnable, handle) = self.spawn(executor_id, registry, tq, future);
         runnable.run_right_away();
         Task(Some(handle))
     }
@@ -178,10 +180,11 @@ impl LocalExecutor {
     pub(crate) fn spawn_and_schedule<T>(
         &self,
         executor_id: usize,
+        registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
-        let (runnable, handle) = self.spawn(executor_id, tq, future);
+        let (runnable, handle) = self.spawn(executor_id, registry, tq, future);
         runnable.schedule();
         Task(Some(handle))
     }

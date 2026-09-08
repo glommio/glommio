@@ -38,7 +38,7 @@ use crate::{
     io::DmaBuffer,
     parking, reactor,
     sys::{self, blocking::BlockingThreadPool},
-    task::{self, waker_fn::dummy_waker},
+    task::{self, registry::TaskRegistry, waker_fn::dummy_waker},
     GlommioError, IoRequirements, IoStats, Latency, Reactor, Shares,
 };
 use ahash::AHashMap;
@@ -1151,6 +1151,7 @@ pub struct LocalExecutorConfig {
 #[derive(Debug)]
 pub struct LocalExecutor {
     queues: Rc<RefCell<ExecutorQueues>>,
+    pub(crate) tasks: Rc<TaskRegistry>,
     parker: parking::Parker,
     id: usize,
     reactor: Rc<reactor::Reactor>,
@@ -1215,6 +1216,7 @@ impl LocalExecutor {
         trace!(id = id, "Creating executor");
         Ok(LocalExecutor {
             queues: Rc::new(RefCell::new(queues)),
+            tasks: Rc::new(TaskRegistry::new()),
             parker: p,
             id,
             reactor: Rc::new(reactor::Reactor::new(
@@ -1343,7 +1345,7 @@ impl LocalExecutor {
 
         let id = self.id;
         let ex = tq.borrow().ex.clone();
-        ex.spawn_and_run(id, tq, future)
+        ex.spawn_and_run(id, &self.tasks, tq, future)
     }
 
     /// Spawns a task directly onto this executor instance.
@@ -1387,7 +1389,7 @@ impl LocalExecutor {
         let id = self.id;
 
         // can't run right away, because we need to cross into a different task queue
-        Ok(ex.spawn_and_schedule(id, tq, future))
+        Ok(ex.spawn_and_schedule(id, &self.tasks, tq, future))
     }
 
     fn preempt_timer_duration(&self) -> Duration {
@@ -1622,6 +1624,43 @@ impl LocalExecutor {
             defer!(LOCAL_EX = std::ptr::null());
             LOCAL_EX = self as *const Self;
             run(self)
+        }
+    }
+}
+
+impl Drop for LocalExecutor {
+    fn drop(&mut self) {
+        let shutdown = || {
+            sys::get_sleep_notifier_for(self.id)
+                .expect("executor's sleep notifier disappeared before shutdown")
+                .close_foreign_wakes();
+            self.tasks.shutdown();
+
+            // Keep the owner context installed until queued runnable references
+            // have also been released. Never hold queue borrows across drops.
+            let executors: Vec<_> = self
+                .queues
+                .borrow()
+                .available_executors
+                .values()
+                .map(|queue| queue.borrow().ex.clone())
+                .collect();
+            for executor in executors {
+                while let Some(task) = executor.get_task() {
+                    drop(task);
+                }
+            }
+        };
+
+        #[cfg(any(not(nightly), not(feature = "native-tls")))]
+        LOCAL_EX.set(self, shutdown);
+
+        #[cfg(all(nightly, feature = "native-tls"))]
+        unsafe {
+            let previous = LOCAL_EX;
+            defer!(LOCAL_EX = previous);
+            LOCAL_EX = self as *const Self;
+            shutdown();
         }
     }
 }

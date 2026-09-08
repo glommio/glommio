@@ -1993,6 +1993,9 @@ impl Reactor {
     ///   because since last time until now it could be that something
     ///   happened in a remote executor that opened up room. If it did we
     ///   bail on sleep and go process it.
+    ///   This final remote-event check can also destroy abandoned tasks.
+    ///   Ring borrows are released around the callback so their destructors
+    ///   can submit I/O, then reacquired before further ring operations.
     /// * `membarrier::heavy()` -- see
     ///   <https://www.scylladb.com/2018/02/15/memory-barriers-seastar-linux/>
     ///   for details. This translates to `sys_membarrier()` /
@@ -2054,7 +2057,11 @@ impl Reactor {
             }
             self.notifier.prepare_to_sleep();
             membarrier::heavy();
+            drop((poll_ring, main_ring, lat_ring));
             let events = process_remote_channels() + self.flush_syscall_thread();
+            poll_ring = self.poll_ring.borrow_mut();
+            main_ring = self.main_ring.borrow_mut();
+            lat_ring = self.latency_ring.borrow_mut();
             if events == 0 {
                 if self.eventfd_src.is_installed().unwrap() {
                     self.link_rings_and_sleep(&mut main_ring)

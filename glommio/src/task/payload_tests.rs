@@ -279,6 +279,7 @@ fn schedule_capture<const N: usize>() {
         // A real executor ID and owner context preserve the raw task contract.
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
+            &ex.tasks,
             future,
             move |task| {
                 let _ = &schedule_guard;

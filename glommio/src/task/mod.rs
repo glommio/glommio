@@ -38,8 +38,11 @@
 //! Task construction incurs a single allocation that holds its state, the
 //! schedule function, and the future or the result of the future if completed.
 //!
-//! The layout of a task is equivalent to 4 `usize`s followed by the schedule
-//! function, and then by a union of the future and its output.
+//! A header tracks the task's references and membership in its executor's
+//! cleanup registry. It is followed by the schedule function and a union of the
+//! future and its output. The executor drops thread-local resources before
+//! releasing its reference; surviving wakers can then free the allocation on
+//! any thread.
 //!
 //! [`spawn_local`]: fn.spawn_local.html
 //! [`Task`]: struct.Task.html
@@ -65,6 +68,7 @@ mod payload_tests;
 #[cfg(test)]
 mod public_spawn_tests;
 pub(crate) mod raw;
+pub(crate) mod registry;
 pub(crate) mod state;
 pub(crate) mod task_impl;
 #[cfg(test)]

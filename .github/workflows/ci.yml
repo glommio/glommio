@@ -155,6 +155,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Use Rust MSRV for building and testing
+        run: rustup override set 1.92.0
+
       - name: Set up musl
         if: matrix.musl
         uses: ./.github/actions/setup-musl

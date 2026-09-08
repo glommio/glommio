@@ -265,7 +265,6 @@ impl<T> fmt::Display for GlommioError<T> {
                 ),
                 ResourceType::RwLock => write!(f, "RwLock is closed"),
                 ResourceType::Channel(_) => write!(f, "Channel is closed"),
-                // TODO: look at what this format string should be as per bug report..
                 ResourceType::File(msg) => write!(f, "File is closed ({msg})"),
                 ResourceType::Gate => write!(f, "Gate is closed"),
             },
@@ -385,6 +384,9 @@ impl fmt::Display for QueueErrorKind {
 /// Note this is a tricky impl in the sense that you will not get the
 /// information you expect from just using this display impl on a value. On the
 /// other hand the display impl for the entire error will give correct results.
+///
+/// TODO: look at what the `ResourceType::File` format string should be, as
+/// per bug report.
 impl<T> fmt::Display for ResourceType<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

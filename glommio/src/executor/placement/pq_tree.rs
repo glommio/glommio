@@ -73,30 +73,31 @@ where
         (lhs.0 * rhs.1).cmp(&(rhs.0 * lhs.1))
     }
 
+    /// Uses the tree as a min heap: smaller values have higher priority.
     fn priority_spread(&self, other: &Self) -> Ordering {
         let ord = Self::cmp_saturation(self.slot_saturation(), other.slot_saturation());
-        // use as min heap: smaller values have higher priority
         ord.reverse()
     }
 
+    /// If a node is partially saturated (i.e. currently being filled by the
+    /// packing iterator), then it takes priority.
+    ///
+    /// If the node is not partially saturated, then it is either equally
+    /// saturated or one node has a greater saturation than the other (note
+    /// that integer division here is exact because we checked for remainders
+    /// above). If nodes are equally saturated, the node with more slots
+    /// (i.e. CPUs online) is used; if nodes are not equally saturated, the
+    /// node with lower saturation is used.
     fn priority_pack(&self, other: &Self) -> Ordering {
-        // if a node is partially saturated (i.e. currently being filled by the packing
-        // iterator), then it takes priority
         if !self.nr_slots_selected.is_multiple_of(self.nr_slots) {
             Ordering::Greater
         } else if !other.nr_slots_selected.is_multiple_of(other.nr_slots) {
             Ordering::Less
         } else {
-            // if the node is not partially saturated, then it is either equally saturated
-            // or one node has a greater saturation than the other (note that
-            // integer division here is exact because we checked for remainders
-            // above)
             match (self.nr_slots_selected / self.nr_slots)
                 .cmp(&(other.nr_slots_selected / other.nr_slots))
             {
-                // if nodes are equally saturated, use the node with more slots (i.e. CPUs online)
                 Ordering::Equal => self.nr_slots.cmp(&other.nr_slots),
-                // if nodes are not equally saturated, use the node with lower saturation
                 ord => ord.reverse(),
             }
         }
@@ -205,6 +206,8 @@ impl Path {
 
 impl std::convert::TryFrom<Path> for CpuLocation {
     type Error = &'static str;
+    /// Trees built without a cache level (the test fixtures) yield no cache
+    /// domain; fall back the same way the sysfs parser does.
     fn try_from(path: Path) -> Result<Self, Self::Error> {
         let mut cpu = None;
         let mut core = None;
@@ -244,8 +247,6 @@ impl std::convert::TryFrom<Path> for CpuLocation {
                 core,
                 package,
                 numa_node,
-                // Trees built without a cache level (the test fixtures) yield
-                // no cache domain; fall back the same way the sysfs parser does.
                 cache_domain: cache.unwrap_or(package),
             }),
             _ => Err("Failed to construct Path from CpuLocation"),
@@ -261,13 +262,15 @@ mod test {
     type NodePack = Node<marker::Pack>;
 
     #[test]
+    /// 2 numa nodes per system/root, 3 packages per numa, 5 cores per
+    /// package, 7 cpus per core.
     fn construct_pq_tree_spread() {
         use std::collections::HashSet;
 
-        let nr_numa = 2; // # per system / root
-        let nr_pkg = 3; // # per numa
-        let nr_core = 5; // # per pkg
-        let nr_cpu = 7; // # per cpu
+        let nr_numa = 2;
+        let nr_pkg = 3;
+        let nr_core = 5;
+        let nr_cpu = 7;
 
         let total_cpus = nr_numa * nr_pkg * nr_core * nr_cpu;
 
@@ -308,13 +311,15 @@ mod test {
     }
 
     #[test]
+    /// 2 numa nodes in the system/root, 3 packages per numa, 5 cores per
+    /// package, 7 cpus per core.
     fn construct_pq_tree_pack() {
         use std::collections::HashSet;
 
-        let nr_numa = 2; // # in system / root
-        let nr_pkg = 3; // # per numa
-        let nr_core = 5; // # per pkg
-        let nr_cpu = 7; // # per cpu
+        let nr_numa = 2;
+        let nr_pkg = 3;
+        let nr_core = 5;
+        let nr_cpu = 7;
 
         let total_cpus = nr_numa * nr_pkg * nr_core * nr_cpu;
 

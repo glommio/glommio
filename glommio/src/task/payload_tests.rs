@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! Lifecycle coverage for thread-local task payloads, results, and schedules.
 
 use std::{
@@ -37,7 +37,6 @@ struct PayloadFuture<R, const N: usize> {
     polls: PollCount,
     behavior: Behavior,
     _guard: DropGuard,
-    // Exercise both branches of spawn_local's future-size threshold.
     _padding: [u8; N],
 }
 
@@ -116,7 +115,6 @@ fn completed_output<const N: usize>(waker_first: bool, foreign: bool) {
     output_drops.assert_not_dropped();
     if waker_first {
         release_waker(waker, foreign);
-        // The handle must retain its unread !Send result after the last waker.
         allocation.assert_live();
         output_drops.assert_not_dropped();
         let mut handle = handle;
@@ -150,7 +148,6 @@ fn suspended_shutdown<const N: usize>(foreign: bool) {
         while polls.get() == 0 {
             yield_now().await;
         }
-        // There is no runnable task left in any executor queue.
         drop(handle);
         allocation
     });
@@ -223,7 +220,6 @@ fn suspended_handle_survives_shutdown<const N: usize>(foreign: bool) {
     let drops_at_shutdown = future_drops.drops();
     allocation.assert_live();
 
-    // Poll once so missing shutdown cancellation fails without hanging the test.
     let dummy = dummy_waker();
     let result = Pin::new(&mut handle).poll(&mut Context::from_waker(&dummy));
     drop(handle);
@@ -276,7 +272,6 @@ fn schedule_capture<const N: usize>() {
         payload_future::<_, N>((), Behavior::Complete, future_drops.guard());
     let schedule_guard = schedule_drops.guard();
     let allocation = ex.run(async {
-        // A real executor ID and owner context preserve the raw task contract.
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
@@ -356,7 +351,6 @@ fn reentrant_output<const N: usize>(wake: bool) {
         .take()
         .expect("task was not polled");
     drop(ex);
-    // This destructor reenters another task's raw waker path on the owner.
     drop(handle);
     release_waker(waker, true);
 

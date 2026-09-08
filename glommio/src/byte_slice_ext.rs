@@ -98,9 +98,8 @@ fn slice_memset(destination: &mut [u8], value: u8) {
     }
 }
 
-// A NOTE about `#[inline]`: rustc currently only inlines code *across crate
-// boundaries* if it is marked with `#[inline]`.
-
+/// A NOTE about `#[inline]`: rustc currently only inlines code *across crate
+/// boundaries* if it is marked with `#[inline]`.
 impl<T: AsRef<[u8]> + ?Sized> ByteSliceExt for T {
     #[inline]
     fn read_at<D: AsMut<[u8]> + ?Sized>(&self, offset: usize, destination: &mut D) -> usize {

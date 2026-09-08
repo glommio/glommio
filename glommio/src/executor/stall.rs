@@ -107,8 +107,8 @@ pub(crate) struct StallDetector {
     id: usize,
     terminated: Arc<AtomicBool>,
     signal_id: signal_hook::SigId,
-    // NOTE: we don't use signal_hook::low_level::channel as backtraces
-    // have too many elements
+    /// We don't use `signal_hook::low_level::channel` as backtraces have too
+    /// many elements.
     rx: crossbeam::channel::Receiver<backtrace::BacktraceFrame>,
 }
 
@@ -142,6 +142,10 @@ impl StallDetector {
         })
     }
 
+    /// Installs the signal handler.
+    ///
+    /// Bails if we can't send or if we've gotten a signal from an unexpected
+    /// thread (i.e., a signal targeting the process).
     fn install_handler(
         tx: crossbeam::channel::Sender<backtrace::BacktraceFrame>,
         signal: u8,
@@ -149,8 +153,6 @@ impl StallDetector {
         let exec_thread = thread::current().id();
         unsafe {
             let signal_id = signal_hook::low_level::register(signal.into(), move || {
-                // Bail if we can't send or if we've gotten a signal
-                // from an unexpected thread (i.e., a signal targeting the process)
                 if tx.is_full() || thread::current().id() != exec_thread {
                     return;
                 }
@@ -359,6 +361,12 @@ mod test {
     }
 
     #[test]
+    /// The sleeping stretches below trigger the stall detector because we
+    /// go over budget; the 40ms one is under it (< 50ms of
+    /// un-cooperativeness, no stall), the timer yields internally so it
+    /// does not stall either; the last 100ms sleep triggers one more
+    /// detection, and the final check makes sure nothing else was
+    /// reported.
     fn executor_stall_detector() {
         let stall_handler = TestHandler::new(nix::libc::SIGUSR1 as u8);
         LocalExecutorBuilder::default()
@@ -367,13 +375,12 @@ mod test {
             .make()
             .unwrap()
             .run(async {
-                // will trigger the stall detector because we go over budget
                 thread::sleep(Duration::from_millis(100));
 
                 let exec = crate::executor();
                 assert!(stall_handler.inner.read().unwrap().detections.is_empty());
 
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
 
                 assert!(stall_handler
                     .inner
@@ -383,23 +390,20 @@ mod test {
                     .pop()
                     .is_some());
 
-                // no stall because < 50ms of un-cooperativeness
                 thread::sleep(Duration::from_millis(40));
 
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
                 assert!(stall_handler.inner.read().unwrap().detections.is_empty());
 
-                // no stall because a timer yields internally
                 sleep(Duration::from_millis(100)).await;
 
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
 
                 assert!(stall_handler.inner.read().unwrap().detections.is_empty());
 
-                // trigger one last time
                 thread::sleep(Duration::from_millis(100));
 
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
 
                 assert!(stall_handler
                     .inner
@@ -409,13 +413,14 @@ mod test {
                     .pop()
                     .is_some());
 
-                // Make sure nothing else was reported
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
                 assert!(stall_handler.inner.read().unwrap().detections.is_empty());
             });
     }
 
     #[test]
+    /// Each executor sleeps past the budget, which triggers the stall
+    /// detector.
     fn stall_detector_correct_signal_handler() {
         let mut build_handlers: Vec<(TestHandler, LocalExecutorBuilder)> = Vec::with_capacity(10);
         for i in 1..11 {
@@ -431,12 +436,11 @@ mod test {
         for (handler, builder) in build_handlers {
             let join_handle = builder.spawn(move || async move {
                 let exec = crate::executor();
-                // will trigger the stall detector because we go over budget
                 thread::sleep(Duration::from_millis(100));
 
                 assert!(handler.inner.read().unwrap().detections.is_empty());
 
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
 
                 let detection = handler.inner.write().unwrap().detections.pop();
                 assert!(detection.is_some());
@@ -450,6 +454,8 @@ mod test {
     }
 
     #[test]
+    /// Each executor sleeps past the budget, which triggers the stall
+    /// detector.
     fn stall_detector_multiple_signals() {
         let signals = [
             nix::libc::SIGALRM as u8,
@@ -471,12 +477,11 @@ mod test {
         for (handler, builder) in build_handlers {
             let join_handle = builder.spawn(move || async move {
                 let exec = crate::executor();
-                // will trigger the stall detector because we go over budget
                 thread::sleep(Duration::from_millis(100));
 
                 assert!(handler.inner.read().unwrap().detections.is_empty());
 
-                exec.yield_task_queue_now().await; // yield the queue
+                exec.yield_task_queue_now().await;
 
                 let detection = handler.inner.write().unwrap().detections.pop();
                 assert!(detection.is_some());

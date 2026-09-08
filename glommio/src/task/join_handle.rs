@@ -66,6 +66,13 @@ impl<R> Drop for JoinHandle<R> {
 impl<R> Future for JoinHandle<R> {
     type Output = Option<R>;
 
+    /// If the task has been closed, the awaiter is notified and `None` is
+    /// returned: a queued runnable can outlive executor shutdown, so if the
+    /// task is scheduled or running we wait only for the future itself to be
+    /// dropped, and the current task's waker is registered until then.
+    ///
+    /// Even though the awaiter is most likely the current task, it could
+    /// also be another task.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let ptr = self.raw_task.as_ptr();
         let header = ptr as *mut Header;
@@ -73,25 +80,17 @@ impl<R> Future for JoinHandle<R> {
         unsafe {
             let state = (*header).state;
 
-            // If the task has been closed, notify the awaiter and return `None`.
             if state & CLOSED != 0 {
-                // A queued runnable can outlive executor shutdown. Wait only for the
-                // future itself to be dropped.
                 if state & FUTURE_DROPPED == 0 || state & RUNNING != 0 {
-                    // Replace the waker with one associated with the current task.
                     Header::register(&(*header).awaiter, cx.waker());
                     return Poll::Pending;
                 }
 
-                // Even though the awaiter is most likely the current task, it could also be
-                // another task.
                 Header::notify(&{ &*header }.awaiter, Some(cx.waker()));
                 return Poll::Ready(None);
             }
 
-            // If the task is not completed, register the current task.
             if state & COMPLETED == 0 {
-                // Replace the waker with one associated with the current task.
                 Header::register(&(*header).awaiter, cx.waker());
 
                 return Poll::Pending;
@@ -99,11 +98,8 @@ impl<R> Future for JoinHandle<R> {
 
             (*header).state = (state | CLOSED) & !OUTPUT_PRESENT;
 
-            // Notify the awaiter. Even though the awaiter is most likely the current
-            // task, it could also be another task.
             Header::notify(&(*header).awaiter, Some(cx.waker()));
 
-            // Take the output from the task.
             let output = ((*header).vtable.get_output)(ptr) as *mut R;
             Poll::Ready(Some(output.read()))
         }

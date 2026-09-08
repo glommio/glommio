@@ -32,7 +32,6 @@ where
     F: Future<Output = R>,
     S: Fn(Task),
 {
-    // Allocate large futures on the heap.
     let raw_task = if mem::size_of::<F>() >= 2048 {
         let future = alloc::boxed::Box::pin(future);
         RawTask::<_, R, S>::allocate(
@@ -92,10 +91,12 @@ pub struct Task {
 
 impl Task {
     /// Returns the queue index used when recovering the owning executor context.
+    ///
+    /// # Safety
+    /// `raw_task` points at a live task allocation for as long as this `Task`
+    /// reference exists, and the header is its first field.
     pub(crate) fn task_queue_index(&self) -> usize {
         let header = self.raw_task.as_ptr() as *const Header;
-        // SAFETY: `raw_task` points at a live task allocation for as long as
-        // this `Task` reference exists, and the header is its first field.
         unsafe { (*header).task_queue_index }
     }
 

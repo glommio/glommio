@@ -384,7 +384,8 @@ impl CpuSet {
         self.0.len()
     }
 
-    // Delegate Set implementation
+    /// Delegates the `Set` implementation.
+    ///
     /// Returns `true` if the `CpuSet` contains a `CpuLocation`.
     pub fn contains(&self, value: &CpuLocation) -> bool {
         self.0.contains(value)
@@ -597,8 +598,9 @@ impl CpuSetGenerator {
     }
 
     #[cfg(test)]
+    /// The test machine may not have the CPU we are asking for during
+    /// testing.
     fn check_cpu(_: usize) -> Result<()> {
-        // the test machine may not have the CPU we are asking for during testing
         Ok(())
     }
 
@@ -663,18 +665,24 @@ where
     /// `Node` ID to indicate that a `Node` is ready to be pushed onto its
     /// parent), so IDs at a particular level should be unique (e.g. a
     /// `Core` with ID 0 should not exist on `Package`s with IDs 0 and 1).
+    ///
+    /// The number of unique numa IDs and package IDs is used to determine
+    /// whether numa nodes reside outside / above or inside / below packages
+    /// in the machine topology.
+    ///
+    /// Cache domain ids must be unique across the whole tree, like every
+    /// other level. They are not necessarily so as they arrive: a machine
+    /// that reports no cache topology falls back to the package id, and if
+    /// numa nodes nest inside packages that same id then appears under two
+    /// different parents. They are remapped against the parents to
+    /// guarantee it.
+    ///
+    /// The topology must be sorted such that all children of a `Node` are
+    /// added to a parent consecutively.
     pub fn from_topology(mut topology: Vec<CpuLocation>) -> Self {
-        // use the number of unique numa IDs and package IDs to determine whether numa
-        // nodes reside outside / above or inside / below packages in the
-        // machine topology
         let nr_numa_node = Self::count_unique_by(&topology, |c| c.numa_node);
         let nr_package = Self::count_unique_by(&topology, |c| c.package);
 
-        // Cache domain ids must be unique across the whole tree, like every
-        // other level. They are not necessarily so as they arrive: a machine
-        // that reports no cache topology falls back to the package id, and if
-        // numa nodes nest inside packages that same id then appears under two
-        // different parents. Remap against the parents to guarantee it.
         {
             let mut dense = std::collections::BTreeMap::new();
             for cpu in &topology {
@@ -688,8 +696,6 @@ where
             }
         }
 
-        // the topology must be sorted such that all children of a `Node` are added to a
-        // parent consecutively
         let f_level: fn(&CpuLocation, usize) -> Level = if nr_package < nr_numa_node {
             topology.sort_by_key(|l| (l.package, l.numa_node, l.cache_domain, l.core, l.cpu));
             |cpu_loc, depth| -> Level {
@@ -876,9 +882,9 @@ mod test {
     }
 
     #[test]
+    /// Packing should exhaust one L3 domain before touching another;
+    /// without a cache level it would have no reason to.
     fn max_packer_fills_a_cache_domain_before_crossing() {
-        // Packing should exhaust one L3 domain before touching another;
-        // without a cache level it would have no reason to.
         let mut packer = MaxPacker::from_topology(topology_four_cache_domains());
         let first: Vec<usize> = (0..2).map(|_| packer.next().unwrap().cpu).collect();
 
@@ -891,9 +897,9 @@ mod test {
     }
 
     #[test]
+    /// Spreading four shards over four domains should use each exactly
+    /// once, rather than doubling up in one while another sits idle.
     fn max_spreader_uses_every_cache_domain_first() {
-        // Spreading four shards over four domains should use each exactly once,
-        // rather than doubling up in one while another sits idle.
         let mut spreader = MaxSpreader::from_topology(topology_four_cache_domains());
         let mut per_domain = [0; 4];
         for _ in 0..4 {
@@ -907,9 +913,9 @@ mod test {
     }
 
     #[test]
+    /// The iterator yields CpuLocations rebuilt from a tree path, so the
+    /// cache domain has to come back out intact.
     fn cache_domain_survives_the_round_trip() {
-        // The iterator yields CpuLocations rebuilt from a tree path, so the
-        // cache domain has to come back out intact.
         let mut spreader = MaxSpreader::from_topology(topology_four_cache_domains());
         for _ in 0..8 {
             let loc = spreader.next().unwrap();
@@ -1023,9 +1029,6 @@ mod test {
         let mut core = 0;
         let mut cpu = 0;
 
-        // level[0] is number of numa nodes
-        // ...
-        // level[3] is number of cpus
         let levels = vec![2, 3, 5, 7];
         let nr_cpu = levels.iter().product();
 
@@ -1121,10 +1124,10 @@ mod test {
     }
 
     #[test]
+    /// Numa nodes 0 and 1 are both in package 0.
     fn max_packer_numa_in_pkg() {
         let mut counts = [0; 7];
 
-        // numa node nodes 0 and 1 are both in package 0
         let topology = vec![
             cpu_loc(0, 0, 1, 4),
             cpu_loc(0, 0, 0, 5),
@@ -1209,7 +1212,7 @@ mod test {
         );
     }
 
-    // Set API
+    /// Set API.
     #[test]
     fn cpuset_disjoint() {
         let xs = CpuSet::from_iter(vec![]);
@@ -1326,7 +1329,6 @@ mod test {
         }
         assert_eq!(i, expected.len());
 
-        // make a bigger than b
         let a = CpuSet::from_iter(vec![
             cpu_loc(0, 0, 0, 2),
             cpu_loc(0, 0, 0, 0),
@@ -1456,7 +1458,6 @@ mod test {
         }
         assert_eq!(i, expected.len());
 
-        // make a bigger than b
         let a = CpuSet::from_iter(vec![
             cpu_loc(0, 0, 0, 2),
             cpu_loc(0, 0, 0, 0),

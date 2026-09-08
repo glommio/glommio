@@ -69,6 +69,8 @@ impl AllocationProbe {
 }
 
 impl Drop for AllocationProbe {
+    /// Failed leak tests must not leave observer entries in the global
+    /// registry.
     fn drop(&mut self) {
         let mut allocations = allocations().lock().unwrap();
         if Arc::strong_count(&self.freed) == 1
@@ -76,7 +78,6 @@ impl Drop for AllocationProbe {
                 .get(&self.address)
                 .is_some_and(|entry| Weak::ptr_eq(entry, &Arc::downgrade(&self.freed)))
         {
-            // Failed leak tests must not leave observer entries in the global registry.
             allocations.remove(&self.address);
         }
     }
@@ -87,7 +88,6 @@ impl Drop for AllocationProbe {
 /// # Safety
 /// `ptr` and `layout` must satisfy `alloc::alloc::dealloc`'s requirements.
 pub(super) unsafe fn deallocate(ptr: *mut u8, layout: Layout) {
-    // Remove the old address before it can be reused by another allocation.
     let observer = allocations()
         .lock()
         .unwrap()
@@ -155,8 +155,8 @@ pub(super) struct DropGuard {
 }
 
 impl Drop for DropGuard {
+    /// Never panics: task destructors are wrapped in `abort_on_panic`.
     fn drop(&mut self) {
-        // Never panic here: task destructors are wrapped in abort_on_panic.
         if thread::current().id() != self.probe.owner {
             self.probe.drops.wrong_thread.fetch_add(1, Ordering::SeqCst);
         }

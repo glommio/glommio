@@ -797,6 +797,7 @@ impl DmaFile {
     /// if given a guard that's not for this file.
     ///
     /// NOTE: This will panic if the unlock operation fails.
+    #[expect(clippy::result_large_err)]
     pub async fn try_take_last_clone_unlocking_guard(
         mut self,
         guard: AdvisoryLockGuard,

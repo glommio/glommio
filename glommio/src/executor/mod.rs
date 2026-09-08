@@ -4369,7 +4369,7 @@ mod test {
                 // we created 5 blocking jobs each taking 100ms but our thread pool only has 4
                 // threads. We expect one of those jobs to take twice as long as the others.
 
-                let mut ts = join_all(blocking.into_iter()).await;
+                let mut ts = join_all(blocking).await;
                 assert_eq!(ts.len(), 5);
 
                 ts.sort_unstable();

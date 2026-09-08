@@ -175,7 +175,7 @@ impl<V: IoVec> IOVecMerger<V> {
 
     pub(super) fn flush(&mut self) -> Option<MergedIOVecs<V>> {
         self.current.take().map(|x| MergedIOVecs {
-            coalesced_user_iovecs: self.merged.drain(..).collect(),
+            coalesced_user_iovecs: std::mem::take(&mut self.merged),
             pos: x.pos(),
             size: x.size(),
         })

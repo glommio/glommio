@@ -63,6 +63,78 @@ jobs:
       - name: Check Cargo.toml ordering
         run: cargo sort --workspace --check
 
+  dylint:
+    name: Custom lints
+    runs-on: ubuntu-latest
+
+    env:
+      DYLINT_NIGHTLY: nightly-2026-06-11
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Install lint toolchain
+        run: rustup toolchain install "$DYLINT_NIGHTLY" --profile minimal --component rustc-dev,llvm-tools-preview
+
+      - name: Use lint toolchain
+        run: rustup override set "$DYLINT_NIGHTLY"
+
+      - name: Install cargo-dylint
+        run: which cargo-dylint || cargo install --locked cargo-dylint dylint-link
+
+      - name: Run custom lints
+        env:
+          DYLINT_RUSTFLAGS: >-
+            -A non_modified_buffer
+            -A non_upper_case_generic
+            -A non_idiomatic_import
+            -A over_qualified_call
+            -A tracing_canonical_instrumentation
+            -A manual_redact_impl
+            -A derive_suggestions
+            -A non_canonical_item_order
+        run: cargo dylint --all
+
+  commit-policy:
+    name: Commit policy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Check Assisted-by trailers
+        run: |
+          TIP="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$TIP" ]; then
+            BASE="$(git merge-base "origin/${{ github.base_ref }}" "$TIP")"
+          else
+            TIP="HEAD"
+            BASE="$TIP"
+          fi
+          missing=0
+          while IFS= read -r line; do
+            sha="${line%% *}"
+            subject="${line#* }"
+            if [ "$(git rev-list --parents -n 1 "$sha" | wc -w)" -gt 2 ]; then
+              echo "commit $sha is a merge commit: $subject" >&2
+              echo "  merge commits are not allowed in pull requests; squash or rebase them away" >&2
+              missing=1
+            elif [ -z "$(git log -1 --format='%(trailers:key=Assisted-by,valueonly=true)' "$sha" | xargs)" ]; then
+              echo "commit $sha declares no AI involvement: $subject" >&2
+              echo "  add a trailer: 'Assisted-by: <tool and model>', or, if no AI was" >&2
+              echo "  involved at all, 'Assisted-by: none'" >&2
+              missing=1
+            fi
+          done < <(git log --format='%h %s' "$BASE..$TIP")
+          exit "$missing"
+
   build-and-test:
     name: Build and Test (${{ matrix.name }})
     runs-on: ubuntu-latest

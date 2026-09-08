@@ -41,6 +41,7 @@ runs:
           target/debug/build/
           target/debug/deps/
           target/debug/incremental/
+          target/dylint/
         key: ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-cargo-${{ steps.versions.outputs.rustc-hash }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
         restore-keys: |
           ${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-cargo-${{ steps.versions.outputs.rustc-hash }}-${{ hashFiles('Cargo.lock') }}-

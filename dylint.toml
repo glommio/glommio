@@ -1,0 +1,3 @@
+[no_docs_allowed]
+allowed_docs                   = ["outer_line", "inner_line", "outer_block", "inner_block", "doc_attribute"]
+allow_docs_on_non_public_items = true

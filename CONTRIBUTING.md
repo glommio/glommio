@@ -20,25 +20,31 @@ If you are interested in understanding these motivations a bit better, you can c
 This project uses several tools to maintain code quality and consistency:
 
 ### Cargo Sort
+
 We use `cargo sort` to keep our dependencies sorted in `Cargo.toml` files. This ensures consistent ordering for better readability and easier diff views.
 
 Install with:
+
 ```bash
 cargo install cargo-sort
 ```
 
 ### Taplo
+
 We use [Taplo](https://taplo.tamasfe.dev/) for formatting and validating TOML files, including `Cargo.toml`. It ensures consistent formatting across all TOML configurations in this repository.
 
 Install with:
+
 ```bash
 cargo install taplo-cli --locked
 ```
 
 ### ClIFF
+
 We use [ClIFF](https://github.com/orhun/cliff) for generating changelogs. This tool helps maintain consistent and automated changelog generation from git history.
 
 Install with:
+
 ```bash
 cargo install git-cliff
 ```
@@ -61,6 +67,31 @@ As of today (September 2021), this is the set of rules that materialize the prin
    At the end, if the result is too hard to follow and the change is simple and limited in complexity, **squashing your
    commits is okay**. Otherwise, if the diff is complex or has a large surface area, we will ask you to rewrite history
    to preserve the individual commits of your branch.
+
+4. **AI-generated contributions are your responsibility.** See [AI-generated contributions](#ai-generated-contributions)
+   below.
+
+## AI-generated contributions
+
+AI-assisted work is welcome; the human contributor owns every line of the diff and the pull request as a whole. These
+rules exist because review time is the scarcest resource in the project, and unedited AI output spends it quickly.
+
+Before you request review:
+
+1. **Re-read the entire diff yourself and clean out AI slop.** Boilerplate praise and summaries, comments that restate
+   the code next to it, speculative error handling for cases that cannot happen, filler doc comments, noise commits —
+   remove them. The code must read as if written intentionally by someone who understands it. Note that this repository
+   enforces a [comment policy](dylint.toml): prose belongs in `///`/`//!` doc comments, and plain `//` comments are
+   rejected by CI. The lint only catches comment noise; the rest of the slop needs human editing.
+2. **PR descriptions and GitHub comments are human-readable.** Write concise plain prose: what and why, how it was
+   tested, links to issues. No raw AI transcripts, no prompt dumps, no "here is what I did" filler. Your audience is
+   human reviewers with limited time, not a chat log.
+3. **Do not outsource judgment.** If you cannot explain a change in your own words, you are not ready to open the PR.
+4. **Say which AI produced the work.** Every AI-assisted commit carries an `Assisted-by: <tool and model>`
+   trailer (e.g. `Assisted-by: claude-sonnet-4-5`); when history is squashed on merge, state the tooling in the PR
+   description instead. A commit with no AI involvement at all declares `Assisted-by: none` — CI requires every
+   commit to state which it is, since it cannot infer AI involvement. Reviewers deserve to know whose output they
+   are reading.
 
 ## Licensing
 

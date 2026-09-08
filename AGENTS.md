@@ -35,6 +35,31 @@ cargo clippy --all-targets -- -D warnings
 ```
 If you need to auto‑apply certain lint hints you can use the `--fix` option.
 
+### Custom lints with dylint
+
+CI runs the `no_docs_allowed`/`no_comments_allowed` dylint lints (policy in `dylint.toml`, library pinned in
+`[workspace.metadata.dylint]` in `Cargo.toml`). Plain `//` and `/* */` comments are prohibited; put prose in
+`///`/`//!` doc comments. The `dylint` job in `.github/workflows/ci.yml` is the canonical invocation.
+
+Opt into a pre-push guard that rejects pushes which add plain-comment warnings above the current baseline:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+One-time setup for running the lints locally (matching the CI `dylint` job):
+
+```bash
+cargo install --locked cargo-dylint dylint-link
+rustup toolchain install nightly-2026-06-11 --profile minimal --component rustc-dev,llvm-tools-preview
+rustup override set nightly-2026-06-11
+DYLINT_RUSTFLAGS="-A non_modified_buffer -A non_upper_case_generic -A non_idiomatic_import -A over_qualified_call -A tracing_canonical_instrumentation -A manual_redact_impl -A derive_suggestions -A non_canonical_item_order" cargo dylint --all
+rustup override unset
+```
+
+The `DYLINT_RUSTFLAGS` list silences the other lints bundled in the `diy_lints` umbrella library; only
+`no_docs_allowed`/`no_comments_allowed` are opted in (see the CI `dylint` job).
+
 ### Tests
 #### Run all tests
 Agent needs a quick sanity check after a change:

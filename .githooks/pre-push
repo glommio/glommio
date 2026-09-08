@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+# Pre-push guard: rejects a push whose plain-comment warning count exceeds the
+# baseline below. Opt in with:
+#
+#   git config core.hooksPath .githooks
+#
+# The CI `dylint` job (.github/workflows/ci.yml) is the canonical invocation; this
+# hook mirrors it locally. CI is warn-level until the per-module comment cleanup
+# lands, so the gate here is a baseline, not zero: lowering the number of plain
+# `//` comments never blocks a push, adding some does. Update BASELINE in the same
+# commit as a cleanup PR; the final deny-flip PR removes the gate.
+
+set -euo pipefail
+
+BASELINE=1214
+NIGHTLY=nightly-2026-06-11
+ALLOW="-A non_modified_buffer -A non_upper_case_generic -A non_idiomatic_import -A over_qualified_call -A tracing_canonical_instrumentation -A manual_redact_impl -A derive_suggestions -A non_canonical_item_order"
+
+if ! rustup toolchain list | grep -q "^$NIGHTLY"; then
+    echo "pre-push: $NIGHTLY not installed, skipping the dylint check" >&2
+    echo "  (rustup toolchain install $NIGHTLY --profile minimal --component rustc-dev,llvm-tools-preview)" >&2
+    exit 0
+fi
+if ! command -v cargo-dylint > /dev/null; then
+    echo "pre-push: cargo-dylint not installed, skipping the dylint check" >&2
+    echo "  (cargo install --locked cargo-dylint dylint-link)" >&2
+    exit 0
+fi
+
+rustup override set "$NIGHTLY" > /dev/null
+# A failing exit means the build broke; set -e aborts the push.
+OUT=$(DYLINT_RUSTFLAGS="$ALLOW" cargo dylint --all 2>&1)
+rustup override unset > /dev/null
+
+COUNT=$(printf '%s\n' "$OUT" | grep -cE '^warning: a `.*` comment is not allowed here' || true)
+if [ "$COUNT" -gt "$BASELINE" ]; then
+    echo "pre-push: $COUNT plain-comment warnings exceed the baseline of $BASELINE; push rejected" >&2
+    echo "  prose belongs in /// doc comments; if a warning is genuinely intentional," >&2
+    echo "  raise BASELINE in .githooks/pre-push deliberately" >&2
+    exit 1
+fi
+echo "pre-push: dylint ok ($COUNT plain-comment warnings, baseline $BASELINE)"

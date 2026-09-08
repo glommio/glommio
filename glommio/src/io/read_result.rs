@@ -1,7 +1,7 @@
-// unless explicitly stated otherwise all files in this repository are licensed
-// under the mit/apache-2.0 license, at your convenience
-//
-// this product includes software developed at datadog (https://www.datadoghq.com/). copyright 2020 datadog, inc.
+//! unless explicitly stated otherwise all files in this repository are licensed
+//! under the mit/apache-2.0 license, at your convenience
+//!
+//! this product includes software developed at [Datadog](https://www.datadoghq.com/). copyright 2020 datadog, inc.
 use crate::io::ScheduledSource;
 use std::{num::NonZeroUsize, ptr::NonNull};
 

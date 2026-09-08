@@ -253,6 +253,12 @@ impl<S: AsRawFd> NonBufferedStream<S> {
         Ok(sz)
     }
 
+    /// Starts an early poll if the buffer is not fully filled, so when the
+    /// next time `poll_read` is called, it will be known immediately whether
+    /// the underlying stream is ready for reading.
+    ///
+    /// The `rush_dispatch` calls that used to live here and after could be
+    /// removed to improve performance if #458 is handled appropriately.
     pub(crate) fn poll_read(
         &mut self,
         cx: &Context<'_>,
@@ -272,14 +278,8 @@ impl<S: AsRawFd> NonBufferedStream<S> {
                 self.source_rx.take();
                 self.read_timeout.cancel_timer(reactor);
                 let result = poll_err!(result);
-                // Start an early poll if the buffer is not fully filled. So when
-                // the next time `poll_read` is called, it will be known immediately
-                // whether the underlying stream is ready for reading.
                 if result > 0 && result < buf.len() {
                     self.source_rx = Some(reactor.poll_read_ready(self.stream.as_raw_fd()));
-                    // The `rush_dispatch`s here and after could be removed to
-                    // improve performance if #458 is handled appropriately.
-                    // reactor.rush_dispatch(self.source_rx.as_ref().unwrap());
                 }
                 return Poll::Ready(Ok(result));
             }
@@ -289,7 +289,6 @@ impl<S: AsRawFd> NonBufferedStream<S> {
 
         if no_pending_poll {
             self.source_rx = Some(reactor.poll_read_ready(self.stream.as_raw_fd()));
-            // reactor.rush_dispatch(self.source_rx.as_ref().unwrap());
         }
 
         let source = self.source_rx.as_ref().unwrap();
@@ -298,11 +297,11 @@ impl<S: AsRawFd> NonBufferedStream<S> {
         Poll::Pending
     }
 
+    /// On the write path, we always start with calling `yolo_send`, because
+    /// it is very likely to succeed. It could be a waste if it already timed
+    /// out since the last `poll_write`, but it would not cost much more to
+    /// give it one last chance in this case.
     pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        // On the write path, we always start with calling `yolo_send`, because
-        // it is very likely to success. It could be a waste if it already timed
-        // out since the last `poll_write`, but it would not cost much more to
-        // give it one last chance in this case.
         if let Some(result) = super::yolo_send(self.stream.as_raw_fd(), buf) {
             let reactor = self.reactor.upgrade().unwrap();
             self.write_timeout.cancel_timer(reactor.as_ref());
@@ -515,17 +514,14 @@ impl<S: AsRawFd + IntoRawFd> NonBufferedStream<S> {
     /// Extracts the raw file descriptor, cleaning up glommio state
     /// but keeping the fd open.
     fn into_raw_fd(mut self) -> RawFd {
-        // Clean up reactor sources
         self.source_tx.take();
         self.source_rx.take();
 
-        // Cancel any pending timers
         if let Some(reactor) = self.reactor.upgrade() {
             self.write_timeout.cancel_timer(&reactor);
             self.read_timeout.cancel_timer(&reactor);
         }
 
-        // Extract fd from inner stream (this prevents it from closing)
         self.stream.into_raw_fd()
     }
 }

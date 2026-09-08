@@ -345,15 +345,16 @@ mod test {
         assert_eq!(rb.len(), 6);
         check_contents!(*rb, 0);
 
-        // Can read again from the same position
         let rb = reader.read_at(0, 6).await.unwrap();
         assert_eq!(rb.len(), 6);
         check_contents!(*rb, 0);
 
-        // Can read again from a random, unaligned position, and will hit
-        // EOF.
         let rb = reader.read_at(3, 6).await.unwrap();
-        assert_eq!(rb.len(), 3);
+        assert_eq!(
+            rb.len(),
+            3,
+            "can read again from a random, unaligned position, and will hit EOF"
+        );
         check_contents!(rb[0..3], 3);
 
         writer.close().await.unwrap();
@@ -407,26 +408,27 @@ mod test {
             .unwrap();
         assert_eq!(r, 387);
         let stat = reader.stat().await.unwrap();
-        // File size is unchanged.
-        assert_eq!(stat.file_size, (cluster_size * 2 + 7).into());
-        // Allocated size should double because the sparse region should be
-        // dirtied sufficiently to need another full filesystem cluster.
-        assert_eq!(stat.allocated_file_size, (cluster_size * 2).into());
+        assert_eq!(
+            stat.file_size,
+            (cluster_size * 2 + 7).into(),
+            "file size is unchanged"
+        );
+        assert_eq!(
+            stat.allocated_file_size,
+            (cluster_size * 2).into(),
+            "allocated size should double because the sparse region should be dirtied sufficiently to need another full filesystem cluster"
+        );
 
-        // Make sure the sparse contents are still 0'ed.
         let rb = reader.read_at(0, 513).await.unwrap();
         assert_eq!(rb.len(), 513);
         for i in rb.iter() {
             assert_eq!(*i, 0);
         }
 
-        // Make sure the non-zeroed contents at the beginning of the file
-        // are correct.
         let rb = reader.read_at(513, 387).await.unwrap();
         assert_eq!(rb.len(), 387);
         check_contents!(*rb, 513);
 
-        // Make sure the other unallocated extent returns 0s.
         let rb = reader
             .read_at(
                 900,
@@ -444,13 +446,17 @@ mod test {
 
         writer.deallocate(0, cluster_size.into()).await.unwrap();
         let stat = writer.stat().await.unwrap();
-        // File size is unchanged.
-        assert_eq!(stat.file_size, (cluster_size * 2 + 7).into());
-        // Allocated size should go back to 0 because there's still one allocated
-        // cluster.
-        assert_eq!(stat.allocated_file_size, cluster_size.into());
+        assert_eq!(
+            stat.file_size,
+            (cluster_size * 2 + 7).into(),
+            "file size is unchanged"
+        );
+        assert_eq!(
+            stat.allocated_file_size,
+            cluster_size.into(),
+            "allocated size should go back to 0 because there's still one allocated cluster"
+        );
 
-        // Deallocated range now returns 0s.
         let rb = reader
             .read_at(0, (cluster_size).try_into().unwrap())
             .await

@@ -191,6 +191,8 @@ where
     /// [`ImmutableFile`]: ImmutableFilePreSealSink
     /// [`new`]: ImmutableFileBuilder::new
     /// [`seal`]: ImmutableFilePreSealSink::seal
+    ///
+    /// These two syscalls are hints and are allowed to fail.
     pub async fn build_sink(self) -> Result<ImmutableFilePreSealSink> {
         let file = OpenOptions::new()
             .read(true)
@@ -199,7 +201,6 @@ where
             .dma_open(self.path)
             .await?;
 
-        // these two syscall are hints and are allowed to fail.
         if let Some(size) = self.pre_allocate {
             let _ = file.pre_allocate(size, true).await;
         }
@@ -573,7 +574,7 @@ mod test {
             assert_eq!(next_buffer.unwrap().1.len(), 1);
             let next_buffer = bufs.next().await.unwrap();
             assert_eq!(next_buffer.unwrap().1.len(), 1);
-        } // ReadManyResult hols a reference to the file so we scope it
+        }
 
         stream.close().await.unwrap();
     });

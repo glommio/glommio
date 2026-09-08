@@ -60,7 +60,7 @@ impl SharedChannels {
             wake!(waker);
         }
 
-        for (_, (pending, check)) in self.wakers_map.iter_mut() {
+        for (pending, check) in self.wakers_map.values_mut() {
             if pending.is_empty() {
                 continue;
             }

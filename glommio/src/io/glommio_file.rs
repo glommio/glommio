@@ -304,6 +304,7 @@ impl GlommioFile {
 
     /// Separates file descriptors but the same file entry; try taking the
     /// fd...
+    #[expect(clippy::result_large_err)]
     pub(crate) async fn try_take_last_clone_unlocking_guard(
         self,
         guard: OwnedGlommioFile,

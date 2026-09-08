@@ -351,7 +351,6 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
         };
 
         if is_last {
-            // If this was the last joiner, build the channels
             let mut state = self.state.lock().unwrap();
             if !state.ready {
                 let n = state.peers.len();
@@ -375,7 +374,6 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 state.ready = true;
             }
         } else {
-            // Wait until last joiner finishes building
             loop {
                 let ready = {
                     let state = self.state.lock().unwrap();
@@ -391,7 +389,6 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
         }
 
         let state = self.state.lock().unwrap();
-        // At this point st.ready == true and st.peers is stable.
 
         let peer_id = state
             .peers
@@ -409,7 +406,6 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
     async fn join_with(self, role: Role) -> Result<(Senders<T>, Receivers<T>), ()> {
         let (peer_id, role_id) = self.register(role).await?;
 
-        // Extract Senders and Receivers for this peer
         let (mut senders, mut receivers) = {
             let mut st = self.state.lock().unwrap();
 

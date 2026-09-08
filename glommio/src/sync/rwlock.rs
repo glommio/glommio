@@ -70,9 +70,10 @@ struct WaiterNode {
     link: LinkedListLink,
     waker: RefCell<Option<Waker>>,
 
-    // waiter node can not be `Unpin` so its pointer could be used inside intrusive
-    // collection, it also can not outlive the container which is guaranteed by the
-    // Waiter lifetime bound to the RwLock which is container of all Waiters.
+    /// The waiter node can not be `Unpin` so its pointer could be used
+    /// inside intrusive collection; it also can not outlive the container,
+    /// which is guaranteed by the `Waiter` lifetime bound to the `RwLock`
+    /// which is container of all `Waiter`s.
     _p: PhantomPinned,
 }
 
@@ -127,7 +128,6 @@ unsafe impl Adapter for WaiterAdapter {
         }
 
         let ptr = (value as *const u8).add(offset_of!(WaiterNode, link));
-        //null check is performed above
         core::ptr::NonNull::new_unchecked(ptr as *mut _)
     }
 
@@ -194,21 +194,20 @@ unsafe impl Adapter for WaiterAdapter {
 #[derive(Debug)]
 pub struct RwLock<T> {
     state: RefCell<State>,
-    // Option is needed only to implement into_inner method so that is absolutely safe
-    // to unwrap it by ref. during the execution
+    /// The `Option` is needed only to implement `into_inner`, so it is
+    /// absolutely safe to unwrap it by ref. during the execution.
     value: RefCell<Option<T>>,
 }
 
 #[derive(Debug)]
 struct State {
-    // Number of granted write access
-    // There can be only single writer, but we use u32 type to support reentrancy fot the lock
-    // in future
+    /// Number of granted write access. There can be only single writer, but
+    /// we use a `u32` type to support reentrancy for the lock in the future.
     writers: u32,
-    // Number of granted read accesses
+    /// Number of granted read accesses.
     readers: u32,
 
-    // Number of queued requests to get write access
+    /// Number of queued requests to get write access.
     queued_writers: u32,
 
     waiters_queue: LinkedList<WaiterAdapter>,
@@ -241,6 +240,8 @@ impl<'a, T> Waiter<'a, T> {
         }
     }
 
+    /// It is safe to skip the null check below because we use an object
+    /// reference.
     fn register_in_waiting_queue(
         node: Pin<&mut WaiterNode>,
         rw: &mut State,
@@ -257,7 +258,6 @@ impl<'a, T> Waiter<'a, T> {
             rw.queued_writers += 1;
         }
 
-        // It is safe to skip null check here because we use object reference
         rw.waiters_queue
             .push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
     }
@@ -306,9 +306,9 @@ impl<T> Future for Waiter<'_, T> {
 }
 
 impl<T> Drop for Waiter<'_, T> {
+    /// If the node is linked, the future is already pinned.
     fn drop(&mut self) {
         if self.node.link.is_linked() {
-            // If node is lined them future is already pinned
             let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
             Self::remove_from_waiting_queue(pinned_node, &mut self.rw.state.borrow_mut())
         }
@@ -791,37 +791,27 @@ impl<T> RwLock<T> {
         Ok(value)
     }
 
+    /// Created with the assumption in mind that the waker will trigger
+    /// delayed execution of fibers; such behaviour supports the users'
+    /// intuition about tasks.
+    ///
+    /// All tasks are woken up in the fair order (in the order of acquiring
+    /// of the lock) if that matters. That allows to avoid lock starvation
+    /// as much as possible.
     fn wake_up_fibers(rw: &mut State) {
-        // Created with assumption in mind that waker will trigger delayed execution of
-        // fibers such behaviour supports users intuition about tasks.
-
-        // All tasks waked up in the fair order (in the order of acquiring of the lock)
-        // if that matters. That allows to avoid lock starvation as much as
-        // possible.
         if rw.readers == 0 && rw.writers == 0 {
             if rw.queued_writers == 0 {
-                // Only readers are waiting in the queue and no one holding a lock
-                // wake up all of them
                 Self::wake_up_all_fibers(rw);
             } else {
-                // There are some writers waiting into the queue so wake up all readers and
-                // single writer no one holding the lock, so likely they will be
-                // executed in order so all will have a chance to proceed
                 Self::wake_up_readers_and_first_writer(rw);
             }
         } else if rw.writers == 0 {
             if rw.queued_writers == 0 {
-                // Only readers in the waiting queue and some readers holding the lock
-                // wake up all of them
                 Self::wake_up_all_fibers(rw);
             } else {
-                // There are both readers and writers in the queue
-                // so only readers are awakened
                 Self::wake_up_all_readers_till_first_writer(rw);
             }
         }
-        // The only option left that some writers still holding the lock
-        // so no reason to try to wake up anyone.
     }
 
     fn wake_up_all_readers_till_first_writer(rw: &mut State) {
@@ -845,10 +835,10 @@ impl<T> RwLock<T> {
         }
     }
 
+    /// We need to remove the writer from the list too, so we use a flag
+    /// instead of executing `break`.
     fn wake_up_readers_and_first_writer(rw: &mut State) {
         let mut cursor = rw.waiters_queue.front_mut();
-        // We need to remove writer from the list too,
-        // so we use flag instead of execution of break
         let mut only_readers = true;
 
         while !cursor.is_null() && only_readers {
@@ -893,9 +883,9 @@ impl<T: Default> Default for RwLock<T> {
 }
 
 impl<T> Drop for RwLock<T> {
+    /// The lifetime annotation prohibits guards from outliving the `RwLock`,
+    /// so such unwrap is safe.
     fn drop(&mut self) {
-        //Lifetime annotation prohibits guards to outlive RwLock so such unwrap is
-        // safe.
         self.close().unwrap();
         assert!(self.state.borrow().waiters_queue.is_empty());
     }
@@ -1080,7 +1070,6 @@ mod test {
             let pinger = crate::spawn_local(async move {
                 let mut prev = -1;
                 loop {
-                    //give a room for other fibers to participate
                     crate::executor().yield_task_queue_now().await;
 
                     let mut lock = ball2.write().await.unwrap();
@@ -1103,7 +1092,6 @@ mod test {
             let ponger = crate::spawn_local(async move {
                 let mut prev = -1;
                 loop {
-                    //give a room for other fibers to participate
                     crate::executor().yield_task_queue_now().await;
 
                     let mut lock = ball3.write().await.unwrap();
@@ -1131,7 +1119,6 @@ mod test {
                 let reader = crate::spawn_local(async move {
                     let mut prev = -1;
                     loop {
-                        //give a room for other fibers to participate
                         crate::executor().yield_task_queue_now().await;
                         let lock = ball.read().await.unwrap();
 

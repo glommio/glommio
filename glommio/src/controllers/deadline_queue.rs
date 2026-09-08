@@ -187,6 +187,23 @@ impl<T> SharesManager for InnerQueue<T> {
     /// the  last output, and not how much the shares should be. It also
     /// eliminates any  dependency on time when calculating the error which
     /// increases resiliency.
+    ///
+    /// How did we pick our constants:
+    ///
+    ///  * As with any stable PI controller we want the bulk of our gain to
+    ///    come from P.
+    ///  * As we normalize the maximum error to 1 we know that the gain
+    ///    should be at most 1000.
+    ///  * Physically, Ki can be expressed as Kp / Tau where Tau is a time
+    ///    constant, roughly equivalent to how many periods need to pass for
+    ///    the integral term to generate the same gain as the proportional
+    ///    term. We set that to 6 so the controller is not too sluggish,
+    ///    which is around 1.5 seconds on the default 250ms adjustment
+    ///    period.
+    ///
+    /// We can then write X + X/6 = 1000, and solving for X we have the
+    /// constants below. If so little time has passed we can't really make
+    /// any useful prediction, so the last shares are returned.
     fn shares(&self) -> usize {
         if let ControllerStatus::Disabled(shares) = self.state.get() {
             return shares;
@@ -206,7 +223,6 @@ impl<T> SharesManager for InnerQueue<T> {
             let time_fraction =
                 1.0 - (remaining_time.as_secs_f64() / source.expected_duration().as_secs_f64());
             if remaining_time.as_nanos() == 0 && now.saturating_duration_since(*exp).as_secs() > 5 {
-                // already too late, bump it up hard
                 self.last_shares.set(1000);
                 return 1000;
             }
@@ -214,7 +230,6 @@ impl<T> SharesManager for InnerQueue<T> {
             processed += source.processed_units() as f64;
         }
 
-        // so little time has passed we can't really make any useful prediction
         if expected < 0.01 {
             return self.last_shares.get();
         }
@@ -226,19 +241,6 @@ impl<T> SharesManager for InnerQueue<T> {
         let delta_error = error - self.last_error.get();
         self.last_error.set(error);
 
-        // How did we pick our constants:
-        //  * As with any stable PI controller we want the bulk of our gain to come from
-        //    P.
-        //  * As we normalize the maximum error to 1 we know that the gain should be at
-        //    most 1000
-        //  * physically, Ki can be expressed as Kp / Tau where Tau is a time constant,
-        //    roughly equivalent to how many periods need to pass for the integral term
-        //    to generate the same gain as the proportional term. We set that to 6 so
-        //    the controller is not too sluggish, which is around 1.5 seconds on the
-        //    default 250ms adjustment period.
-        //
-        //  We can then write X + X/6 = 1000, and solving for X we have the constants
-        // below
         let kp = 850.0;
         let ki = kp / 6.0;
         let dshares = ki * error + kp * delta_error;
@@ -384,13 +386,24 @@ impl<T: 'static> DeadlineQueue<T> {
     ///     DeadlineQueue::<usize>::new("example", Duration::from_millis(250));
     /// });
     /// ```
+    ///
+    /// We could always dispatch into the latency queue, but since that
+    /// effectively means putting requests in a different io_uring we'll
+    /// avoid doing that unless the process is very sensitive. Because of
+    /// dead time it wouldn't be a bad idea to even have a minimum here. But
+    /// we'll just document it and leave it to the user.
+    ///
+    /// Internally, a spawned task executes each queued action and then pops
+    /// it from the queue, regardless of whether it succeeded. It is legal
+    /// for the queue not to be present anymore in case the `DeadlineQueue`
+    /// itself was destroyed after the action was done; but if it does exist
+    /// we expect to be able to pop the element, so we `unwrap()`
+    /// `pop_front()`. Note that because this is a queue with concurrency of
+    /// one we can safely `pop_front()`: if we ever do this with higher
+    /// concurrency (very unlikely), we need to move to a more complex data
+    /// structure.
     pub fn new(name: &'static str, adjustment_period: Duration) -> DeadlineQueue<T> {
         let queue = Rc::new(InnerQueue::new(adjustment_period));
-        // We could always dispatch into the latency queue, but since that effectively
-        // means putting requests in a different io_uring we'll avoid doing that
-        // unless the process is very sensitive. Because of dead time it
-        // wouldn't be a bad idea to even have a minimum here. But we'll just
-        // document it and leave it to the user.
         let lat = {
             if adjustment_period < Duration::from_millis(100) {
                 Latency::Matters(adjustment_period)
@@ -414,17 +427,6 @@ impl<T: 'static> DeadlineQueue<T> {
                 let mut stream = receiver.stream();
                 while let Some(request) = stream.next().await {
                     let res = request.action().await;
-                    // now that we have executed the action, pop it from
-                    // the queue. We must do it regardless of whether we succeeded.
-                    //
-                    // It is legal for the queue not to be present anymore in
-                    // case the DeadlineQueue itself was destroyed after the action
-                    // was done. But if it does exist we expect to be able to pop
-                    // the element: so we unwrap() pop_front().
-                    //
-                    // Note that because this is a queue with concurrency of one we
-                    // can safely pop_front(). If we ever do this with higher concurrency
-                    // (very unlikely), then we need to move to a more complex data structure.
                     if let Some(queue) = queue_weak.upgrade() {
                         let mut queue = queue.queue.borrow_mut();
                         queue.pop_front().unwrap();
@@ -750,8 +752,10 @@ mod test {
 
             Timer::new(Duration::from_millis(2)).await;
             let shares_second = queue.queue.shares();
-            // The second element that we push should rush the first.
-            assert!(shares_second > shares_first);
+            assert!(
+                shares_second > shares_first,
+                "the second element that we push should rush the first"
+            );
             tq.await;
             tq2.await;
         });

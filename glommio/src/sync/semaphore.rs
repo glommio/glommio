@@ -30,9 +30,10 @@ struct WaiterNode {
     units: u64,
     waker: RefCell<Option<Waker>>,
 
-    // Waiter node can not be `Unpin` so its pointer could be used inside intrusive
-    // collections, it also can not outlive the container which is guaranteed by the
-    // Waiter lifetime bound to the Semaphore which is container of all Waiters.
+    /// The waiter node can not be `Unpin` so its pointer could be used
+    /// inside intrusive collections; it also can not outlive the container,
+    /// which is guaranteed by the `Waiter` lifetime bound to the
+    /// `Semaphore` which is container of all `Waiter`s.
     _p: PhantomPinned,
 }
 
@@ -85,7 +86,6 @@ unsafe impl Adapter for WaiterAdapter {
         }
 
         let ptr = (value as *const u8).add(offset_of!(WaiterNode, link));
-        // We call unchecked method because of safety check above
         core::ptr::NonNull::new_unchecked(ptr as *mut _)
     }
 
@@ -132,6 +132,8 @@ impl<'a> Waiter<'a> {
         }
     }
 
+    /// It is safe to use the unchecked call below because we convert a
+    /// passed-in reference, which can not be null.
     fn register_in_waiting_queue(
         waiter_node: Pin<&mut WaiterNode>,
         sem_state: &mut SemaphoreState,
@@ -144,18 +146,16 @@ impl<'a> Waiter<'a> {
         }
 
         sem_state.waiters_list.push_back(unsafe {
-            // It is safe to use unchecked call here because we convert passed in reference
-            // which can not be null
             NonNull::new_unchecked(Pin::into_inner_unchecked(waiter_node) as *mut _)
         });
     }
 }
 
 impl Drop for Waiter<'_> {
+    /// If the node is linked, it is for sure pinned, so it is safe to make
+    /// it pinned directly.
     fn drop(&mut self) {
         if self.node.link.is_linked() {
-            // If node is linked that is for sure is pinned so that is safe
-            // to make it pinned directly
             let waiter_node = unsafe { Pin::new_unchecked(&mut self.node) };
             Self::remove_from_waiting_queue(waiter_node, &mut self.semaphore.state.borrow_mut())
         }
@@ -306,7 +306,6 @@ fn process_wakes(sem: &Semaphore, units: u64) {
 
     let mut cursor = state.waiters_list.front_mut();
 
-    //only tasks which will be able to proceed will be awaken
     while available_units > 0 {
         let mut waker = None;
         if let Some(node) = cursor.get() {
@@ -470,8 +469,6 @@ impl Semaphore {
     pub async fn acquire(&self, units: u64) -> Result<()> {
         let waiter = {
             let mut state = self.state.borrow_mut();
-            // Try acquiring first without paying the price to construct a waker.
-            // If that fails then we construct a waker and wait on it.
             if state.waiters_list.is_empty() && state.try_acquire(units)? {
                 return Ok(());
             }
@@ -723,7 +720,6 @@ mod test {
                 let _g = sem.acquire_permit(1).await.unwrap();
             }});
 
-            // For this last one, use the static version. Move around and sleep a bit first
             let t3 = crate::spawn_local(enclose! { (sem, exec) async move {
                 exec.set(exec.get() + 1);
                 let g = sem.acquire_static_permit(1).await.unwrap();
@@ -733,7 +729,6 @@ mod test {
                 }).await
             }});
 
-            // Wait for all permits to try and acquire, then unleash the gates.
             while exec.get() != 3 {
                 crate::executor().yield_task_queue_now().await;
             }
@@ -748,6 +743,9 @@ mod test {
     }
 
     #[test]
+    /// For this last one, use the static version. Move around and sleep a
+    /// bit first; then wait for all permits to try and acquire, and unleash
+    /// the gates.
     fn explicit_signal_unblocks_waiting_semaphore() {
         make_shared_var!(Semaphore::new(0), sem1, sem2);
         make_shared_var_mut!(0, exec1, exec2);
@@ -891,9 +889,10 @@ mod test {
         test_executor!(
             async move {
                 wait_on_cond!(exec1, 1);
-                // even if try to acquire 0, which always succeed,
-                // we should fail if it is closed.
-                let _g = sem1.acquire_permit(0).await.unwrap();
+                let _g = sem1
+                    .acquire_permit(0)
+                    .await
+                    .expect("even if we try to acquire 0, which always succeeds, we should fail if it is closed");
             },
             async move {
                 sem2.close();
@@ -904,9 +903,9 @@ mod test {
 
     #[test]
     #[should_panic]
+    /// In this test, for the acquire to happen first, we need to block on
+    /// the acquisition, so the semaphore starts at 0.
     fn broken_semaphore_if_acquire_happens_first() {
-        // Notice how in this test, for the acquire to happen first, we
-        // need to block on the acquisition. So the semaphore starts at 0
         make_shared_var!(Semaphore::new(0), sem1, sem2);
         make_shared_var_mut!(0, exec1, exec2);
 

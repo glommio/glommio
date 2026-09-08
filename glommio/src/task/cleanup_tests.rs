@@ -74,6 +74,7 @@ fn synchronous_schedule<const N: usize>(run: bool, panic: bool) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
+            &ex.tasks,
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -113,6 +114,7 @@ fn owned_schedule_after_shutdown<const N: usize>() {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
+            &ex.tasks,
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -198,6 +200,7 @@ fn nested_synchronous_schedule<const N: usize>(panic: bool) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
+            &ex.tasks,
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -245,7 +248,7 @@ fn abandoned_future<const N: usize>(foreign: bool) {
     let polls = future.polls.clone();
 
     ex.run(async {
-        let (task, handle) = task_impl::spawn_local(ex.id(), 0, future, drop, false);
+        let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
         let allocation = AllocationProbe::track_handle(&handle);
         task.run_right_away();
         drop(handle);
@@ -280,7 +283,7 @@ fn cleanup_notification_before_foreign_release<const N: usize>() {
     let polls = future.polls.clone();
 
     ex.run(async {
-        let (task, handle) = task_impl::spawn_local(ex.id(), 0, future, drop, false);
+        let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
         let allocation = AllocationProbe::track_handle(&handle);
         task.run_right_away();
         drop(handle);
@@ -720,7 +723,7 @@ fn handle_and_waker_release_race<const N: usize>() {
             let future = CleanupFuture::<N>::new(true, future_drops.guard());
             let saved_waker = future.waker.clone();
             let polls = future.polls.clone();
-            let (task, handle) = task_impl::spawn_local(ex.id(), 0, future, drop, false);
+            let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
             let allocation = AllocationProbe::track_handle(&handle);
             task.run_right_away();
             let waker = saved_waker
@@ -758,6 +761,7 @@ fn sole_waker_completes_detached_future<const N: usize>(foreign: bool, by_ref: b
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
+            &ex.tasks,
             future,
             |task| {
                 task.run();
@@ -846,7 +850,7 @@ fn runnable_and_waker_release_race<const N: usize>() {
                 _padding: [0; N],
             };
             assert_eq!(std::mem::size_of_val(&future) >= 2048, N >= 2048);
-            let (task, handle) = task_impl::spawn_local(ex.id(), 0, future, drop, false);
+            let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
             let allocation = AllocationProbe::track_handle(&handle);
             drop(handle);
             // The foreign waker release races the runnable release after Pending.
@@ -881,6 +885,7 @@ fn panicking_scheduler<const N: usize>(trigger: SchedulePanicTrigger) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
+            &ex.tasks,
             future,
             move |_task| {
                 let _ = &schedule_guard;

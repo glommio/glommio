@@ -9,7 +9,7 @@ use core::{fmt, future::Future, marker::PhantomData, mem, ptr::NonNull};
 use crate::task::debugging::TaskDebugger;
 use crate::{
     dbg_context,
-    task::{header::Header, raw::RawTask, state::*, JoinHandle},
+    task::{header::Header, raw::RawTask, registry::TaskRegistry, JoinHandle},
 };
 
 /// Creates a new local task.
@@ -25,6 +25,7 @@ use crate::{
 pub(crate) fn spawn_local<F, R, S>(
     executor_id: usize,
     task_queue_index: usize,
+    registry: &TaskRegistry,
     future: F,
     schedule: S,
     latency_matters: bool,
@@ -41,6 +42,7 @@ where
             schedule,
             executor_id,
             task_queue_index,
+            registry,
             latency_matters,
         )
     } else {
@@ -49,6 +51,7 @@ where
             schedule,
             executor_id,
             task_queue_index,
+            registry,
             latency_matters,
         )
     };
@@ -150,33 +153,16 @@ impl Task {
     }
 
     pub(crate) fn run_right_away(self) -> bool {
-        let ptr = self.raw_task.as_ptr();
-        let header = ptr as *const Header;
-        mem::forget(self);
-
-        unsafe { ((*header).vtable.run)(ptr) }
+        self.run()
     }
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
         let ptr = self.raw_task.as_ptr();
-        let header = ptr as *mut Header;
+        let header = ptr as *const Header;
 
         unsafe {
-            // Cancel the task.
-            (*header).cancel();
-
-            // Drop the future.
-            ((*header).vtable.drop_future)(ptr);
-
-            // Mark the task as unscheduled.
-            (*header).state &= !SCHEDULED;
-
-            // Notify the awaiter that the future has been dropped.
-            (*header).notify(None);
-
-            // Drop the task reference.
             ((*header).vtable.drop_task)(ptr);
         }
     }

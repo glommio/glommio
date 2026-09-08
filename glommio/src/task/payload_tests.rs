@@ -280,6 +280,7 @@ fn schedule_capture<const N: usize>() {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
+            &ex.tasks,
             future,
             move |task| {
                 let _ = &schedule_guard;

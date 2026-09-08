@@ -761,11 +761,10 @@ impl Reactor {
         timers.process_timers()
     }
 
+    /// Releases the channel registry before foreign wakes can drop task futures.
     fn process_shared_channels(&self) -> usize {
-        let mut channels = self.shared_channels.borrow_mut();
-        let mut processed = channels.process_shared_channels();
-        processed += self.sys.process_foreign_wakes();
-        processed
+        let processed = self.shared_channels.borrow_mut().process_shared_channels();
+        processed + self.sys.process_foreign_wakes()
     }
 
     pub(crate) fn process_shared_channels_by_id(&self, id: u64) -> usize {

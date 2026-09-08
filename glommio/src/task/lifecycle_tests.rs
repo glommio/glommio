@@ -60,7 +60,7 @@ pub(crate) mod test_executor_id {
 #[cfg(test)]
 mod test {
     use super::test_executor_id;
-    use crate::task::{task_impl, task_impl::Task, JoinHandle};
+    use crate::task::{registry::TaskRegistry, task_impl, task_impl::Task, JoinHandle};
     use std::{
         cell::RefCell,
         future::Future,
@@ -94,32 +94,45 @@ mod test {
     /// Collects rescheduled runnables so a test can run them by hand.
     type Collected = Rc<RefCell<Vec<Task>>>;
 
+    thread_local! {
+        static REGISTRY: TaskRegistry = TaskRegistry::new();
+    }
+
+    struct OwnerGuard {
+        _identity: test_executor_id::Guard,
+    }
+
+    impl Drop for OwnerGuard {
+        fn drop(&mut self) {
+            REGISTRY.with(TaskRegistry::shutdown);
+        }
+    }
+
     /// Claims `EXECUTOR_ID` for this thread so the task's drop and wake paths
     /// take the owning-thread branch. Must be held for as long as any task from
     /// `spawn_capturing` is alive.
-    fn own_tasks() -> test_executor_id::Guard {
-        test_executor_id::scoped(EXECUTOR_ID)
+    fn own_tasks() -> OwnerGuard {
+        OwnerGuard {
+            _identity: test_executor_id::scoped(EXECUTOR_ID),
+        }
     }
 
-    /// Spawn with a schedule closure that captures, so `RawTask::schedule`
-    /// takes its non-zero-sized path and clones a waker as a lifetime guard.
-    ///
-    /// The returned `Task` carries no reference yet: `run_right_away` and
-    /// `schedule` are the two entry points that give it one, exactly as
-    /// `spawn_and_run` and `spawn_and_schedule` do in the executor. Calling
-    /// `run` or dropping it directly would underflow the count.
+    /// Spawns a counted runnable in the reactor-free test registry.
     fn spawn_capturing<F, R>(future: F, sink: Collected) -> (Task, JoinHandle<R>)
     where
         F: Future<Output = R>,
         R: 'static,
     {
-        task_impl::spawn_local(
-            EXECUTOR_ID,
-            QUEUE_INDEX,
-            future,
-            move |runnable: Task| sink.borrow_mut().push(runnable),
-            false,
-        )
+        REGISTRY.with(|registry| {
+            task_impl::spawn_local(
+                EXECUTOR_ID,
+                QUEUE_INDEX,
+                registry,
+                future,
+                move |runnable: Task| sink.borrow_mut().push(runnable),
+                false,
+            )
+        })
     }
 
     #[test]

@@ -43,6 +43,11 @@ pub struct CpuLocation {
     pub cache_domain: usize,
 }
 
+/// Builds the `CpuLocation` for a single CPU from its sysfs topology files.
+///
+/// The `cache_domain` is provisional here: it is replaced with a dense id
+/// below, or left as the package id if this machine does not report cache
+/// topology.
 fn build_cpu_location(
     sysfs_path: &Path,
     cpu: usize,
@@ -60,8 +65,6 @@ fn build_cpu_location(
         core: get_core_id(cpu, &cpu_path, cpu_to_core)?,
         package: package_id,
         numa_node,
-        // Provisional: replaced with a dense id below, or left as the package
-        // id if this machine does not report cache topology.
         cache_domain: get_cache_domain_id(sysfs_path, cpu).unwrap_or(package_id),
     })
 }
@@ -73,7 +76,7 @@ fn build_cpu_location(
 /// a domain derives the same value without any cross-CPU coordination. Returns
 /// `None` when the machine does not expose cache topology at all (some
 /// containers, some architectures), in which case the caller falls back to the
-/// package.
+/// package. Instruction caches are never the sharing domain we care about.
 fn get_cache_domain_id(sysfs_path: &Path, cpu: usize) -> Option<usize> {
     let cache_path = sysfs_path.join(format!("cpu/cpu{cpu}/cache"));
     let mut best: Option<(usize, usize)> = None;
@@ -96,7 +99,6 @@ fn get_cache_domain_id(sysfs_path: &Path, cpu: usize) -> Option<usize> {
             Err(_) => continue,
         };
 
-        // Instruction caches are never the sharing domain we care about.
         if matches!(
             std::fs::read_to_string(dir.join("type"))
                 .as_deref()
@@ -123,7 +125,19 @@ fn get_cache_domain_id(sysfs_path: &Path, cpu: usize) -> Option<usize> {
 
 /// Request the machine topology.  Only CPUs that are currently `online`
 /// according to `/sys/devices/system/cpu/online` are provided;  `sysfs` is
-/// always at `/sys` per: https://www.kernel.org/doc/html/latest/admin-guide/sysfs-rules.html
+/// always at `/sys` per: <https://www.kernel.org/doc/html/latest/admin-guide/sysfs-rules.html>
+///
+/// Assigns a virtual core id to each CPU. The basic strategy is to sort CPUs
+/// by their (NUMA node id, core id) and assign virtual core id in this order.
+/// Note we need to ensure that the CPUs on the same core will have the same
+/// core id. A `BTree` is used over `HashMap` for 2 reasons:
+/// 1. to keep mapping consitent between different invocations.
+/// 2. to assign smaller virtual core ids to smaller numa node id.
+///
+/// Densifies cache domain ids the same way, and for the same reason: the
+/// placement tree assumes ids at a level are unique and consecutive, and the
+/// raw value so far is "lowest CPU sharing this cache", which is neither.
+/// `BTreeMap` keeps the mapping stable across invocations.
 pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
     let sysfs_path = Path::new("/sys/devices/system");
     let mut cpus_online = HashSet::new();
@@ -155,7 +169,6 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
         let node_cpus = ListIterator::from_path(&node_path.join("cpulist"))?;
         for cpu in node_cpus {
             let cpu = cpu?;
-            // only map CPUs that are online
             if !cpus_online.contains(&cpu) {
                 continue;
             }
@@ -165,15 +178,6 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
         }
     }
 
-    // Assign a virtual core id to each CPU. The basic strategy is to sort CPUs
-    // by their (NUMA node id, core id) and assign virtual core id in this order.
-    // Note we need to ensure that the CPUs on the same core will have the same core
-    // id.
-
-    // Using BTree over HashMap for 2 reasons:
-    // 1. to keep mapping consitent between different invocations.
-    // 2. to assign smaller virtual core ids to smaller numa node id.
-    // numa_node -> (core_id -> [cpu_id])
     let mut node_to_core_to_cpus: BTreeMap<usize, BTreeMap<usize, Vec<usize>>> = BTreeMap::new();
     for l in &cpu_locations {
         node_to_core_to_cpus
@@ -199,10 +203,6 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
         cpu_location.core = *cpu_to_vcore.get(&cpu_location.cpu).unwrap();
     }
 
-    // Densify cache domain ids the same way, and for the same reason: the
-    // placement tree assumes ids at a level are unique and consecutive, and the
-    // raw value so far is "lowest CPU sharing this cache", which is neither.
-    // BTreeMap keeps the mapping stable across invocations.
     let raw_domains: std::collections::BTreeSet<usize> =
         cpu_locations.iter().map(|l| l.cache_domain).collect();
     let domain_to_dense: HashMap<usize, usize> = raw_domains
@@ -217,15 +217,18 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
     Ok(cpu_locations)
 }
 
+/// Resolves the core id for `cpu` (and all of its hyper-thread siblings).
+///
+/// `hwloc` suggests that some hardware assigns unique `core_id`s to each CPU
+/// even though they are hyper-threads, so we ensure we have the same
+/// `core_id` for all CPUs in `core_cpus_list` (`thread_siblings` is
+/// deprecated in favor of `core_cpus`) see:
+/// <https://github.com/open-mpi/hwloc/blob/3c8ed197d9a017ca5399007861981b60032e7ca6/hwloc/topology-linux.c#L4267>
 fn get_core_id(
     cpu: usize,
     cpu_path: &Path,
     cpu_to_core: &mut HashMap<usize, usize>,
 ) -> io::Result<usize> {
-    // `hwloc` suggests that some hardware assigns unique `core_id`s to each CPU
-    // even though they are hyper-threads, so we ensure we have the same
-    // `core_id` for all CPUs in `core_cpus_list` (`thread_siblings` is
-    // deprecated in favor of `core_cpus`) see: https://github.com/open-mpi/hwloc/blob/3c8ed197d9a017ca5399007861981b60032e7ca6/hwloc/topology-linux.c#L4267
     let cpu_siblings = ListIterator::from_path(&cpu_path.join("core_cpus_list"))?;
     match cpu_to_core.get(&cpu) {
         Some(core) => Ok(*core),
@@ -246,12 +249,11 @@ fn get_core_id(
 pub(crate) mod test_helpers {
     use super::{CpuLocation, HashMap};
 
+    /// Checks that we don't have a system where any hardware component has an id
+    /// that is not unique system-wide (e.g. both numa node 0 and 1 have a core
+    /// with id 0); this precondition is assumed throughout
     pub fn check_topolgy(mut topology: Vec<CpuLocation>) {
-        // Check that we don't have a system where any hardware component has an id that
-        // is not unique system-wide (e.g. both numa node 0 and 1 have a core
-        // with id 0); this precondition is assumed throughout
         topology.sort_by_key(|l| (l.numa_node, l.package, l.core, l.cpu));
-
         let cpus = topology.into_iter();
         let mut cpu_to_core = HashMap::new();
         let mut core_to_pkg = HashMap::new();
@@ -359,10 +361,10 @@ mod test {
 
     #[test]
     #[should_panic(expected = "unsupported topology hierarchy")]
+    /// Panics because topology levels are unclear:
+    /// numa node 0 is associated with package 0 and 1
+    /// package 1 is associated with numa node 0 and 2
     fn check_topology_check() {
-        // panic because topology level are unclear:
-        // numa node 0 is associated with package 0 and 1
-        // package 1 is associated with numa node 0 and 2
         let topology = vec![
             cpu_loc(0, 0, 0, 0),
             cpu_loc(0, 1, 1, 1),
@@ -406,12 +408,13 @@ mod cache_domain_tests {
         }
 
         /// Adds one cache index for `cpu`, as sysfs would expose it.
+        ///
+        /// Trailing newlines are written, because sysfs has them and the list
+        /// parser relies on it: `skip_delim` leaves the final byte alone so the
+        /// terminator can be checked. A fixture without one hangs.
         fn cache(&self, cpu: usize, index: usize, level: &str, kind: &str, shared: &str) -> &Self {
             let dir = self.0.join(format!("cpu/cpu{cpu}/cache/index{index}"));
             fs::create_dir_all(&dir).expect("create cache index");
-            // Trailing newlines, because sysfs has them and the list parser
-            // relies on it: `skip_delim` leaves the final byte alone so the
-            // terminator can be checked. A fixture without one hangs.
             fs::write(dir.join("level"), format!("{level}\n")).expect("write level");
             fs::write(dir.join("type"), format!("{kind}\n")).expect("write type");
             fs::write(dir.join("shared_cpu_list"), format!("{shared}\n"))
@@ -426,10 +429,10 @@ mod cache_domain_tests {
         }
     }
 
+    /// Two packages of four, sharing an L3 each.
     #[test]
     fn the_domain_is_the_lowest_cpu_sharing_the_deepest_cache() {
         let sysfs = FakeSysfs::new();
-        // Two packages of four, sharing an L3 each.
         for cpu in 0..8 {
             let l3 = if cpu < 4 { "0-3" } else { "4-7" };
             sysfs
@@ -445,11 +448,11 @@ mod cache_domain_tests {
         }
     }
 
+    /// An instruction cache reported at a deeper level than the unified one
+    /// it shares a die with. Taking it would split a domain that is real.
     #[test]
     fn an_instruction_cache_is_not_a_sharing_domain() {
         let sysfs = FakeSysfs::new();
-        // An instruction cache reported at a deeper level than the unified one
-        // it shares a die with. Taking it would split a domain that is real.
         sysfs
             .cache(0, 0, "2", "Unified", "0-1")
             .cache(0, 1, "3", "Instruction", "0");
@@ -468,11 +471,11 @@ mod cache_domain_tests {
         );
     }
 
+    /// Some containers and some architectures expose no cache directory at
+    /// all. The caller falls back to the package id.
     #[test]
     fn a_machine_that_reports_no_cache_topology_has_no_domain() {
         let sysfs = FakeSysfs::new();
-        // Some containers and some architectures expose no cache directory at
-        // all. The caller falls back to the package id.
         assert_eq!(get_cache_domain_id(sysfs.path(), 0), None);
     }
 

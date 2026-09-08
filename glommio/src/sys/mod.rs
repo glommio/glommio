@@ -103,16 +103,17 @@ pub(crate) fn direct_io_ify(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
-// This essentially converts the nix errors into something we can integrate with
-// the rest of the crate.
+/// This essentially converts the nix errors into something we can integrate with
+/// the rest of the crate.
+///
+/// Unnamed unix sockets have a len of 0. Technically we should make sure this
+/// has family = `AF_UNIX`, but if len == 0 the OS may not have written
+/// anything here. If this is not supposed to be unix, the upper layers will
+/// complain.
 pub(crate) unsafe fn ssptr_to_sockaddr<T: SockaddrLike>(
     ss: MaybeUninit<nix::sys::socket::sockaddr_storage>,
     len: usize,
 ) -> io::Result<T> {
-    // Unnamed unix sockets have a len of 0. Technically we should make sure this
-    // has family = AF_UNIX, but if len == 0 the OS may not have written
-    // anything here. If this is not supposed to be unix, the upper layers will
-    // complain.
     if len == 0 {
         let addr = nix::sys::socket::UnixAddr::new("").unwrap();
         Ok(T::from_raw(addr.as_ptr() as *const _, Some(addr.len())).unwrap())
@@ -186,13 +187,13 @@ use std::{convert::TryFrom, ops::Deref, sync::atomic::AtomicBool};
 #[derive(Debug, Default)]
 pub(crate) struct ReactorGlobalState {
     idgen: usize,
-    // reactor_id -> notifier
+    /// `reactor_id` -> notifier
     sleep_notifiers: AHashMap<usize, std::sync::Weak<SleepNotifier>>,
 }
 
 impl ReactorGlobalState {
+    /// Note how the id starts from 1. 0 means "no notifier present"
     fn new_local_state(&mut self) -> io::Result<Arc<SleepNotifier>> {
-        // Note how this starts from 1. 0 means "no notifier present"
         self.idgen += 1;
         let id = self.idgen;
         if id == 0 || id == usize::MAX {
@@ -316,10 +317,12 @@ impl SleepNotifier {
         }
     }
 
+    /// Queues a waker, and notifies the destination executor.
+    ///
+    /// The sender only errors out if the destination disconnected. That
+    /// most likely happened because the remote executor already died, in which
+    /// case they were no longer interested in this notification. But log.
     pub(crate) fn queue_waker(&self, waker: Waker, force_notify: bool) {
-        // Sender only errors out if the destination disconnected. That
-        // most likely happened because the remote executor already died, in which
-        // case they were no longer interested in this notification. But log.
         if self.waker_sender.send(waker).is_err() {
             debug!(
                 "Executor {} cannot send the waker to its destination!",
@@ -339,9 +342,9 @@ impl SleepNotifier {
         processed
     }
 
+    /// This will allow this `eventfd` to be notified. This should not happen
+    /// for the placeholder (disconnected) case.
     pub(super) fn prepare_to_sleep(&self) {
-        // This will allow this `eventfd` to be notified. This should not happen
-        // for the placeholder (disconnected) case.
         assert_ne!(self.id, usize::MAX);
         self.should_notify.store(true, Ordering::Relaxed);
     }
@@ -352,11 +355,11 @@ impl SleepNotifier {
 }
 
 impl Drop for SleepNotifier {
+    /// The other side may still be holding a reference in which case the notifier
+    /// will be freed later. However, we can't receive notifications anymore
+    /// so memory must be zeroed here.
     fn drop(&mut self) {
         let mut state = REACTOR_GLOBAL_STATE.write().unwrap();
-        // The other side may still be holding a reference in which case the notifier
-        // will be freed later. However, we can't receive notifications anymore
-        // so memory must be zeroed here.
         self.wake_up();
         state.sleep_notifiers.remove(&self.id).unwrap();
     }
@@ -419,15 +422,15 @@ pub(crate) enum DirectIo {
 /// meaning we can't conflate Pollable and the buffer type.
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum PollableStatus {
-    // The pollable ring only supports Direct I/O, so always true.
+    /// The pollable ring only supports Direct I/O, so always true.
     Pollable,
-    // Non-pollable can go either way
+    /// Non-pollable can go either way
     NonPollable(DirectIo),
 }
 
-// code imported from libc crate
-// libc::statx isn't used because it's not available when targeting musl
-
+/// Code imported from libc crate.
+///
+/// `libc::statx` isn't used because it's not available when targeting musl
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Statx {
@@ -508,8 +511,8 @@ pub(crate) struct KernelTimespec {
     pub tv_nsec: i64,
 }
 
-// `io-uring` is a separate crate, so hold it to that layout here: a change
-// there would otherwise show up as a timeout of garbage duration.
+/// `io-uring` is a separate crate, so hold it to that layout here: a change
+/// there would otherwise show up as a timeout of garbage duration.
 const _: () = {
     assert!(
         std::mem::size_of::<KernelTimespec>() == std::mem::size_of::<io_uring::types::Timespec>()
@@ -653,16 +656,15 @@ impl Wakers {
 
 /// Shuts down the requested side of a socket.
 ///
-/// If this source is not a socket, the `shutdown()` syscall error is ignored.
+/// This may not be a TCP stream, but that's okay: all we do is call
+/// `shutdown()` on the raw descriptor. The only actual error may be
+/// `ENOTCONN`; ignore everything else.
 pub(crate) fn shutdown(raw: RawFd, how: Shutdown) -> io::Result<()> {
-    // This may not be a TCP stream, but that's okay. All we do is call `shutdown()`
-    // on the raw descriptor and ignore errors if it's not a socket.
     let res = unsafe {
         let stream = ManuallyDrop::new(TcpStream::from_raw_fd(raw));
         stream.shutdown(how)
     };
 
-    // The only actual error may be ENOTCONN, ignore everything else.
     match res {
         Err(err) if err.kind() == io::ErrorKind::NotConnected => Err(err),
         _ => Ok(()),

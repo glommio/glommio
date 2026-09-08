@@ -27,8 +27,9 @@ use std::{
 };
 
 #[derive(Debug)]
-#[allow(dead_code)] // Clippy is unhappy with some of the fields on these enums never being read,
-                    // but they are certainly used, and read by debug
+/// Clippy is unhappy with some of the fields on these enums never being read,
+/// but they are certainly used, and read by debug
+#[allow(dead_code)]
 pub(crate) enum SourceType {
     Write(PollableStatus, IoBuffer),
     Read(PollableStatus, Option<IoBuffer>),
@@ -224,6 +225,9 @@ impl Source {
         })
     }
 
+    /// Returns the result of this I/O source, if it has completed.
+    ///
+    /// If a scheduler latency collection function is present, invoke it once.
     pub(crate) fn result(&self) -> Option<io::Result<usize>> {
         let mut inner = self.inner.borrow_mut();
         let ret = inner
@@ -235,7 +239,6 @@ impl Source {
             return ret;
         }
 
-        // if there is a scheduler latency collection function present, invoke it once
         if let Some(Some(stat_fn)) = inner.stats_collection.as_ref().map(|x| x.latency) {
             if let Some(lat) = inner.wakers.timestamps() {
                 drop(inner);
@@ -264,9 +267,9 @@ impl Source {
         ret
     }
 
-    // adds a single waiter to the list, replacing any waiter that may already
-    // exist. Should be used for single streams that map a future 1:1 to their I/O
-    // source
+    /// Adds a single waiter to the list, replacing any waiter that may already
+    /// exist. Should be used for single streams that map a future 1:1 to their I/O
+    /// source
     pub(crate) fn add_waiter_single(&self, waker: &Waker) {
         let mut inner = self.inner.borrow_mut();
         let waiters = &mut inner.wakers.waiters;
@@ -281,8 +284,8 @@ impl Source {
         debug_assert_eq!(inner.wakers.waiters.len(), 1)
     }
 
-    // adds a waiter to the list. Useful for streams that have many futures waiting
-    // on a single I/O source
+    /// Adds a waiter to the list. Useful for streams that have many futures waiting
+    /// on a single I/O source
     pub(crate) fn add_waiter_many(&self, waker: Waker) {
         self.inner.borrow_mut().wakers.waiters.push(waker)
     }
@@ -317,28 +320,28 @@ impl Source {
 }
 
 impl Drop for Source {
+    /// Drops the source and consumes its enqueue status:
+    ///
+    /// * If it was never submitted (`Enqueued`), it is safe to consume the source
+    ///   here -- the kernel didn't see our buffers. Consuming the source signals
+    ///   to the submit method that we are no longer interested in submitting
+    ///   this. This should be cheaper than removing elements from the vector all
+    ///   the time.
+    /// * If it was dispatched (`Dispatched`) but is being cancelled, the kernel
+    ///   might be using the buffers right now, so `consume_source` is delayed
+    ///   until the corresponding event is consumed from the completion queue.
+    ///   Marking it `Canceled` is not necessary, but useful for correctness.
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
         let enqueued = inner.enqueued.as_mut();
         if let Some(EnqueuedSource { id, queue, status }) = enqueued {
             match status {
                 EnqueuedStatus::Enqueued => {
-                    // We never submitted the request, so it's safe to consume
-                    // source here -- kernel didn't see our buffers. By consuming
-                    // the source we are signaling to the submit method that we are
-                    // no longer interested in submitting this. This should be cheaper
-                    // than removing elements from the vector all the time.
-
                     *status = EnqueuedStatus::Canceled;
                 }
                 EnqueuedStatus::Dispatched => {
-                    // We are cancelling this request, but it is already submitted.
-                    // This means that the kernel might be using the buffers right
-                    // now, so we delay `consume_source` until we consume the
-                    // corresponding event from the completion queue.
-
                     queue.borrow_mut().cancel_request(*id);
-                    *status = EnqueuedStatus::Canceled; // not necessary, but useful for correctness
+                    *status = EnqueuedStatus::Canceled;
                 }
                 EnqueuedStatus::Canceled => unreachable!(),
             }

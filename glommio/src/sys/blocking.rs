@@ -22,8 +22,8 @@ use std::{
 
 use super::membarrier;
 
-// So hard to copy/clone io::Error, plus need to send between threads. Best to
-// do all i64.
+/// So hard to copy/clone `io::Error`, plus need to send between threads. Best to
+/// do all i64.
 macro_rules! raw_syscall {
     ($fn:ident $args:tt) => {{
         let res = unsafe { libc::$fn $args };
@@ -152,8 +152,9 @@ pub(super) struct BlockingThreadResp {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Clippy is unhappy with some of the fields on these enums never being read,
-                    // but they are certainly used, and read by debug
+/// Clippy is unhappy with some of the fields on these enums never being read,
+/// but they are certainly used, and read by debug
+#[allow(dead_code)]
 struct BlockingThread(JoinHandle<()>);
 
 impl BlockingThread {
@@ -191,16 +192,19 @@ pub(crate) struct BlockingThreadPool {
 }
 
 impl BlockingThreadPool {
+    /// Make sure to initialize the membarrier before the thread pool is constructed
+    /// so that registration is much cheaper. Additionally, even if we take the
+    /// expensive slow path, we do it here instead of at the reactor hot loop which
+    /// synchronously blocks the io_uring loop to register the membarrier.
+    /// See <https://github.com/DataDog/glommio/issues/652>.
+    ///
+    /// An alternative solution is to pull in <https://crates.io/crates/ctor> as a
+    /// dependency and run this that way - then the public API to call `early_init`
+    /// can be elided wholesale.
     pub(crate) fn new(
         placement: PoolPlacement,
         sleep_notifier: Arc<SleepNotifier>,
     ) -> crate::Result<Self, ()> {
-        // Make sure to initialize the membarrier before the thread pool is constructed so that registration
-        // is much cheaper. Additionally, even if we take the expensive slow path, we do it here instead
-        // of at the reactor hot loop which synchronously blocks the io_uring loop to register the membarrier.
-        // https://github.com/DataDog/glommio/issues/652
-        // An alternative solution is to pull in https://crates.io/crates/ctor as a dependency and run this
-        // that way - then the public API to call early_init can be elided wholesale.
         membarrier::initialize_strategy();
 
         let (in_tx, in_rx) = flume::bounded(4 << 10);

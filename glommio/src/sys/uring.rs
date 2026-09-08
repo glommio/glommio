@@ -337,10 +337,11 @@ fn is_transient(err: &UringUnsupported) -> bool {
 ///
 /// Cached once per process, but only a definitive answer: a probe that failed
 /// for want of a descriptor is tried again.
+///
+/// A poisoned lock here carries no state worth protecting: the value behind
+/// it is a cached verdict, and a panicking prober leaves it untouched.
 pub(crate) fn check_uring_support() -> io::Result<()> {
     let unsupported = |reason: String| io::Error::new(io::ErrorKind::Unsupported, reason);
-    // A poisoned lock here carries no state worth protecting: the value behind
-    // it is a cached verdict, and a panicking prober leaves it untouched.
     let mut cached = IO_URING_SUPPORT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -365,6 +366,17 @@ pub(crate) fn check_uring_support() -> io::Result<()> {
 }
 
 /// Builds the submission queue entry for one descriptor.
+///
+/// # Safety
+///
+/// Every pointer passed to the opcodes below belongs to a `Source` that the
+/// `SourceMap` keeps alive until the completion is reaped.
+///
+/// # Notes
+///
+/// * For `LinkTimeout`, the timespec is borrowed, not copied: it has to
+///   outlive the SQE. Same layout as `__kernel_timespec`, asserted in
+///   `sys/mod.rs`.
 fn fill_sqe<F>(
     op: &UringDescriptor,
     buffer_allocation: F,
@@ -376,8 +388,6 @@ where
     let mut user_data = op.user_data;
     let fd = types::Fd(op.fd);
 
-    // SAFETY: every pointer below belongs to a `Source` that the `SourceMap`
-    // keeps alive until the completion is reaped.
     let entry = unsafe {
         match op.args {
             UringOpDescriptor::PollAdd(events) => {
@@ -407,10 +417,13 @@ where
                             let entry = opcode::Read::new(fd, buf.as_mut_ptr(), len as u32)
                                 .offset(pos)
                                 .build();
-                            // If you have a buffer here, that very likely means you are reusing the
-                            // source. The kernel knows about that buffer already, and will write to
-                            // it. So this can only be called if there is no buffer attached to it.
-                            assert!(slot.is_none());
+                            assert!(
+                                slot.is_none(),
+                                "if you have a buffer here, that very likely means you are \
+                                 reusing the source; the kernel knows about that buffer \
+                                 already, and will write to it, so this can only be called \
+                                 if there is no buffer attached to it"
+                            );
                             *slot = Some(IoBuffer::DmaSink(buf));
                             entry
                         }
@@ -431,8 +444,6 @@ where
                 opcode::Connect::new(fd, (*addr).as_ptr(), (*addr).len()).build()
             }
             UringOpDescriptor::LinkTimeout(timespec) => {
-                // Borrowed, not copied: it has to outlive the SQE. Same
-                // layout as `__kernel_timespec`, asserted in `sys/mod.rs`.
                 opcode::LinkTimeout::new(timespec as *const types::Timespec).build()
             }
             UringOpDescriptor::Accept(addr) => {
@@ -447,8 +458,8 @@ where
                 .build(),
             UringOpDescriptor::StatxFd(statx_fd, statx_buf) => {
                 const EMPTY_PATH: &[u8] = b"\0";
-                // Not defined by the libc crate for musl targets. 0 in the
-                // kernel UAPI (`linux/stat.h`): do whatever stat() does.
+                /// Not defined by the libc crate for musl targets. 0 in the
+                /// kernel UAPI (`linux/stat.h`): do whatever stat() does.
                 const AT_STATX_SYNC_AS_STAT: libc::c_int = 0;
                 let flags = AT_STATX_SYNC_AS_STAT | libc::AT_NO_AUTOMOUNT | libc::AT_EMPTY_PATH;
                 opcode::Statx::new(
@@ -562,15 +573,16 @@ where
 
 /// Turns a raw CQE result into an `io::Result`. io_uring reports failure as a
 /// negative errno in the completion, not through errno.
+///
+/// `ECANCELED` is converted to `ETIMEDOUT`. This will be the case for linked
+/// `sqe`s with a timeout, and if we wanted to be really strict we'd check. But
+/// if the operation is truly cancelled no one will check the result, and we
+/// have no other use case for cancel at the moment so keep it simple
 fn transmute_error(res: i32) -> io::Result<usize> {
     if res >= 0 {
         return Ok(res as usize);
     }
     Err(io::Error::from_raw_os_error(-res)).map_err(|x: io::Error| {
-        // Convert CANCELED to TimedOut. This will be the case for linked `sqe`s with a
-        // timeout, and if we wanted to be really strict we'd check. But if
-        // the operation is truly cancelled no one will check the result,
-        // and we have no other use case for cancel at the moment so keep it simple
         if let Some(libc::ECANCELED) = x.raw_os_error() {
             io::Error::from_raw_os_error(libc::ETIMEDOUT)
         } else {
@@ -607,8 +619,8 @@ fn record_stats<Ring: UringCommon>(
     }
 }
 
-// Find the next complete chain of events from the queue.
-// Returns None if the queue is empty.
+/// Find the next complete chain of events from the queue.
+/// Returns None if the queue is empty.
 fn peek_one_chain(queue: &VecDeque<UringDescriptor>, ring_size: usize) -> Option<Range<usize>> {
     if queue.is_empty() {
         return None;
@@ -624,8 +636,8 @@ fn peek_one_chain(queue: &VecDeque<UringDescriptor>, ring_size: usize) -> Option
     Some(0..chain + 1)
 }
 
-// Extract a chain of events from the queue.
-// The chain be empty if the sources were cancelled
+/// Extract a chain of events from the queue.
+/// The chain be empty if the sources were cancelled
 fn extract_one_chain(
     source_map: &mut SourceMap,
     queue: &mut VecDeque<UringDescriptor>,
@@ -659,7 +671,15 @@ fn extract_one_chain(
         .collect()
 }
 
-// Submit the next complete chain of events from the queue if available.
+/// Submit the next complete chain of events from the queue if available.
+///
+/// A linked chain is only meaningful whole -- half of one is a link timeout
+/// with no operation to guard. Bails if it doesn't fit and lets the caller
+/// flush first.
+///
+/// The `sq.push` inside the unsafe block is sound because `op`'s buffers
+/// belong to sources the `SourceMap` keeps alive until the completion is
+/// reaped, and the capacity check above means the push cannot fail.
 fn submit_event_chain(
     source_map: &mut SourceMap,
     ring: &mut IoUring,
@@ -670,9 +690,6 @@ fn submit_event_chain(
     let now = Instant::now();
 
     while let Some(chain) = peek_one_chain(queue, ring_size) {
-        // A linked chain is only meaningful whole -- half of one is a link
-        // timeout with no operation to guard. Bail if it doesn't fit and let
-        // the caller flush first.
         let mut sq = ring.submission();
         if sq.capacity() - sq.len() < chain.len() {
             return None;
@@ -680,16 +697,12 @@ fn submit_event_chain(
 
         let ops = extract_one_chain(source_map, queue, chain, now);
         if ops.is_empty() {
-            // all the sources in the ring were cancelled
             continue;
         }
 
         for op in ops {
             let allocator = allocator.clone();
             let entry = fill_sqe(&op, move |size| allocator.new_buffer(size), source_map);
-            // SAFETY: `op`'s buffers belong to sources the `SourceMap` keeps
-            // alive until the completion is reaped, and the check above means
-            // the push cannot fail.
             unsafe {
                 sq.push(&entry)
                     .expect("chain was checked to fit in the submission queue");
@@ -700,6 +713,9 @@ fn submit_event_chain(
     Some(false)
 }
 
+/// Processes a single completion event, if any.
+///
+/// No user data is `POLL_REMOVE` or `CANCEL`; we won't process it.
 fn process_one_event<F, R>(
     cqe: Option<cqueue::Entry>,
     try_process: F,
@@ -711,7 +727,6 @@ where
     R: FnOnce(RefMut<'_, InnerSource>, io::Result<usize>) -> io::Result<usize>,
 {
     if let Some(value) = cqe {
-        // No user data is `POLL_REMOVE` or `CANCEL`, we won't process.
         if value.user_data() == 0 {
             return Some(false);
         }
@@ -969,10 +984,10 @@ impl UringCommon for PollRing {
         self.ring.submitter()
     }
 
+    /// We need to enter the kernel to submit and collect CQEs so if the number
+    /// of submitted requests doesn't match the number of request we collected,
+    /// we need to poll.
     fn needs_kernel_enter(&mut self) -> bool {
-        // We need to enter the kernel to submit and collect CQEs so if the number of
-        // submitted requests doesn't match the number of request we collected, we need
-        // to poll.
         self.in_kernel > 0 || self.waiting_kernel_submission() > 0
     }
 
@@ -1002,10 +1017,10 @@ impl UringCommon for PollRing {
         Ok(x)
     }
 
+    /// Reaps the completion before the closure below borrows `self`, since
+    /// the completion queue borrows the ring exclusively.
     fn consume_one_event(&mut self) -> Option<bool> {
         let source_map = self.source_map.clone();
-        // Reap the completion before the closure below borrows `self`, since
-        // the completion queue borrows the ring exclusively.
         let cqe = self.ring.completion().next();
         process_one_event(
             cqe,
@@ -1147,10 +1162,14 @@ impl SleepableRing {
         timer_source
     }
 
+    /// Now must wait on the `eventfd` in case someone wants to wake us up.
+    /// If we can't then we can't sleep and will just bail immediately.
+    ///
+    /// The read targets the eventfd source's own buffer, which the
+    /// `SourceMap` keeps alive until the completion is reaped. The
+    /// `is_full()` check above means the push cannot fail.
     fn install_eventfd(&mut self, eventfd_src: &Source) -> bool {
         if !self.ring.submission().is_full() {
-            // Now must wait on the `eventfd` in case someone wants to wake us up.
-            // If we can't then we can't sleep and will just bail immediately
             let op = UringDescriptor {
                 fd: eventfd_src.raw(),
                 flags: squeue::Flags::empty(),
@@ -1179,9 +1198,6 @@ impl SleepableRing {
                 },
                 &mut self.source_map.borrow_mut(),
             );
-            // SAFETY: the read targets the eventfd source's own buffer, which
-            // the `SourceMap` keeps alive until the completion is reaped. The
-            // emptiness check above means the push cannot fail.
             unsafe {
                 self.ring
                     .submission()
@@ -1201,6 +1217,26 @@ impl SleepableRing {
         }
     }
 
+    /// Sleeps until an event arrives, by preparing an SQE that polls the link
+    /// source and links the two rings.
+    ///
+    /// We have now prepared the SQE that links the two rings; we need to
+    /// submit it successfully to be able to safely sleep. If we fail to
+    /// submit the `SQE` that links the rings, we can't sleep: waiting here is
+    /// unsafe because we could end up waiting much longer than needed.
+    ///
+    /// The entry stays queued. io-uring can't rewrite a pushed entry and
+    /// doesn't need to: it goes out with the next submit and its completion
+    /// retires the source. Wakes nobody, costs a spurious CQE.
+    ///
+    /// On success the rings are linked. Goodnight!
+    ///
+    /// Can't link rings because we ran out of `CQE`s? Just can't sleep.
+    /// Submit what we have; once we're out of here we'll consume them and at
+    /// some point will be able to sleep again.
+    ///
+    /// The poll targets the latency ring's fd, which outlives this reactor,
+    /// and the `is_full()` check above means the push cannot fail.
     fn sleep(&mut self, link: &Source) -> io::Result<usize> {
         assert_eq!(
             self.waiting_kernel_submission(),
@@ -1219,17 +1255,12 @@ impl SleepableRing {
                 args: UringOpDescriptor::PollAdd(common_flags() | read_flags()),
             };
             let entry = fill_sqe(&op, DmaBuffer::new, &mut self.source_map.borrow_mut());
-            // SAFETY: the poll targets the latency ring's fd, which outlives
-            // this reactor, and the check above means the push cannot fail.
             unsafe {
                 self.ring
                     .submission()
                     .push(&entry)
                     .expect("submission queue was checked to have room");
             }
-
-            // We have now prepared the SQE that links the two rings. We now need to submit
-            // it successfully to be able to safely sleep.
 
             if self
                 .submit_sqes()
@@ -1238,17 +1269,8 @@ impl SleepableRing {
                 .or_else(Reactor::intr_ok)?
                 != 1
             {
-                // We failed to submit the `SQE` that links the rings. Just can't sleep.
-                // Waiting here is unsafe because we could end up waiting much longer than
-                // needed.
-                //
-                // The entry stays queued. io-uring can't rewrite a pushed
-                // entry and doesn't need to: it goes out with the next submit
-                // and its completion retires the source. Wakes nobody, costs a
-                // spurious CQE.
                 Err(io::Error::from_raw_os_error(libc::EBUSY))
             } else {
-                // The rings are linked. Goodnight!
                 self.ring
                     .submit_and_wait(1)
                     .map(|_| 1)
@@ -1257,9 +1279,6 @@ impl SleepableRing {
                     .or_else(Reactor::intr_ok)
             }
         } else {
-            // Can't link rings because we ran out of `CQE`s. Just can't sleep.
-            // Submit what we have, once we're out of here we'll consume them
-            // and at some point will be able to sleep again.
             self.submit_sqes()
                 .or_else(Reactor::busy_ok)
                 .or_else(Reactor::again_ok)
@@ -1289,9 +1308,9 @@ impl UringCommon for SleepableRing {
         false
     }
 
+    /// We only need to enter the kernel to submit SQEs, not to collect CQEs
+    /// (the kernel posts the CQEs asynchronously for us)
     fn needs_kernel_enter(&mut self) -> bool {
-        // We only need to enter the kernel to submit SQEs, not to collect CQEs (the
-        // kernel posts the CQEs asynchronously for us)
         self.waiting_kernel_submission() > 0
     }
 
@@ -1323,9 +1342,9 @@ impl UringCommon for SleepableRing {
         Ok(x)
     }
 
+    /// As above: reap first, then borrow `self` in the post-process closure.
     fn consume_one_event(&mut self) -> Option<bool> {
         let source_map = self.source_map.clone();
-        // As above: reap first, then borrow `self` in the post-process closure.
         let cqe = self.ring.completion().next();
         process_one_event(
             cqe,
@@ -1359,7 +1378,7 @@ impl UringCommon for SleepableRing {
 }
 
 pub(crate) struct Reactor {
-    // FIXME: it is starting to feel we should clean this up to a Inner pattern
+    /// FIXME: it is starting to feel we should clean this up to a Inner pattern
     main_ring: RefCell<SleepableRing>,
     latency_ring: RefCell<SleepableRing>,
     poll_ring: RefCell<PollRing>,
@@ -1369,12 +1388,12 @@ pub(crate) struct Reactor {
 
     link_fd: RawFd,
 
-    // This keeps the `eventfd` alive. Drop will close it when we're done
+    /// This keeps the `eventfd` alive. Drop will close it when we're done
     notifier: Arc<sys::SleepNotifier>,
-    // This is the source used to handle the notifications into the ring.
-    // It is reused, unlike the timeout src, because it is possible and likely
-    // that it will be in the ring through many calls to the reactor loop. It only ever gets
-    // completed if this reactor is woken up from another one
+    /// This is the source used to handle the notifications into the ring.
+    /// It is reused, unlike the timeout src, because it is possible and likely
+    /// that it will be in the ring through many calls to the reactor loop. It only ever gets
+    /// completed if this reactor is woken up from another one
     eventfd_src: Source,
     source_map: Rc<RefCell<SourceMap>>,
 
@@ -1427,6 +1446,12 @@ fn align_up(v: usize, align: usize) -> usize {
 }
 
 impl Reactor {
+    /// Creates a new reactor.
+    ///
+    /// Always have at least some small amount of memory for the slab. The
+    /// `register_buffers` calls are sound because `registry` borrows the
+    /// allocator's arena, which lives as long as the reactor and therefore
+    /// outlives the registration.
     pub(crate) fn new(
         notifier: Arc<sys::SleepNotifier>,
         mut io_memory: usize,
@@ -1443,7 +1468,6 @@ impl Reactor {
         }
 
         let source_map = Rc::new(RefCell::new(SourceMap::default()));
-        // always have at least some small amount of memory for the slab
         io_memory = std::cmp::max(align_up(io_memory, 4096), 65536);
 
         let allocator = Rc::new(UringBufferAllocator::new(io_memory));
@@ -1461,8 +1485,6 @@ impl Reactor {
         let mut latency_ring =
             SleepableRing::new(ring_depth, "latency", allocator.clone(), source_map.clone())?;
 
-        // SAFETY: `registry` borrows the allocator's arena, which lives as long as
-        // the reactor and therefore outlives the registration.
         match unsafe { main_ring.submitter().register_buffers(&registry) } {
             Err(x) => warn!("Error: registering buffers in the main ring. Skipping{x:#?}"),
             Ok(_) => match unsafe { poll_ring.submitter().register_buffers(&registry) } {
@@ -1944,6 +1966,48 @@ impl Reactor {
     ///   to the point where we *leave* this method. For instance: if we spin
     ///   here for 3ms and the preempt timer is 10ms that would leave the next
     ///   task queue just 7ms to run.
+    ///
+    /// The steps, in order:
+    ///
+    /// * Consume all events from the rings.
+    /// * Cancel the old timer regardless of whether we can sleep: if we
+    ///   won't sleep, we will register the new timer with its new value. But
+    ///   if we will sleep, there might be a timer registered that needs to
+    ///   be removed otherwise we'll wake up when it expires.
+    /// * Schedule the throughput-based timeout immediately: it won't matter
+    ///   if we end up sleeping.
+    /// * Flush cancellations. This will only dispatch if we run out of sqes.
+    ///   Which means until `flush_rings!` nothing is really send to the
+    ///   kernel... which happens right here. If you ever reorder this code
+    ///   just be careful about this dependency.
+    /// * Pick up the results of any cancellations.
+    /// * If we generated any event so far, we can't sleep. Need to handle
+    ///   them.
+    ///
+    /// When sleeping:
+    ///
+    /// * It's ok to sleep, but if there is a timer set, we need to make sure
+    ///   we wake up to handle it.
+    /// * From this moment on the remote executors are aware that we are
+    ///   sleeping. We have to sweep the remote channels function once more
+    ///   because since last time until now it could be that something
+    ///   happened in a remote executor that opened up room. If it did we
+    ///   bail on sleep and go process it.
+    /// * `membarrier::heavy()` -- see
+    ///   <https://www.scylladb.com/2018/02/15/memory-barriers-seastar-linux/>
+    ///   for details. This translates to `sys_membarrier()` /
+    ///   `MEMBARRIER_CMD_PRIVATE_EXPEDITED`.
+    /// * May have new cancellations related to the link ring fd; flush them.
+    /// * Woke up, so no need to notify us anymore.
+    ///
+    /// # A note about `need_preempt`
+    ///
+    /// If in the last call to `consume_rings!` some events completed, the
+    /// tail and head would have moved to match. So it does not matter that
+    /// events were generated after we registered the timer: since we
+    /// consumed them here, `need_preempt()` should be false at this point.
+    /// As soon as the next event in the preempt ring completes, though, then
+    /// it will be true.
     pub(crate) fn wait<Preempt, F>(
         &self,
         preempt_timer: Preempt,
@@ -1961,19 +2025,10 @@ impl Reactor {
         let mut main_ring = self.main_ring.borrow_mut();
         let mut lat_ring = self.latency_ring.borrow_mut();
 
-        // consume all events from the rings
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        // Cancel the old timer regardless of whether we can sleep:
-        // if we won't sleep, we will register the new timer with its new
-        // value.
-        //
-        // But if we will sleep, there might be a timer registered that needs
-        // to be removed otherwise we'll wake up when it expires.
         drop(self.latency_preemption_timeout_src.take());
 
-        // Schedule the throughput-based timeout immediately: it won't matter if we end
-        // up sleeping.
         self.throughput_preemption_timeout_src.replace(Some(
             main_ring.prepare_throughput_preemption_timer(
                 self.ring_depth() as u32,
@@ -1981,16 +2036,10 @@ impl Reactor {
             ),
         ));
 
-        // This will only dispatch if we run out of sqes. Which means until
-        // flush_rings! nothing is really send to the kernel...
         flush_cancellations!(into &mut woke; lat_ring, poll_ring, main_ring);
-        // ... which happens right here. If you ever reorder this code just
-        // be careful about this dependency.
         flush_rings!(lat_ring, poll_ring, main_ring)?;
-        // pick up the results of any cancellations
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        // If we generated any event so far, we can't sleep. Need to handle them.
         let should_sleep = preempt_timer().is_none()
             && (woke == 0)
             && poll_ring.can_sleep()
@@ -1998,33 +2047,22 @@ impl Reactor {
             && lat_ring.can_sleep();
 
         if should_sleep {
-            // We are about to go to sleep. It's ok to sleep, but if there
-            // is a timer set, we need to make sure we wake up to handle it.
             if let Some(dur) = user_timer {
                 self.latency_preemption_timeout_src
                     .set(Some(lat_ring.prepare_latency_preemption_timer(dur)));
                 assert!(flush_rings!(lat_ring)? > 0);
             }
-            // From this moment on the remote executors are aware that we are sleeping
-            // We have to sweep the remote channels function once more because since
-            // last time until now it could be that something happened in a remote executor
-            // that opened up room. If it did we bail on sleep and go process it.
             self.notifier.prepare_to_sleep();
-            // See https://www.scylladb.com/2018/02/15/memory-barriers-seastar-linux/ for
-            // details. This translates to `sys_membarrier()` /
-            // `MEMBARRIER_CMD_PRIVATE_EXPEDITED`
             membarrier::heavy();
             let events = process_remote_channels() + self.flush_syscall_thread();
             if events == 0 {
                 if self.eventfd_src.is_installed().unwrap() {
                     self.link_rings_and_sleep(&mut main_ring)
                         .expect("some error");
-                    // May have new cancellations related to the link ring fd.
                     flush_cancellations!(into &mut 0; lat_ring, poll_ring, main_ring);
                     flush_rings!(lat_ring, poll_ring, main_ring)?;
                     consume_rings!(into &mut 0; lat_ring, poll_ring, main_ring);
                 }
-                // Woke up, so no need to notify us anymore.
                 self.notifier.wake_up();
             }
         }
@@ -2035,13 +2073,6 @@ impl Reactor {
             flush_rings!(lat_ring, main_ring)?;
         }
 
-        // A Note about `need_preempt`:
-        //
-        // If in the last call to consume_rings! some events completed, the tail and
-        // head would have moved to match. So it does not matter that events were
-        // generated after we registered the timer: since we consumed them here,
-        // need_preempt() should be false at this point. As soon as the next event
-        // in the preempt ring completes, though, then it will be true.
         Ok(should_sleep)
     }
 
@@ -2049,19 +2080,20 @@ impl Reactor {
         self.blocking_thread.flush()
     }
 
+    /// The status must not outlive the ring, and the `Reactor` that stores it
+    /// owns this whole structure. Bound to a local first because the
+    /// `CompletionQueue` it comes from only borrows `lat_ring`.
     pub(crate) fn preempt_status(&self) -> CompletionStatus {
         let mut lat_ring = self.latency_ring.borrow_mut();
-        // SAFETY: the status must not outlive the ring, and the `Reactor` that
-        // stores it owns this whole structure. Bound to a local first because
-        // the `CompletionQueue` it comes from only borrows `lat_ring`.
         let status = unsafe { lat_ring.ring.completion().status() };
         status
     }
 
     /// RAII-truncate asynchronously files that required it, e.g. because of
     /// padded writes, but were not closed explicitly.
+    ///
+    /// Actually synchronous for now!
     pub(crate) fn async_truncate(&self, fd: RawFd, size: u64) {
-        // actually synchronous for now!
         let _ = sys::truncate_file(fd, size);
     }
 
@@ -2079,15 +2111,16 @@ impl Reactor {
         });
     }
 
+    /// Dispatch requests according to the following rules:
+    /// * Disk reads/writes go to the poll ring if possible, or the main ring
+    ///   otherwise;
+    /// * Network Rx and connect/accept go the latency ring;
+    /// * Every other request are dispatched to the main ring;
+    ///
+    /// We avoid putting requests that come in high numbers on the latency
+    /// ring because the more request we issue there, the less effective it
+    /// becomes.
     pub(crate) fn ring_for_source(&self, source: &Source) -> RefMut<'_, dyn UringCommon> {
-        // Dispatch requests according to the following rules:
-        // * Disk reads/writes go to the poll ring if possible, or the main ring
-        //   otherwise;
-        // * Network Rx and connect/accept go the latency ring;
-        // * Every other request are dispatched to the main ring;
-        // We avoid putting requests that come in high numbers on the latency ring
-        // because the more request we issue there, the less effective it becomes.
-
         match &*source.source_type() {
             SourceType::Read(p, _) | SourceType::Write(p, _) => match p {
                 PollableStatus::Pollable => self.poll_ring.borrow_mut(),
@@ -2188,11 +2221,11 @@ mod tests {
 
     use super::*;
 
+    /// The probe list is the only thing standing between an unsupported
+    /// kernel and an -EINVAL on a completion nobody is expecting, so it has
+    /// to name every opcode fill_sqe can build.
     #[test]
     fn probes_every_opcode_glommio_submits() {
-        // The probe list is the only thing standing between an unsupported
-        // kernel and an -EINVAL on a completion nobody is expecting, so it has
-        // to name every opcode fill_sqe can build.
         let submitted = [
             opcode::Nop::CODE,
             opcode::Fsync::CODE,
@@ -2245,6 +2278,7 @@ mod tests {
         assert!(err.contains(expected), "{err}");
     }
 
+    /// Dropping the in-flight `slow` timer mid-test cancels it.
     #[test]
     fn timeout_smoke_test() {
         let notifier = sys::new_sleep_notifier().unwrap();
@@ -2300,7 +2334,7 @@ mod tests {
         let elapsed_ms = start.elapsed().as_millis();
         assert!((50..100).contains(&elapsed_ms));
 
-        drop(slow); // Cancel this one.
+        drop(slow);
 
         reactor.wait(|| None, None, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
@@ -2328,10 +2362,10 @@ mod tests {
         unsafe { alloc::alloc::dealloc(data.as_ptr(), l) }
     }
 
+    /// The allocator fails with a single page, because it needs extra metadata
+    /// space
     #[test]
     fn allocator_exhaustion() {
-        // The allocator fails with a single page, because it needs extra metadata
-        // space
         let al = Rc::new(UringBufferAllocator::new(8192));
         al.activate_registered_buffers(1234);
         let x = al.new_buffer(4096).unwrap();
@@ -2347,20 +2381,19 @@ mod tests {
         drop(x);
         drop(y);
 
-        // memory is back, able to allocate again
         let x = al.new_buffer(4096).unwrap();
         match x.uring_buffer_id() {
             Some(x) => assert_eq!(x, 1234),
             None => unreachable!("Expected uring buffer"),
         }
         drop(x);
-        // Allocation for an object that is too big fails
         let x = al.new_buffer(40960).unwrap();
         if x.uring_buffer_id().is_some() {
             unreachable!("Expected non-uring buffer")
         }
     }
 
+    /// Enqueues three nops. The second is soft-linked to the third.
     #[test]
     fn sqe_link_chain() {
         let allocator = Rc::new(UringBufferAllocator::new(65536));
@@ -2369,7 +2402,6 @@ mod tests {
         let q = ring.submission_queue();
         let mut queue = q.borrow_mut();
 
-        // enqueue three nops. The second is soft-linked to the third
         for i in 0..3 {
             queue.submissions.push_back(UringDescriptor {
                 args: UringOpDescriptor::Nop,
@@ -2383,12 +2415,10 @@ mod tests {
             });
         }
 
-        // the first nop is unlinked, so we're only expecting one SQE
         ring.submit_one_event(&mut queue.submissions);
         assert_eq!(1, ring.submit_sqes().unwrap());
         assert_eq!(1, ring.consume_completion_queue(&mut 0));
 
-        // the following nops are linked, so we expect two submissions and completions
         ring.submit_one_event(&mut queue.submissions);
         assert_eq!(2, ring.submit_sqes().unwrap());
         assert_eq!(2, ring.consume_completion_queue(&mut 0));
@@ -2396,6 +2426,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "Unterminated SQE link chain")]
+    /// If the link chain points outside of the queue, we panic
     fn unterminated_sqe_link_chain() {
         let allocator = Rc::new(UringBufferAllocator::new(65536));
         let source_map = Rc::new(RefCell::new(SourceMap::default()));
@@ -2410,12 +2441,12 @@ mod tests {
             user_data: 0,
         });
 
-        // If the link chain points outside of the queue, we panic
         ring.submit_one_event(&mut queue.submissions);
     }
 
     #[test]
     #[should_panic(expected = "Unterminated SQE link chain or submission queue overflow")]
+    /// If the link chain is longer than the io_uring submission queue, we panic
     fn sqe_link_chain_overflow() {
         let allocator = Rc::new(UringBufferAllocator::new(65536));
         let source_map = Rc::new(RefCell::new(SourceMap::default()));
@@ -2439,7 +2470,6 @@ mod tests {
             user_data: 0,
         });
 
-        // If the link chain is longer than the io_uring submission queue, we panic
         ring.submit_one_event(&mut queue.submissions);
     }
 }

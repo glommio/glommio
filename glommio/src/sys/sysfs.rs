@@ -111,8 +111,16 @@ impl BlockDevice {
         }
     }
 
+    /// Creates a `BlockDevice` from a `(major, minor)` device id, reading the
+    /// kernel's sysfs data for it.
+    ///
+    /// Prefers `/sys/dev/block/major:minor`, then resolves it. If we can't find
+    /// the queue, it is treated as non-pollable and conservative defaults are
+    /// returned (but kept as "not memory"). `rotational` should exist for real
+    /// block queues, but we don't hard-fail. `io_poll` may not exist on older
+    /// kernels/drivers; treat missing as false. `write_cache` might be missing
+    /// on some virtual devices; default to write back.
     fn new(dev_id: (usize, usize)) -> BlockDevice {
-        // Prefer /sys/dev/block/major:minor, then resolve it.
         let link = PathBuf::from(format!("/sys/dev/block/{}:{}", dev_id.0, dev_id.1));
 
         let dir = match link.canonicalize() {
@@ -121,12 +129,9 @@ impl BlockDevice {
             Err(e) => panic!("Unexpected error canonicalizing {}: {e:?}", link.display()),
         };
 
-        // Find the correct queue directory (partition-safe).
         let queue = match find_queue_dir(dir.clone()) {
             Some(q) => q,
             None => {
-                // If we can’t find queue, treat it as non-pollable and return conservative defaults.
-                // (But keep it as "not memory".)
                 return BlockDevice {
                     memory_device: false,
                     rotational: true,
@@ -143,10 +148,8 @@ impl BlockDevice {
             }
         };
 
-        // Rotational should exist for real block queues, but don’t hard-fail.
         let rotational = read_int_opt(&queue.join("rotational")).unwrap_or(1) != 0;
 
-        // io_poll may not exist on older kernels/drivers; treat missing as false.
         let io_poll = read_int_opt(&queue.join("io_poll")).unwrap_or(0) != 0;
 
         let minimum_io_size = read_int_opt(&queue.join("minimum_io_size")).unwrap_or(512) as usize;
@@ -161,7 +164,6 @@ impl BlockDevice {
         let max_segment_size = read_int_opt(&queue.join("max_segment_size"))
             .unwrap_or((u32::MAX - 1) as isize) as usize;
 
-        // write_cache might be missing on some virtual devices; default to write back.
         let cache = read_to_string(queue.join("write_cache"))
             .ok()
             .and_then(|s| s.parse::<StorageCache>().ok())
@@ -298,16 +300,16 @@ impl ListIterator {
             .map_err(|_| self.err_invalid())
     }
 
+    /// Leaves a list terminating `'\n'` for syntax verification. The white
+    /// spaces that are skipped are defined in:
+    /// <https://github.com/torvalds/linux/blob/d93a0d43e3d0ba9e19387be4dae4a8d5b175a8d7/include/linux/ctype.h#L17-L33>
+    /// <https://github.com/torvalds/linux/blob/d93a0d43e3d0ba9e19387be4dae4a8d5b175a8d7/lib/ctype.c#L12-L36>
     fn skip_delim(&mut self) {
         fn is_space(c: char) -> bool {
-            // White spaces are defined in:
-            // https://github.com/torvalds/linux/blob/d93a0d43e3d0ba9e19387be4dae4a8d5b175a8d7/include/linux/ctype.h#L17-L33
-            // https://github.com/torvalds/linux/blob/d93a0d43e3d0ba9e19387be4dae4a8d5b175a8d7/lib/ctype.c#L12-L36
             let c = c as u8;
             (9..=13).contains(&c) || c == 32 || c == 160
         }
 
-        // leave a list terminating '\n' for syntax verification
         let idx_max = if self.idx < self.list_str.len() {
             self.list_str.len() - 1
         } else {
@@ -385,8 +387,8 @@ impl ListIterator {
         io::Error::new(io::ErrorKind::InvalidData, msg)
     }
 
-    // Returns the first error if any elements were errors, otherwise returns the
-    // collection of unwrapped elements
+    /// Returns the first error if any elements were errors, otherwise returns the
+    /// collection of unwrapped elements
     #[cfg(test)]
     fn collect_ok<C>(self) -> io::Result<C>
     where
@@ -481,6 +483,8 @@ impl RangeIter<Unchecked> {
 }
 
 impl RangeIter<Checked> {
+    /// At the point of the group-stride check below:
+    /// `0 < self.used_size <= self.group_size`
     fn next(&mut self) -> Option<usize> {
         if self.used_size == 0 {
             return None;
@@ -491,7 +495,6 @@ impl RangeIter<Checked> {
             None => return self.ret(self.beg),
         };
 
-        // at this point: 0 < self.used_size <= self.group_size
         if (last - self.beg) % self.group_size < self.used_size - 1 {
             self.ret(last.checked_add(1)?)
         } else {
@@ -553,6 +556,9 @@ pub(super) mod test_helpers {
             })
         }
 
+        /// Pops the next set bit. The subtraction below cannot underflow:
+        /// `self.n_bits_on_deck` == 0 implies `self.bits_on_deck` == 0, which
+        /// would take the branch above
         fn next(&mut self) -> Option<usize> {
             loop {
                 match self.bits_on_deck {
@@ -561,8 +567,6 @@ pub(super) mod test_helpers {
                     }
                     Some(ref mut m) => {
                         let is_set = (*m & 1) != 0;
-                        // `self.n_bits_on_deck` == 0 implies `self.bits_on_deck` == 0, which
-                        // would take the branch above, so this cannot underflow
                         self.n_bits_on_deck -= 1;
                         self.bit_counter += 1;
                         *m >>= 1;
@@ -574,8 +578,11 @@ pub(super) mod test_helpers {
             }
         }
 
+        /// Puts the next hexadecimal run on deck. Counts unused bits (these are
+        /// all equal to 0). Each hexadecimal char represents 4 bits and we only
+        /// have space for 64 bits. `sub_str` should only contain hexadecimal
+        /// values at this point, and `sub_str` could represent less than 64 bits
         fn set_on_deck(&mut self) -> Option<u64> {
-            // Count unused bits (these are all equal to 0)
             self.bit_counter += self.n_bits_on_deck;
 
             self.s_end = 1 + self
@@ -588,15 +595,12 @@ pub(super) mod test_helpers {
                 .rfind(|c: char| !c.is_ascii_hexdigit())
                 .map_or(0, |ii| ii + 1);
 
-            // Each hexadecimal char represents 4 bits and we only have space for 64 bits
             if self.s_end - self.s_beg > 16 {
                 self.s_beg = self.s_end - 16;
             }
 
             let sub_str = self.hex_str.get(self.s_beg..self.s_end)?;
-            // `sub_str` should only contain hexadecimal values at this point
             self.bits_on_deck = Some(u64::from_str_radix(sub_str, 16).expect("not a hex value"));
-            // `sub_str` could represent less than 64 bits
             self.n_bits_on_deck = 4 * sub_str.len();
             self.bits_on_deck
         }

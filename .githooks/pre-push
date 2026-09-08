@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-BASELINE=978
+BASELINE=723
 NIGHTLY=nightly-2026-06-11
 ALLOW="-A non_modified_buffer -A non_upper_case_generic -A non_idiomatic_import -A over_qualified_call -A tracing_canonical_instrumentation -A manual_redact_impl -A derive_suggestions -A non_canonical_item_order"
 

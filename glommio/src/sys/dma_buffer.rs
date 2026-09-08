@@ -3,10 +3,10 @@
 //!
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
-// Buffers that are friendly to be used with O_DIRECT files.
-// For the time being they are really only properly aligned,
-// but in the near future they can be coming from memory-areas
-// that are pre-registered for I/O uring.
+//! Buffers that are friendly to be used with O_DIRECT files.
+//! For the time being they are really only properly aligned,
+//! but in the near future they can be coming from memory-areas
+//! that are pre-registered for I/O uring.
 
 use std::ptr;
 
@@ -89,7 +89,7 @@ impl BufferStorage {
 /// suitable for io_uring's Direct I/O.
 pub struct DmaBuffer {
     storage: BufferStorage,
-    // Invariant: trim + size are at most one byte past the original allocation.
+    /// Invariant: `trim` + `size` are at most one byte past the original allocation.
     trim: usize,
     size: usize,
 }

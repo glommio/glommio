@@ -1,4 +1,4 @@
-// code imported from https://github.com/jeehoonkang/membarrier-rs (seems unmaintained)
+//! Code imported from <https://github.com/jeehoonkang/membarrier-rs> (seems unmaintained)
 #[allow(unused_macros)]
 macro_rules! fatal_assert {
     ($cond:expr) => {
@@ -68,9 +68,11 @@ mod syscall {
     }
 
     /// Returns `true` if the `sys_membarrier` call is available.
+    ///
+    /// Queries which membarrier commands are supported; checks if private
+    /// expedited membarrier is supported, then registers the current process
+    /// as a user of private expedited membarrier.
     pub fn is_supported() -> bool {
-        // Queries which membarrier commands are supported. Checks if private expedited
-        // membarrier is supported.
         let ret = sys_membarrier(membarrier_cmd::MEMBARRIER_CMD_QUERY);
         if ret < 0
             || ret & membarrier_cmd::MEMBARRIER_CMD_PRIVATE_EXPEDITED as libc::c_long == 0
@@ -79,7 +81,6 @@ mod syscall {
             return false;
         }
 
-        // Registers the current process as a user of private expedited membarrier.
         if sys_membarrier(membarrier_cmd::MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) < 0 {
             return false;
         }
@@ -109,32 +110,28 @@ mod mprotect {
         /// Issues a process-wide barrier by changing access protections of a
         /// single mmap-ed page. This method is not as fast as the
         /// `sys_membarrier()` call, but works very similarly.
+        ///
+        /// The page is ensured to be dirty before we change the protection so
+        /// that we prevent the OS from skipping the global TLB flush. Changing
+        /// a page protection from read + write to none causes the OS to issue
+        /// an interrupt to flush TLBs on all processors. This also results in
+        /// flushing the processor buffers.
         #[inline]
         fn barrier(&self) {
             let page = self.page as *mut libc::c_void;
 
             unsafe {
-                // Lock the mutex.
                 fatal_assert!(libc::pthread_mutex_lock(self.lock.get()) == 0);
 
-                // Set the page access protections to read + write.
                 fatal_assert!(
                     libc::mprotect(page, self.page_size, libc::PROT_READ | libc::PROT_WRITE,) == 0
                 );
 
-                // Ensure that the page is dirty before we change the protection so that we
-                // prevent the OS from skipping the global TLB flush.
                 let atomic_usize = &*(page as *const atomic::AtomicUsize);
                 atomic_usize.fetch_add(1, atomic::Ordering::SeqCst);
 
-                // Set the page access protections to none.
-                //
-                // Changing a page protection from read + write to none causes the OS to issue
-                // an interrupt to flush TLBs on all processors. This also results in flushing
-                // the processor buffers.
                 fatal_assert!(libc::mprotect(page, self.page_size, libc::PROT_NONE) == 0);
 
-                // Unlock the mutex.
                 fatal_assert!(libc::pthread_mutex_unlock(self.lock.get()) == 0);
             }
         }
@@ -143,14 +140,17 @@ mod mprotect {
     lazy_static! {
         /// An alternative solution to `sys_membarrier` that works on older Linux kernels and
         /// x86/x86-64 systems.
+        ///
+        /// The page is locked to ensure that it stays in memory during the two
+        /// `mprotect` calls in `Barrier::barrier()`. If the page was unmapped
+        /// between those calls, they would not have the expected effect of
+        /// generating IPI.
         static ref BARRIER: Barrier = {
             unsafe {
-                // Find out the page size on the current system.
                 let page_size = libc::sysconf(libc::_SC_PAGESIZE);
                 fatal_assert!(page_size > 0);
                 let page_size = page_size as libc::size_t;
 
-                // Create a dummy page.
                 let page = libc::mmap(
                     ptr::null_mut(),
                     page_size,
@@ -162,12 +162,8 @@ mod mprotect {
                 fatal_assert!(page != libc::MAP_FAILED);
                 fatal_assert!((page as libc::size_t).is_multiple_of(page_size));
 
-                // Locking the page ensures that it stays in memory during the two mprotect
-                // calls in `Barrier::barrier()`. If the page was unmapped between those calls,
-                // they would not have the expected effect of generating IPI.
                 libc::mlock(page, page_size as libc::size_t);
 
-                // Initialize the mutex.
                 let lock = UnsafeCell::new(libc::PTHREAD_MUTEX_INITIALIZER);
                 let mut attr = mem::MaybeUninit::<libc::pthread_mutexattr_t>::uninit();
                 fatal_assert!(libc::pthread_mutexattr_init(attr.as_mut_ptr()) == 0);

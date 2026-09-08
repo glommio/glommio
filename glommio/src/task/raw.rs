@@ -29,7 +29,7 @@ use crate::{
 
 /// The vtable for a task.
 pub(crate) struct TaskVTable {
-    /// Schedules the task.
+    /// Schedules a runnable, consuming its counted reference.
     pub(crate) schedule: unsafe fn(*const ()),
 
     /// Drops the future inside the task.
@@ -132,10 +132,11 @@ where
                 notifier: sys::get_sleep_notifier_for(executor_id).unwrap(),
                 state: SCHEDULED | HANDLE,
                 latency_matters,
-                references: AtomicRefCount::new(0),
+                // Count the initial runnable before publishing the allocation.
+                references: AtomicRefCount::new(1),
                 awaiter: None,
                 vtable: &TaskVTable {
-                    schedule: Self::schedule,
+                    schedule: Self::schedule_owned,
                     drop_future: Self::drop_future,
                     get_output: Self::get_output,
                     drop_task: Self::drop_task,
@@ -360,21 +361,34 @@ where
         });
     }
 
-    /// Schedules a task for running.
-    ///
-    /// This function doesn't modify the state of the task. It only passes the
-    /// task reference to its schedule function.
+    /// Creates and schedules a new runnable for a wake or cleanup request.
     unsafe fn schedule(ptr: *const ()) {
+        Self::schedule_with_reference(ptr, false);
+    }
+
+    /// Transfers an existing counted runnable to its scheduling callback.
+    unsafe fn schedule_owned(ptr: *const ()) {
+        Self::schedule_with_reference(ptr, true);
+    }
+
+    #[inline]
+    unsafe fn schedule_with_reference(ptr: *const (), owned: bool) {
         dbg_context!(ptr, "schedule", {
             let raw = Self::from_ptr(ptr);
-            Self::increment_references(&*(raw.header as *mut Header));
+            let needs_guard = mem::size_of::<S>() > 0;
+            let additional = RefCount::from(!owned) + RefCount::from(needs_guard);
+            if additional != 0 {
+                // Acquire the new runnable and callback guard together.
+                let refs = (*raw.header)
+                    .references
+                    .fetch_add(additional, Ordering::Relaxed);
+                assert!(refs <= RefCount::MAX - additional, "Waker invariant broken");
+            }
 
-            // Calling of schedule functions itself does not increment references,
-            // if the schedule function has captured variables, increment references
-            // so if task being dropped inside schedule function , function itself
-            // will keep valid data till the end of execution.
-            let guard = if mem::size_of::<S>() > 0 {
-                Some(Waker::from_raw(Self::clone_waker(ptr)))
+            // Captures must outlive a callback that synchronously runs or drops
+            // the runnable. Its guard reference was acquired above.
+            let guard = if needs_guard {
+                Some(Waker::from_raw(RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE)))
             } else {
                 None
             };
@@ -479,8 +493,6 @@ where
         //state could be updated after the coll to the poll
         state = (*raw.header).state;
 
-        let mut ret = false;
-
         match poll {
             Poll::Ready(out) => {
                 // Replace the future with its output.
@@ -538,14 +550,16 @@ where
                 } else if state & SCHEDULED != 0 {
                     // The thread that woke the task up didn't reschedule it because
                     // it was running so now it's our responsibility to do so.
-                    Self::schedule(ptr);
-                    ret = true;
+                    // Transfer our runnable instead of creating a new reference
+                    // and releasing this one. The callback may free the task.
+                    Self::schedule_owned(ptr);
+                    return true;
                 }
             }
         }
         Self::drop_task(ptr);
 
-        return ret;
+        return false;
 
         /// A guard that closes the task if polling its future panics.
         struct Guard<F, R, S>(RawTask<F, R, S>)

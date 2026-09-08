@@ -13,7 +13,11 @@
 
 set -euo pipefail
 
-BASELINE=492
+BASELINE=224
+# 224 = the 166 left after the executor/task/timer PR, plus 58 new plain comments
+# upstream added since (48 in the async OnceCell's sync/once_cell.rs, 9 in the new
+# glommio-macros crate, 1 in sys/mod.rs); those fall to the later PRs in the
+# series.
 NIGHTLY=nightly-2026-06-11
 ALLOW="-A non_modified_buffer -A non_upper_case_generic -A non_idiomatic_import -A over_qualified_call -A tracing_canonical_instrumentation -A manual_redact_impl -A derive_suggestions -A non_canonical_item_order"
 

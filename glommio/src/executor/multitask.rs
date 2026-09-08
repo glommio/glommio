@@ -155,8 +155,6 @@ impl Scheduler {
         let owner_id = self.owner_id;
         let schedule = move |runnable: Runnable| self.schedule(runnable);
 
-        // Create a task, push it into the queue by scheduling it, and return its `Task`
-        // handle.
         task_impl::spawn_local(
             owner_id,
             task_queue_index,

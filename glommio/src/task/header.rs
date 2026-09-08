@@ -81,14 +81,13 @@ impl Header {
     /// Notifies the awaiter blocked on this task.
     ///
     /// If the awaiter is the same as the current waker, it will not be
-    /// notified.
+    /// notified. A safeguard against panics is in place because waking can
+    /// panic.
     #[inline]
     pub(crate) fn notify(awaiter: &Cell<Option<Waker>>, current: Option<&Waker>) {
-        // Take the waker out.
         let waker = awaiter.take();
 
         if let Some(w) = waker {
-            // We need a safeguard against panics because waking can panic.
             abort_on_panic(|| match current {
                 None => w.wake(),
                 Some(c) if !w.will_wake(c) => w.wake(),
@@ -100,10 +99,10 @@ impl Header {
     /// Registers a new awaiter blocked on this task.
     ///
     /// This method is called when `JoinHandle` is polled and the task has not
-    /// completed.
+    /// completed. A mutable borrow is never held across a user-provided waker
+    /// callback.
     #[inline]
     pub(crate) fn register(awaiter: &Cell<Option<Waker>>, waker: &Waker) {
-        // Do not hold a mutable borrow across a user-provided waker callback.
         abort_on_panic(|| {
             let waker = waker.clone();
             let previous = awaiter.replace(Some(waker));

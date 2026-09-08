@@ -19,8 +19,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUNDS: usize = 16;
 const WORKERS: usize = 4;
 
+/// Joins all workers even if one panicked, before inspecting any task state.
 fn join_workers(workers: Vec<ThreadHandle<()>>) {
-    // Join all workers even if one panicked, before inspecting any task state.
     let outcomes: Vec<_> = workers.into_iter().map(ThreadHandle::join).collect();
     for outcome in outcomes {
         outcome.expect("foreign waker worker panicked");
@@ -69,8 +69,6 @@ fn ordered_foreign_wakes<const N: usize>(shutdown_first: bool) {
     let freed_before_release = allocation.deallocations();
     start_tx.send(()).expect("foreign waker worker exited");
     join_workers(vec![worker]);
-    // In the other ordering, all notifications are queued before shutdown.
-    // There is deliberately no second run() to drain them.
     drop(executor);
 
     assert_eq!(freed_before_release, 0, "live waker lost its allocation");
@@ -170,12 +168,8 @@ fn race_completed_task_shutdown<const N: usize>() {
     for round in 0..ROUNDS {
         let executor = executor();
         let (waker, allocation, future_drop) = completed_waker::<N>(&executor);
-        // Drop-only rounds also race final references without queued wakes
-        // keeping the task alive.
         let (start, workers) = waiting_workers(round % 2 == 0);
 
-        // The start handshakes allow operations to race shutdown. They do not
-        // force any particular interleaving inside the runtime.
         start.release(&waker);
         drop(waker);
         drop(executor);
@@ -205,6 +199,9 @@ struct CompletingFuture<const N: usize> {
 impl<const N: usize> Future for CompletingFuture<N> {
     type Output = AllocationProbe;
 
+    /// Once the handshake releases the waker, foreign operations may overlap
+    /// completion, future destruction, and run()'s release of the root
+    /// task's join handle.
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         this.polls.fetch_add(1, Ordering::SeqCst);
@@ -213,8 +210,6 @@ impl<const N: usize> Future for CompletingFuture<N> {
             .take()
             .expect("completed task was polled again")
             .release(cx.waker());
-        // Foreign operations may now overlap completion, future destruction,
-        // and run()'s release of the root task's join handle.
         Poll::Ready(allocation)
     }
 }
@@ -238,7 +233,6 @@ fn race_completion_and_handle_release<const N: usize>() {
         };
         let allocation = executor.run(future);
         join_workers(workers);
-        // No further run() may be necessary to reclaim a completed task.
         drop(executor);
         assert_eq!(polls.load(Ordering::SeqCst), 1, "completed task repolled");
         observations.push((allocation, future_drop));

@@ -1,8 +1,8 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
-// This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
+//! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
+//!
 //! Task lifecycle tests, which run under the ordinary test runner and also
 //! under Miri.
 //!
@@ -74,14 +74,15 @@ mod test {
 
     /// A waker that does nothing, for polling a `JoinHandle` whose task has
     /// already been run to completion.
+    ///
+    /// Every function in the vtable is a no-op and ignores its data pointer,
+    /// so the null pointer handed to `Waker::from_raw` is never dereferenced.
     fn noop_waker() -> Waker {
         fn clone(_: *const ()) -> RawWaker {
             RawWaker::new(std::ptr::null(), &VTABLE)
         }
         fn noop(_: *const ()) {}
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        // SAFETY: every function in the vtable is a no-op and ignores its data
-        // pointer, so a null pointer is never dereferenced.
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
     }
 
@@ -194,27 +195,27 @@ mod test {
     }
 
     #[test]
+    /// A runnable reaches a droppable place by being scheduled; dropping it
+    /// there instead of running it cancels the task and drops its future.
+    /// That is what the executor does when the task queue has gone away.
     fn dropping_the_runnable_cancels() {
         let _owned = own_tasks();
         let sink: Collected = Default::default();
         let (runnable, mut handle) = spawn_capturing(async { 7u32 }, sink.clone());
 
-        // A runnable reaches a droppable place by being scheduled; dropping it
-        // there instead of running it cancels the task and drops its future.
-        // That is what the executor does when the task queue has gone away.
         runnable.schedule();
         drop(sink.borrow_mut().pop().expect("scheduled"));
         assert_eq!(poll_once(&mut handle), Poll::Ready(None));
     }
 
     #[test]
+    /// Detaching: the task must still be safe to run and must tear itself
+    /// down afterwards, with no handle left to collect the output.
     fn dropping_the_handle_leaves_the_task_runnable() {
         let _owned = own_tasks();
         let sink: Collected = Default::default();
         let (runnable, handle) = spawn_capturing(async { 1u32 }, sink.clone());
 
-        // Detaching: the task must still be safe to run and must tear itself
-        // down afterwards, with no handle left to collect the output.
         drop(handle);
         runnable.run();
         assert!(sink.borrow().is_empty());
@@ -232,14 +233,14 @@ mod test {
     }
 
     #[test]
+    /// `schedule` takes a reference, passes it to the schedule function, and
+    /// relies on a guard to keep the closure's captured state alive if the
+    /// task is freed during the call.
     fn scheduling_hands_the_runnable_to_the_schedule_function() {
         let _owned = own_tasks();
         let sink: Collected = Default::default();
         let (runnable, mut handle) = spawn_capturing(async { 9u32 }, sink.clone());
 
-        // `schedule` takes a reference, passes it to the schedule function, and
-        // relies on a guard to keep the closure's captured state alive if the
-        // task is freed during the call.
         runnable.schedule();
         assert_eq!(sink.borrow().len(), 1);
 
@@ -249,6 +250,9 @@ mod test {
     }
 
     #[test]
+    /// The first run leaves the task pending. Waking from inside the poll
+    /// marks it scheduled, and `run` hands it back through the schedule
+    /// function on the way out.
     fn a_task_that_yields_is_rescheduled_and_completes() {
         struct YieldOnce(bool);
         impl Future for YieldOnce {
@@ -268,9 +272,6 @@ mod test {
         let sink: Collected = Default::default();
         let (runnable, mut handle) = spawn_capturing(YieldOnce(false), sink.clone());
 
-        // The first run leaves the task pending. Waking from inside the poll
-        // marks it scheduled, and `run` hands it back through the schedule
-        // function on the way out.
         runnable.run();
         let rescheduled = sink.borrow_mut().pop().expect("task should reschedule");
         rescheduled.run();
@@ -278,9 +279,9 @@ mod test {
     }
 
     #[test]
+    /// `spawn_local` boxes futures of 2KB or more, taking a different
+    /// allocation path that has to free correctly too.
     fn a_larger_future_is_boxed_and_still_torn_down() {
-        // `spawn_local` boxes futures of 2KB or more, taking a different
-        // allocation path that has to free correctly too.
         let _owned = own_tasks();
         let sink: Collected = Default::default();
         let buf = [7u8; 4096];
@@ -293,9 +294,9 @@ mod test {
     }
 
     #[test]
+    /// The task completes with an output nobody collects; closing the task
+    /// has to drop that output rather than leak it.
     fn output_is_dropped_when_the_handle_goes_away_first() {
-        // The task completes with an output nobody collects; closing the task
-        // has to drop that output rather than leak it.
         let dropped = Rc::new(RefCell::new(false));
         struct NotifyOnDrop(Rc<RefCell<bool>>);
         impl Drop for NotifyOnDrop {
@@ -316,9 +317,9 @@ mod test {
     }
 
     #[test]
+    /// Repetition, so a refcount that is off by one shows up as a leak or a
+    /// double free rather than passing by luck.
     fn many_tasks_allocate_and_free() {
-        // Repetition, so a refcount that is off by one shows up as a leak or a
-        // double free rather than passing by luck.
         let _owned = own_tasks();
         let sink: Collected = Default::default();
         for i in 0..64u32 {

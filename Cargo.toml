@@ -7,5 +7,5 @@ version = "0.10.0"
 
 [workspace.metadata.dylint]
   libraries = [
-  { git = "https://gitlab.com/oss47/rusty/diy_lints", rev = "17e6b6e18b01bd8c2d5e41124c2322cd7f10fb54" },
+  { git = "https://gitlab.com/oss47/rusty/diy_lints", rev = "9d967b5cbe907766fad0142e866397c365c8851a" },
 ]

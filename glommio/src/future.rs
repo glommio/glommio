@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! Combinators over futures.
 
 use crate::{timer::Timer, GlommioError, Result};
@@ -72,9 +72,6 @@ mod test {
                     .unwrap(),
                 42
             );
-
-            // Somebody else's `Result` comes back whole rather than flattened,
-            // so the caller still knows which of the two failures happened.
             let nested: Result<std::result::Result<u32, std::io::Error>> =
                 timeout(Duration::from_secs(10), async {
                     Err(std::io::Error::other("theirs"))

@@ -106,8 +106,8 @@ where
         Self::drop_waker,
     );
 
-    // Cleanup notifications must not be confused with genuine wakes: consuming
-    // the sole external waker of a detached task must still poll its future.
+    /// Cleanup notifications must not be confused with genuine wakes: consuming
+    /// the sole external waker of a detached task must still poll its future.
     const CLEANUP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
         Self::clone_cleanup_waker,
         Self::wake_cleanup,
@@ -128,12 +128,9 @@ where
         registry: &TaskRegistry,
         latency_matters: bool,
     ) -> NonNull<()> {
-        // Compute the layout of the task for allocation. Abort if the computation
-        // fails.
         let task_layout = abort_on_panic(Self::task_layout);
 
         unsafe {
-            // Allocate enough space for the entire task.
             let raw_task = match NonNull::new(alloc::alloc::alloc(task_layout.layout) as *mut ()) {
                 None => abort(),
                 Some(p) => p,
@@ -141,7 +138,6 @@ where
 
             let raw = Self::from_ptr(raw_task.as_ptr());
 
-            // Write the header as the first field of the task.
             (raw.header as *mut Header).write(Header {
                 executor_id,
                 task_queue_index,
@@ -168,10 +164,8 @@ where
                 debugger_count: TaskDebugger::counter(),
             });
 
-            // Write the schedule function as the third field of the task.
             (raw.schedule as *mut S).write(schedule);
 
-            // Write the future as the fourth field of the task.
             raw.future.write(future);
 
             registry.insert(raw.header as *mut Header);
@@ -196,11 +190,11 @@ where
         sys::get_sleep_notifier_for(self.my_id())
     }
 
+    /// The lifecycle tests take the owning-thread path without a
+    /// `LocalExecutor`, which they cannot build: it would pull in io_uring,
+    /// which needs a reactor and which Miri cannot execute either. The
+    /// override is unset outside those tests, so behaviour is unchanged.
     fn thread_id() -> Option<usize> {
-        // The lifecycle tests take the owning-thread path without a
-        // `LocalExecutor`, which they cannot build: it would pull in io_uring,
-        // which needs a reactor and which Miri cannot execute either. Unset
-        // outside those tests, so behaviour is unchanged.
         #[cfg(test)]
         if let Some(id) = crate::task::lifecycle_tests::test_executor_id::get() {
             return Some(id);
@@ -227,19 +221,15 @@ where
     /// Returns the memory layout for a task.
     #[inline]
     fn task_layout() -> TaskLayout {
-        // Compute the layouts for `Header`, `T`, `S`, `F`, and `R`.
         let layout_header = Layout::new::<Header>();
         let layout_s = Layout::new::<S>();
         let layout_f = Layout::new::<F>();
         let layout_r = Layout::new::<R>();
 
-        // Compute the layout for `union { F, R }`.
         let size_union = layout_f.size().max(layout_r.size());
         let align_union = layout_f.align().max(layout_r.align());
         let layout_union = unsafe { Layout::from_size_align_unchecked(size_union, align_union) };
 
-        // Compute the layout for `Header` followed by `T`, then `S`, and finally `union
-        // { F, R }`.
         let layout = layout_header;
         let (layout, offset_s) = extend(layout, layout_s);
         let (layout, offset_union) = extend(layout, layout_union);
@@ -280,8 +270,8 @@ where
         }
     }
 
+    /// Ownership is preserved even if a synchronous scheduling callback panics.
     unsafe fn wake(ptr: *const ()) {
-        // Preserve ownership even if a synchronous scheduling callback panics.
         let _waker = Waker::from_raw(RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE));
         Self::do_wake(ptr);
     }
@@ -306,6 +296,8 @@ where
         Self::release_references(ptr, 1);
     }
 
+    /// A concurrent final release may free the allocation immediately after
+    /// our decrement: the header is never accessed on the nonfinal path.
     #[inline]
     unsafe fn release_references(ptr: *const (), count: RefCount) {
         let header = ptr as *const Header;
@@ -317,8 +309,6 @@ where
             fence(Ordering::Acquire);
             Self::destroy(ptr);
         }
-        // A concurrent final release may free the allocation immediately after
-        // our decrement. Do not access the header on the nonfinal path.
     }
 
     /// Keep our reference while arranging owner cleanup of an abandoned future.
@@ -547,8 +537,8 @@ where
     /// Unlinks before invoking destructors, which can reenter executor shutdown.
     /// A running poll or schedule callback retains the registry reference until
     /// its guard can finish cleanup, even if the registry itself is destroyed.
+    /// The registry may own the only reference at shutdown entry.
     unsafe fn shutdown(ptr: *const ()) {
-        // The registry may own the only reference at shutdown entry.
         Self::increment_references(ptr as *const Header);
         TaskRegistry::remove(ptr as *mut Header);
         Self::close(ptr);
@@ -558,9 +548,9 @@ where
 
     /// Only the inert header is left when the count reaches zero. In particular,
     /// the !Send output was taken or destroyed before releasing the handle.
+    /// The acquire load or fence in the final release observes owner cleanup.
     unsafe fn destroy(ptr: *const ()) {
         let header = ptr as *mut Header;
-        // The acquire load or fence in the final release observes owner cleanup.
         debug_assert_eq!(
             (*header).state & (FUTURE_DROPPED | SCHEDULE_DROPPED | OUTPUT_PRESENT | HANDLE),
             FUTURE_DROPPED | SCHEDULE_DROPPED,
@@ -578,7 +568,9 @@ where
     }
 
     /// Polls once while holding the runnable reference, transferring it when a
-    /// wake received during polling schedules the task again.
+    /// wake received during polling schedules the task again. After the
+    /// transfer the schedule callback owns the runnable, whether it runs,
+    /// drops, or panics synchronously.
     unsafe fn run(ptr: *const ()) -> bool {
         let raw = Self::from_ptr(ptr);
         let header = raw.header as *mut Header;
@@ -611,8 +603,6 @@ where
                 } else {
                     (*header).state &= !RUNNING;
                     if (*header).state & SCHEDULED != 0 {
-                        // The callback owns the runnable from here, including
-                        // if it runs, drops, or panics synchronously.
                         mem::forget(guard);
                         Self::schedule_owned(ptr);
                         return true;

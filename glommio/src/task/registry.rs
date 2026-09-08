@@ -1,8 +1,8 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
-// This product includes software developed at Datadog (https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
+//! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
+//!
 //! Tracks tasks whose thread-local resources still belong to an executor.
 
 use std::{cell::Cell, ptr, rc::Rc};
@@ -52,11 +52,12 @@ impl TaskRegistry {
     ///
     /// The task and registry must remain alive until the task is removed. All
     /// registry operations must happen on the owning thread.
+    ///
+    /// The registry lives in an `Rc` and tasks stay in their original
+    /// allocation, so both kinds of link target remain stable until unlink.
     pub(crate) unsafe fn insert(&self, task: *mut Header) {
         debug_assert!((*task).prev_link.is_null());
         let head = self.head.get();
-        // The registry lives in an Rc and tasks stay in their original
-        // allocation, so both kinds of link target remain stable until unlink.
         (*task).prev_link = self.head.as_ptr();
         (*task).next = head;
         if !head.is_null() {

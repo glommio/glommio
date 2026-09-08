@@ -265,6 +265,7 @@ impl<T> fmt::Display for GlommioError<T> {
                 ),
                 ResourceType::RwLock => write!(f, "RwLock is closed"),
                 ResourceType::Channel(_) => write!(f, "Channel is closed"),
+                #[allow(no_comments_allowed)]
                 // TODO: look at what this format string should be as per bug report..
                 ResourceType::File(msg) => write!(f, "File is closed ({msg})"),
                 ResourceType::Gate => write!(f, "Gate is closed"),

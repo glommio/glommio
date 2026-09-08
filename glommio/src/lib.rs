@@ -269,6 +269,7 @@
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 #![cfg_attr(doc, deny(rustdoc::broken_intra_doc_links))]
 #![cfg_attr(all(nightly, feature = "native-tls"), feature(thread_local))]
+#![allow(unknown_lints)]
 
 #[macro_use]
 extern crate nix;
@@ -278,11 +279,11 @@ extern crate lazy_static;
 #[macro_use(defer)]
 extern crate scopeguard;
 
-// `#[glommio::test]` expands to `::glommio::…`, which does not resolve inside
-// the crate that defines it. Aliasing the crate to its own name makes the one
-// expansion work everywhere, rather than the macro having to guess where it is
-// being used: nothing in the environment distinguishes a doc test from the
-// library, both report `glommio` for `CARGO_PKG_NAME` and `CARGO_CRATE_NAME`.
+/// `#[glommio::test]` expands to `::glommio::…`, which does not resolve inside
+/// the crate that defines it. Aliasing the crate to its own name makes the one
+/// expansion work everywhere, rather than the macro having to guess where it is
+/// being used: nothing in the environment distinguishes a doc test from the
+/// library, both report `glommio` for `CARGO_PKG_NAME` and `CARGO_CRATE_NAME`.
 extern crate self as glommio;
 
 /// Call [`Waker::wake()`] and log to `error` if panicked.
@@ -593,7 +594,6 @@ impl IoRequirements {
 /// Stores information about IO performed in a specific ring
 #[derive(Clone)]
 pub struct RingIoStats {
-    // Counters
     pub(crate) files_opened: u64,
     pub(crate) files_closed: u64,
     pub(crate) file_reads: u64,
@@ -607,7 +607,6 @@ pub struct RingIoStats {
     pub(crate) file_buffered_writes: u64,
     pub(crate) file_buffered_bytes_written: u64,
 
-    // Distributions
     pub(crate) pre_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch,
     pub(crate) io_latency_us: sketches_ddsketch::DDSketch,
     pub(crate) post_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch,
@@ -829,13 +828,13 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Glommio currently only supports NVMe-backed volumes formatted with
+    /// XFS or EXT4. We therefore let the user decide what directory glommio
+    /// should use to host the unit tests in. For more information regarding
+    /// this limitation, see the README.
     pub(crate) fn make_test_directories(test_name: &str) -> std::vec::Vec<TestDirectory> {
         let mut vec = Vec::new();
 
-        // Glommio currently only supports NVMe-backed volumes formatted with XFS or
-        // EXT4. We therefore let the user decide what directory glommio should
-        // use to host the unit tests in. For more information regarding this
-        // limitation, see the README
         match std::env::var("GLOMMIO_TEST_POLLIO_ROOTDIR") {
             Err(_) => {
                 eprintln!(
@@ -894,6 +893,7 @@ pub(crate) mod test_utils {
     // means. Callers outside the crate never see this: they get the macro.
     #[::core::prelude::v1::test]
     #[allow(unused_must_use)]
+    #[allow(no_comments_allowed)]
     fn test_tracing_init() {
         tracing_subscriber::fmt::fmt()
             .with_env_filter(EnvFilter::from_env("GLOMMIO_TRACE"))

@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience.
-
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience.
+//!
 //! Lifetimes when runnable ownership moves through scheduling callbacks.
 
 use std::{
@@ -242,7 +242,6 @@ fn captured_callback<const N: usize>(callback: Callback) {
             ex.task_registry(),
             future,
             move |task| {
-                // Keep an independent observer alive while consuming the last runnable.
                 let callback_drops = callback_drops.clone();
                 match callback {
                     Callback::Run | Callback::Reschedule | Callback::PollPanic => {

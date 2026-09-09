@@ -9,7 +9,7 @@ use core::{fmt, future::Future, marker::PhantomData, mem, ptr::NonNull};
 use crate::task::debugging::TaskDebugger;
 use crate::{
     dbg_context,
-    task::{header::Header, raw::RawTask, registry::TaskRegistry, JoinHandle},
+    task::{header::Header, raw::RawTask, registry::TaskRegistry, state::CLOSED, JoinHandle},
 };
 
 /// Creates a new local task.
@@ -93,16 +93,24 @@ pub struct Task {
 }
 
 impl Task {
-    /// Returns the index of the task queue this task belongs to.
-    ///
-    /// Used by the schedule function to find its queue without capturing a
-    /// reference to it, which is what keeps that closure zero-sized. See
-    /// `Header::task_queue_index`.
+    /// Returns the queue index used when recovering the owning executor context.
     pub(crate) fn task_queue_index(&self) -> usize {
         let header = self.raw_task.as_ptr() as *const Header;
         // SAFETY: `raw_task` points at a live task allocation for as long as
         // this `Task` reference exists, and the header is its first field.
         unsafe { (*header).task_queue_index }
+    }
+
+    /// Whether this runnable only needs destruction rather than another poll.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        unsafe { (*(self.raw_task.as_ptr() as *const Header)).state & CLOSED != 0 }
+    }
+
+    /// Cancels a queued runnable without destroying its future inline.
+    pub(crate) fn cancel(&self) {
+        let ptr = self.raw_task.as_ptr();
+        let header = ptr as *const Header;
+        unsafe { ((*header).vtable.cancel)(ptr) };
     }
 
     /// Schedules the task.

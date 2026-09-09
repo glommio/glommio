@@ -39,7 +39,7 @@ use crate::{
     parking, reactor,
     sys::{self, blocking::BlockingThreadPool},
     task::{self, registry::TaskRegistry, waker_fn::dummy_waker},
-    GlommioError, IoRequirements, IoStats, Latency, Reactor, Shares,
+    GlommioError, IoRequirements, IoStats, Latency, Shares,
 };
 use ahash::AHashMap;
 use futures_lite::pin;
@@ -48,7 +48,7 @@ use log::warn;
 pub use placement::{CpuSet, Placement, PoolPlacement};
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BinaryHeap},
+    collections::{hash_map::Entry, BinaryHeap, VecDeque},
     fmt,
     future::Future,
     io,
@@ -64,10 +64,13 @@ use std::{
 };
 use tracing::trace;
 
+mod context;
 mod latch;
 mod multitask;
 mod placement;
 pub mod stall;
+
+pub(crate) use context::{ExecutorContext, WeakExecutorContext};
 
 pub(crate) const DEFAULT_EXECUTOR_NAME: &str = "unnamed";
 pub(crate) const DEFAULT_PREEMPT_TIMER: Duration = Duration::from_millis(100);
@@ -82,10 +85,10 @@ use crate::Result;
 
 #[cfg(all(nightly, feature = "native-tls"))]
 #[thread_local]
-static mut LOCAL_EX: *const LocalExecutor = std::ptr::null();
+static mut LOCAL_EX: *const ExecutorContext = std::ptr::null();
 
 #[cfg(any(not(nightly), not(feature = "native-tls")))]
-scoped_tls::scoped_thread_local!(static LOCAL_EX: LocalExecutor);
+scoped_tls::scoped_thread_local!(static LOCAL_EX: ExecutorContext);
 
 /// Returns a proxy struct to the [`LocalExecutor`]
 #[inline(always)]
@@ -156,7 +159,9 @@ impl TaskQueueHandle {
 
 #[derive(Debug)]
 pub(crate) struct TaskQueue {
-    pub(crate) ex: Rc<multitask::LocalExecutor>,
+    scheduler: Rc<multitask::Scheduler>,
+    /// Tasks retain scheduling metadata, while the queue owns runnable tasks.
+    runnables: VecDeque<multitask::Runnable>,
     active: bool,
     shares: Shares,
     vruntime: u64,
@@ -193,7 +198,7 @@ impl TaskQueue {
     /// The index this queue is registered under in the executor's queue map.
     ///
     /// Stored in each task's header so its schedule function can find the
-    /// queue without capturing a reference to it. See `schedule_runnable`.
+    /// queue without capturing a reference to it.
     pub(crate) fn index(&self) -> usize {
         self.stats.index.index()
     }
@@ -203,12 +208,15 @@ impl TaskQueue {
         name: S,
         shares: Shares,
         ioreq: IoRequirements,
+        owner_id: usize,
+        registry: &Rc<TaskRegistry>,
     ) -> Rc<RefCell<Self>>
     where
         S: Into<String>,
     {
         Rc::new(RefCell::new(TaskQueue {
-            ex: Rc::new(multitask::LocalExecutor::new()),
+            scheduler: Rc::new(multitask::Scheduler::new(owner_id, registry)),
+            runnables: VecDeque::new(),
             active: false,
             stats: TaskQueueStats::new(index, shares.reciprocal_shares()),
             shares,
@@ -225,7 +233,7 @@ impl TaskQueue {
     }
 
     fn get_task(&mut self) -> Option<multitask::Runnable> {
-        self.ex.get_task()
+        self.runnables.pop_front()
     }
 
     fn yielded(&self) -> bool {
@@ -246,7 +254,7 @@ impl TaskQueue {
         let delta_scaled = (self.stats.reciprocal_shares * (delta.as_nanos() as u64)) >> 12;
         self.stats.runtime += delta;
         self.stats.queue_selected += 1;
-        self.active = self.ex.is_active();
+        self.active = !self.runnables.is_empty();
 
         let vruntime = self.vruntime.checked_add(delta_scaled);
         if let Some(x) = vruntime {
@@ -1095,77 +1103,21 @@ impl<T> PoolThreadHandles<T> {
     }
 }
 
-/// Pushes a woken task back onto its task queue and activates that queue.
-///
-/// The task carries the index of its queue in its header rather than a
-/// reference to it, so this resolves the queue from the executor running on
-/// this thread. That is sound because every caller of a task's schedule
-/// function -- `do_wake`, `drop_waker` and `run` in `task::raw` -- first checks
-/// that the current thread owns the task, and routes to the notifier otherwise.
-///
-/// Keeping the queue out of the schedule closure is what lets that closure be
-/// zero-sized, which lets `RawTask::schedule` skip the waker clone/drop guard
-/// it would otherwise need. See `Header::task_queue_index`.
-///
-/// A missing queue means the queue was destroyed, or the executor is shutting
-/// down; in both cases the runnable is dropped, which cancels the task. This
-/// matches the previous behaviour, where the closure held a `Weak` to the queue
-/// and did nothing when it failed to upgrade.
-pub(crate) fn schedule_runnable(runnable: multitask::Runnable) {
-    let handle = TaskQueueHandle {
-        index: runnable.task_queue_index(),
-    };
-
+/// Borrows the installed context once for scheduling on the owning executor.
+pub(super) fn with_executor_context<T>(f: impl FnOnce(Option<&ExecutorContext>) -> T) -> T {
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     {
         if LOCAL_EX.is_set() {
-            LOCAL_EX.with(|local_ex| {
-                if let Some(tq) = local_ex.get_queue(&handle) {
-                    tq.borrow().ex.push_task(runnable);
-                    maybe_activate(tq);
-                }
-            });
-        }
-    }
-
-    #[cfg(all(nightly, feature = "native-tls"))]
-    {
-        // SAFETY: `LOCAL_EX` is a thread-local raw pointer to the executor
-        // running on this thread; it is null when none is running.
-        if let Some(local_ex) = unsafe { LOCAL_EX.as_ref() } {
-            if let Some(tq) = local_ex.get_queue(&handle) {
-                tq.borrow().ex.push_task(runnable);
-                maybe_activate(tq);
-            }
-        }
-    }
-}
-
-pub(crate) fn maybe_activate(tq: Rc<RefCell<TaskQueue>>) {
-    #[cfg(any(not(nightly), not(feature = "native-tls")))]
-    {
-        // A task that panics unwinds through this path while the executor is
-        // already tearing down, and by then the thread-local may be gone.
-        // Reaching for it unconditionally panics a second time, and a panic
-        // during a panic aborts the process. There is nothing to activate at
-        // that point anyway, so skipping is both safe and correct.
-        if LOCAL_EX.is_set() {
-            LOCAL_EX.with(|local_ex| {
-                let mut queues = local_ex.queues.borrow_mut();
-                queues.maybe_activate(tq);
-            });
+            LOCAL_EX.with(|context| f(Some(context)))
+        } else {
+            f(None)
         }
     }
 
     #[cfg(all(nightly, feature = "native-tls"))]
     unsafe {
-        // Same reasoning as above: null means no executor is installed on this
-        // thread, which happens while unwinding out of a panicked task.
-        if let Some(local_ex) = LOCAL_EX.as_ref() {
-            let mut queues = local_ex.queues.borrow_mut();
-            queues.maybe_activate(tq);
-        }
-    };
+        f(LOCAL_EX.as_ref())
+    }
 }
 
 pub struct LocalExecutorConfig {
@@ -1227,8 +1179,13 @@ enum TaskQueueRun {
 }
 
 impl LocalExecutor {
-    fn get_reactor(&self) -> Rc<Reactor> {
-        self.reactor.clone()
+    fn context(&self) -> ExecutorContext {
+        ExecutorContext {
+            queues: self.queues.clone(),
+            tasks: self.tasks.clone(),
+            id: self.id,
+            reactor: self.reactor.clone(),
+        }
     }
 
     fn init(&mut self) {
@@ -1240,6 +1197,8 @@ impl LocalExecutor {
                 "default",
                 Shares::Static(1000),
                 io_requirements,
+                self.id,
+                &self.tasks,
             ),
         );
     }
@@ -1265,21 +1224,33 @@ impl LocalExecutor {
             None => config.spin_before_park = None,
         }
         let p = parking::Parker::new();
-        let queues = ExecutorQueues::new(config.preempt_timer, config.spin_before_park);
+        let queues = Rc::new(RefCell::new(ExecutorQueues::new(
+            config.preempt_timer,
+            config.spin_before_park,
+        )));
         let id = notifier.id();
+        let reactor = Rc::new(reactor::Reactor::new(
+            notifier,
+            config.io_memory,
+            config.ring_depth,
+            config.record_io_latencies,
+            blocking_thread,
+        )?);
+        let tasks = Rc::new_cyclic(|tasks| {
+            TaskRegistry::new(WeakExecutorContext::new(
+                id,
+                &queues,
+                &reactor,
+                tasks.clone(),
+            ))
+        });
         trace!(id = id, "Creating executor");
         Ok(LocalExecutor {
-            queues: Rc::new(RefCell::new(queues)),
-            tasks: Rc::new(TaskRegistry::new()),
+            queues,
+            tasks,
             parker: p,
             id,
-            reactor: Rc::new(reactor::Reactor::new(
-                notifier,
-                config.io_memory,
-                config.ring_depth,
-                config.record_io_latencies,
-                blocking_thread,
-            )?),
+            reactor,
             stall_detector: RefCell::new(
                 config
                     .detect_stalls
@@ -1323,25 +1294,12 @@ impl LocalExecutor {
         self.id
     }
 
+    #[cfg(test)]
     fn create_task_queue<S>(&self, shares: Shares, latency: Latency, name: S) -> TaskQueueHandle
     where
         S: Into<String>,
     {
-        let index = {
-            let mut ex = self.queues.borrow_mut();
-            let index = ex.executor_index;
-            ex.executor_index += 1;
-            index
-        };
-
-        let io_requirements = IoRequirements::new(latency, index);
-        let tq = TaskQueue::new(TaskQueueHandle { index }, name, shares, io_requirements);
-
-        self.queues
-            .borrow_mut()
-            .available_executors
-            .insert(index, tq);
-        TaskQueueHandle { index }
+        self.context().create_task_queue(shares, latency, name)
     }
 
     /// Removes a task queue.
@@ -1349,6 +1307,13 @@ impl LocalExecutor {
     /// The task queue cannot be removed if there are still pending tasks.
     pub fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
         let mut queues = self.queues.borrow_mut();
+        if queues
+            .active_executing
+            .as_ref()
+            .is_some_and(|queue| queue.borrow().stats.index == handle)
+        {
+            return Err(GlommioError::queue_still_active(handle.index));
+        }
 
         let queue_entry = queues.available_executors.entry(handle.index);
         if let Entry::Occupied(entry) = queue_entry {
@@ -1363,43 +1328,8 @@ impl LocalExecutor {
         Err(GlommioError::queue_not_found(handle.index))
     }
 
-    fn get_queue(&self, handle: &TaskQueueHandle) -> Option<Rc<RefCell<TaskQueue>>> {
-        self.queues
-            .borrow()
-            .available_executors
-            .get(&handle.index)
-            .cloned()
-    }
-
-    fn current_task_queue(&self) -> TaskQueueHandle {
-        self.queues
-            .borrow()
-            .active_executing
-            .as_ref()
-            .unwrap()
-            .borrow()
-            .stats
-            .index
-    }
-
-    fn mark_me_for_yield(&self) {
-        let queues = self.queues.borrow();
-        let mut me = queues.active_executing.as_ref().unwrap().borrow_mut();
-        me.yielded = true;
-    }
-
     fn spawn_internal<T>(&self, future: impl Future<Output = T>) -> multitask::Task<T> {
-        let tq = self
-            .queues
-            .borrow()
-            .active_executing
-            .clone() // this clone is cheap because we clone an `Option<Rc<_>>`
-            .or_else(|| self.get_queue(&TaskQueueHandle { index: 0 }))
-            .unwrap();
-
-        let id = self.id;
-        let ex = tq.borrow().ex.clone();
-        ex.spawn_and_run(id, &self.tasks, tq, future)
+        self.context().spawn_internal(future)
     }
 
     /// Spawns a task directly onto this executor instance.
@@ -1436,14 +1366,7 @@ impl LocalExecutor {
     where
         F: Future<Output = T>,
     {
-        let tq = self
-            .get_queue(&handle)
-            .ok_or_else(|| GlommioError::queue_not_found(handle.index))?;
-        let ex = tq.borrow().ex.clone();
-        let id = self.id;
-
-        // can't run right away, because we need to cross into a different task queue
-        Ok(ex.spawn_and_schedule(id, &self.tasks, tq, future))
+        self.context().spawn_into(future, handle)
     }
 
     fn preempt_timer_duration(&self) -> Duration {
@@ -1659,26 +1582,11 @@ impl LocalExecutor {
             }
         };
 
-        #[cfg(any(not(nightly), not(feature = "native-tls")))]
-        {
-            assert!(
-                !LOCAL_EX.is_set(),
-                "There is already an LocalExecutor running on this thread"
-            );
-            LOCAL_EX.set(self, || run(self))
-        }
-
-        #[cfg(all(nightly, feature = "native-tls"))]
-        unsafe {
-            assert!(
-                LOCAL_EX.is_null(),
-                "There is already an LocalExecutor running on this thread"
-            );
-
-            defer!(LOCAL_EX = std::ptr::null());
-            LOCAL_EX = self as *const Self;
-            run(self)
-        }
+        assert!(
+            executor_id().is_none(),
+            "There is already an LocalExecutor running on this thread"
+        );
+        self.context().enter(|| run(self))
     }
 }
 
@@ -1689,33 +1597,9 @@ impl Drop for LocalExecutor {
                 .expect("executor's sleep notifier disappeared before shutdown")
                 .close_foreign_wakes();
             self.tasks.shutdown();
-
-            // Keep the owner context installed until queued runnable references
-            // have also been released. Never hold queue borrows across drops.
-            let executors: Vec<_> = self
-                .queues
-                .borrow()
-                .available_executors
-                .values()
-                .map(|queue| queue.borrow().ex.clone())
-                .collect();
-            for executor in executors {
-                while let Some(task) = executor.get_task() {
-                    drop(task);
-                }
-            }
         };
 
-        #[cfg(any(not(nightly), not(feature = "native-tls")))]
-        LOCAL_EX.set(self, shutdown);
-
-        #[cfg(all(nightly, feature = "native-tls"))]
-        unsafe {
-            let previous = LOCAL_EX;
-            defer!(LOCAL_EX = previous);
-            LOCAL_EX = self as *const Self;
-            shutdown();
-        }
+        self.context().with_cleanup(None, shutdown);
     }
 }
 

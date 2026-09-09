@@ -95,7 +95,7 @@ mod test {
     type Collected = Rc<RefCell<Vec<Task>>>;
 
     thread_local! {
-        static REGISTRY: TaskRegistry = TaskRegistry::new();
+        static REGISTRY: TaskRegistry = TaskRegistry::new(crate::executor::WeakExecutorContext::default());
     }
 
     struct OwnerGuard {

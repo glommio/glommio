@@ -9,18 +9,16 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 use crate::{
-    executor::TaskQueue,
+    executor::{with_executor_context, TaskQueue, TaskQueueHandle},
     task::{registry::TaskRegistry, task_impl, JoinHandle},
     Latency,
 };
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     future::Future,
-    marker::PhantomData,
     panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
-    rc::Rc,
+    rc::{Rc, Weak},
     task::{Context, Poll},
 };
 
@@ -90,70 +88,60 @@ impl<T> Future for Task<T> {
     }
 }
 
+/// Shared scheduling metadata outlives queue removal without retaining its owner.
 #[derive(Debug)]
-struct LocalQueue {
-    queue: RefCell<VecDeque<Runnable>>,
+pub(super) struct Scheduler {
+    owner: Weak<TaskRegistry>,
+    owner_id: usize,
 }
 
-impl LocalQueue {
-    fn new() -> Self {
-        LocalQueue {
-            queue: RefCell::new(VecDeque::new()),
+impl Scheduler {
+    #[inline]
+    fn schedule(&self, runnable: Runnable) {
+        with_executor_context(|context| match context {
+            Some(context) if context.id() == self.owner_id => {
+                match context.get_queue(&TaskQueueHandle {
+                    index: runnable.task_queue_index(),
+                }) {
+                    Some(queue) => context.schedule(queue, runnable),
+                    None => context.schedule_cleanup(runnable),
+                }
+            }
+            _ => self.schedule_inactive(runnable),
+        });
+    }
+
+    #[cold]
+    fn schedule_inactive(&self, runnable: Runnable) {
+        if let Some(context) = self.owner.upgrade().and_then(|owner| owner.context()) {
+            match context.get_queue(&TaskQueueHandle {
+                index: runnable.task_queue_index(),
+            }) {
+                Some(queue) if !runnable.is_cancelled() => context.schedule(queue, runnable),
+                queue => context.with_cleanup(queue, || drop(runnable)),
+            }
+        }
+    }
+}
+
+impl UnwindSafe for Scheduler {}
+
+impl RefUnwindSafe for Scheduler {}
+
+impl Scheduler {
+    /// Creates the scheduling state shared by a queue and its tasks.
+    pub(super) fn new(owner_id: usize, registry: &Rc<TaskRegistry>) -> Self {
+        Self {
+            owner: Rc::downgrade(registry),
+            owner_id,
         }
     }
 
-    pub(crate) fn push(&self, runnable: Runnable) {
-        self.queue.borrow_mut().push_back(runnable);
-    }
-
-    pub(crate) fn pop(&self) -> Option<Runnable> {
-        self.queue.borrow_mut().pop_front()
-    }
-}
-
-/// Compile-time proof that the schedule closure captures nothing.
-///
-/// `RawTask::schedule` only skips its waker clone/drop guard -- two atomic
-/// read-modify-writes on every wake -- when the schedule function is
-/// zero-sized. Capturing anything at all silently gives that back, costing
-/// roughly a third of a task switch with no test failing. Fail the build
-/// instead.
-fn assert_zero_sized<T>(_: &T) {
-    const {
-        assert!(
-            std::mem::size_of::<T>() == 0,
-            "the schedule closure must capture nothing: see Header::task_queue_index"
-        )
-    }
-}
-
-/// A single-threaded executor.
-#[derive(Debug)]
-pub(crate) struct LocalExecutor {
-    local_queue: LocalQueue,
-
-    /// Make sure the type is `!Send` and `!Sync`.
-    _marker: PhantomData<Rc<()>>,
-}
-
-impl UnwindSafe for LocalExecutor {}
-
-impl RefUnwindSafe for LocalExecutor {}
-
-impl LocalExecutor {
-    /// Creates a new single-threaded executor.
-    pub(crate) fn new() -> LocalExecutor {
-        LocalExecutor {
-            local_queue: LocalQueue::new(),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Spawns a thread-local future onto this executor.
+    /// Transfers the caller's scheduler reference into a new task.
     fn spawn<T>(
-        &self,
-        executor_id: usize,
-        registry: &TaskRegistry,
+        self: Rc<Self>,
+        owner_id: usize,
+        registry: &Rc<TaskRegistry>,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> (Runnable, JoinHandle<T>) {
@@ -165,22 +153,12 @@ impl LocalExecutor {
             };
             (latency_matters, tq.index())
         };
-
-        // The function that schedules a runnable task when it gets woken up.
-        //
-        // This closure captures nothing, so it is zero-sized. That matters:
-        // `RawTask::schedule` guards a non-zero-sized schedule function by
-        // cloning and dropping a waker around the call, which costs two atomic
-        // read-modify-writes on every wake. Capturing so much as a `Weak` to
-        // the task queue here would reintroduce them. The queue is instead
-        // found from the index in the task header -- see `schedule_runnable`.
-        let schedule = |runnable: Runnable| crate::executor::schedule_runnable(runnable);
-        assert_zero_sized(&schedule);
+        let schedule = move |runnable: Runnable| self.schedule(runnable);
 
         // Create a task, push it into the queue by scheduling it, and return its `Task`
         // handle.
         task_impl::spawn_local(
-            executor_id,
+            owner_id,
             task_queue_index,
             registry,
             future,
@@ -190,9 +168,9 @@ impl LocalExecutor {
     }
 
     pub(crate) fn spawn_and_run<T>(
-        &self,
+        self: Rc<Self>,
         executor_id: usize,
-        registry: &TaskRegistry,
+        registry: &Rc<TaskRegistry>,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
@@ -202,30 +180,14 @@ impl LocalExecutor {
     }
 
     pub(crate) fn spawn_and_schedule<T>(
-        &self,
+        self: Rc<Self>,
         executor_id: usize,
-        registry: &TaskRegistry,
+        registry: &Rc<TaskRegistry>,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
         let (runnable, handle) = self.spawn(executor_id, registry, tq, future);
         runnable.schedule();
         Task(Some(handle))
-    }
-
-    /// Pushes a woken task onto this queue's run list.
-    pub(crate) fn push_task(&self, runnable: Runnable) {
-        self.local_queue.push(runnable);
-    }
-
-    /// Gets one task from the queue, if one exists.
-    ///
-    /// Returns an option rapping the task.
-    pub(crate) fn get_task(&self) -> Option<Runnable> {
-        self.local_queue.pop()
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        !self.local_queue.queue.borrow().is_empty()
     }
 }

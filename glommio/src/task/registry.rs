@@ -7,19 +7,37 @@
 
 use std::{cell::Cell, ptr};
 
+use crate::executor::{ExecutorContext, WeakExecutorContext};
+
 use super::header::Header;
 
 /// An executor's intrusive list of tasks requiring owner-thread cleanup.
+/// The hot list head stays ahead of the cold cleanup context.
 #[derive(Debug)]
+#[repr(C)]
 pub(crate) struct TaskRegistry {
     head: Cell<*mut Header>,
+    context: WeakExecutorContext,
+    shutting_down: Cell<bool>,
 }
 
 impl TaskRegistry {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(context: WeakExecutorContext) -> Self {
         Self {
             head: Cell::new(ptr::null_mut()),
+            context,
+            shutting_down: Cell::new(false),
         }
+    }
+
+    /// Retains the resources needed while task cleanup can destroy its executor.
+    pub(crate) fn context(&self) -> Option<ExecutorContext> {
+        self.context.upgrade()
+    }
+
+    /// Cleanup contexts must also drain tasks spawned after reentrant shutdown.
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.get()
     }
 
     /// Registers a task protected by its counted executor reference.
@@ -54,6 +72,7 @@ impl TaskRegistry {
 
     /// Cancels and cleans each task while its executor is still available.
     pub(crate) fn shutdown(&self) {
+        self.shutting_down.set(true);
         loop {
             let task = self.head.get();
             if task.is_null() {

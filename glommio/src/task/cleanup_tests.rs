@@ -461,6 +461,67 @@ fn abandoned_future_destructor_can_spawn_io() {
     });
 }
 
+/// Shutdown destructors must be able to spawn tasks that submit I/O.
+#[test]
+fn shutdown_destructor_can_spawn_io() {
+    shutdown_destructor_io(false);
+}
+
+/// Shutdown still needs a usable queue when the default queue was removed.
+#[test]
+fn shutdown_destructor_can_spawn_io_without_default_queue() {
+    shutdown_destructor_io(true);
+}
+
+fn shutdown_destructor_io(remove_default_queue: bool) {
+    /// Records submission failures without unwinding through task destruction.
+    struct SpawnIoOnDrop(Rc<Cell<Option<bool>>>);
+
+    impl Drop for SpawnIoOnDrop {
+        fn drop(&mut self) {
+            let succeeded = catch_unwind(|| {
+                let handle = crate::spawn_local(async {
+                    let file = crate::io::BufferedFile::open("/dev/null")
+                        .await
+                        .expect("failed to open the cleanup test file");
+                    file.close()
+                        .await
+                        .expect("failed to close the cleanup test file");
+                })
+                .detach();
+                drop(handle);
+            })
+            .is_ok();
+            self.0.set(Some(succeeded));
+        }
+    }
+
+    let owner = executor();
+    let result = Rc::new(Cell::new(None));
+    let guard = SpawnIoOnDrop(result.clone());
+    let handle = owner
+        .spawn(async move {
+            pending::<()>().await;
+            drop(guard);
+        })
+        .detach();
+    let allocation = AllocationProbe::track_handle(&handle);
+    if remove_default_queue {
+        owner
+            .remove_task_queue(crate::TaskQueueHandle::default())
+            .expect("idle default queue could not be removed");
+    }
+    drop(owner);
+    drop(handle);
+
+    assert_eq!(
+        result.get(),
+        Some(true),
+        "shutdown cleanup lacked a task queue context",
+    );
+    allocation.assert_freed();
+}
+
 /// Thread-local executors can outlive the debugger's thread-local state.
 #[cfg(feature = "debugging")]
 #[test]
@@ -572,8 +633,8 @@ fn idle_handle_drop_preserves_executor_context() {
     let allocation = AllocationProbe::track_handle(&handle);
 
     drop(handle);
-    owner.run(async {});
 
+    assert_eq!(crate::executor::executor_id(), None);
     assert_eq!(
         observed.borrow().as_slice(),
         &[Some(owner.id())],
@@ -582,29 +643,175 @@ fn idle_handle_drop_preserves_executor_context() {
     allocation.assert_freed();
 }
 
-/// Cleanup can release the last executor reference while destroying its task.
+/// Synchronous cleanup must restore the executor and queue that it interrupted.
+#[test]
+fn idle_handle_cleanup_restores_other_executor_context() {
+    struct RecordContext(Rc<Cell<Option<(usize, crate::TaskQueueHandle)>>>);
+
+    impl Drop for RecordContext {
+        fn drop(&mut self) {
+            self.0.set(
+                catch_unwind(|| {
+                    let ex = crate::executor();
+                    (ex.id(), ex.current_task_queue())
+                })
+                .ok(),
+            );
+        }
+    }
+
+    let owner = executor();
+    let observed = Rc::new(Cell::new(None));
+    let guard = RecordContext(observed.clone());
+    let (handle, owner_queue, owner_reactor) = owner.run(async {
+        let queue = crate::executor().create_task_queue(
+            crate::Shares::default(),
+            crate::Latency::Matters(Duration::from_millis(1)),
+            "cleanup owner",
+        );
+        let (started_tx, started_rx) = oneshot::channel();
+        let handle = crate::spawn_local_into(
+            async move {
+                started_tx.send(()).expect("start receiver disappeared");
+                pending::<()>().await;
+                drop(guard);
+            },
+            queue,
+        )
+        .expect("spawn failed")
+        .detach();
+        started_rx.await.expect("task did not start");
+        (handle, queue, crate::executor().reactor())
+    });
+    let allocation = AllocationProbe::track_handle(&handle);
+    let owner_requirements = owner_reactor.io_requirements();
+    let other = executor();
+    other.run(async {
+        let ex = crate::executor();
+        let queue = ex.current_task_queue();
+        let requirements = ex.reactor().io_requirements();
+        drop(handle);
+        assert_eq!(observed.get(), Some((owner.id(), owner_queue)));
+        assert_eq!(crate::executor::executor_id(), Some(other.id()));
+        assert_eq!(ex.current_task_queue(), queue);
+        assert_eq!(
+            ex.reactor().io_requirements()._io_handle,
+            requirements._io_handle
+        );
+    });
+    assert_eq!(
+        owner_reactor.io_requirements()._io_handle,
+        owner_requirements._io_handle,
+        "cleanup did not restore its owner's I/O requirements",
+    );
+    assert_eq!(crate::executor::executor_id(), None);
+    allocation.assert_freed();
+}
+
+/// Last-handle cleanup must finish and reclaim both the task and its executor.
 #[test]
 fn last_handle_drop_with_captured_executor_finishes() {
     let (completed_tx, completed_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let owner = Rc::new(executor());
+        let weak_owner = Rc::downgrade(&owner);
         let captured_owner = owner.clone();
+        let future_drops = DropProbe::new();
+        let guard = future_drops.guard();
         let handle = owner
             .spawn(async move {
                 pending::<()>().await;
-                drop(captured_owner);
+                drop((captured_owner, guard));
             })
             .detach();
+        let allocation = AllocationProbe::track_handle(&handle);
         drop(owner);
         drop(handle);
         completed_tx
-            .send(())
+            .send((allocation, future_drops, weak_owner.strong_count()))
             .expect("executor-drop test stopped waiting for cleanup");
     });
-    completed_rx
+    let (allocation, future_drops, remaining_owners) = completed_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("dropping the last handle did not finish while destroying its executor");
     worker.join().expect("executor-drop test worker panicked");
+    future_drops.assert_dropped_once();
+    allocation.assert_freed();
+    assert_eq!(
+        remaining_owners, 0,
+        "dropping the last handle retained its captured executor",
+    );
+}
+
+/// A destructor can keep using its context after releasing the public executor.
+#[test]
+fn last_handle_destructor_can_spawn_after_releasing_executor() {
+    struct ReleaseThenSpawn {
+        owner: Option<Rc<crate::LocalExecutor>>,
+        child_drops: DropProbe,
+        child_allocation: Rc<RefCell<Option<AllocationProbe>>>,
+        succeeded: Rc<Cell<Option<bool>>>,
+    }
+
+    impl Drop for ReleaseThenSpawn {
+        fn drop(&mut self) {
+            let succeeded = catch_unwind(AssertUnwindSafe(|| {
+                let owner = self.owner.take().expect("executor already released");
+                let id = owner.id();
+                drop(owner);
+                assert_eq!(crate::executor::executor_id(), Some(id));
+                let _queue = crate::executor().current_task_queue();
+                let guard = self.child_drops.guard();
+                let child = crate::spawn_local(async move {
+                    crate::timer::Timer::new(Duration::from_secs(60)).await;
+                    drop(guard);
+                })
+                .detach();
+                *self.child_allocation.borrow_mut() = Some(AllocationProbe::track_handle(&child));
+                drop(child);
+            }))
+            .is_ok();
+            self.succeeded.set(Some(succeeded));
+        }
+    }
+
+    let owner = Rc::new(executor());
+    let weak_owner = Rc::downgrade(&owner);
+    let weak_registry = Rc::downgrade(&owner.tasks);
+    let child_drops = DropProbe::new();
+    let child_allocation = Rc::new(RefCell::new(None));
+    let succeeded = Rc::new(Cell::new(None));
+    let guard = ReleaseThenSpawn {
+        owner: Some(owner.clone()),
+        child_drops: child_drops.clone(),
+        child_allocation: child_allocation.clone(),
+        succeeded: succeeded.clone(),
+    };
+    let handle = owner
+        .spawn(async move {
+            pending::<()>().await;
+            drop(guard);
+        })
+        .detach();
+    let allocation = AllocationProbe::track_handle(&handle);
+    drop(owner);
+    drop(handle);
+
+    assert_eq!(
+        succeeded.get(),
+        Some(true),
+        "cleanup lost its owner context"
+    );
+    assert_eq!(crate::executor::executor_id(), None);
+    assert_eq!(weak_owner.strong_count(), 0);
+    assert_eq!(weak_registry.strong_count(), 0);
+    allocation.assert_freed();
+    child_drops.assert_dropped_once();
+    child_allocation
+        .borrow()
+        .as_ref()
+        .expect("cleanup did not spawn a child task")
+        .assert_freed();
 }
 
 /// A removed queue drops canceled runnables synchronously, including their executor.
@@ -657,6 +864,16 @@ fn cancel_after_queue_removal_can_release_executor() {
 /// Replacing a timer's last task waker must permit timer use during cleanup.
 #[test]
 fn replacing_timer_waker_allows_timer_use_in_destructor() {
+    timer_waker_replacement(false);
+}
+
+/// A removed queue must not force timer cleanup under the registry's borrow.
+#[test]
+fn replacing_timer_waker_after_queue_removal_allows_timer_use_in_destructor() {
+    timer_waker_replacement(true);
+}
+
+fn timer_waker_replacement(remove_queue: bool) {
     use crate::timer::Timer;
 
     /// Records timer registration failures without unwinding through task destruction.
@@ -675,13 +892,14 @@ fn replacing_timer_waker_allows_timer_use_in_destructor() {
     let owner = executor();
     let result = Rc::new(Cell::new(None));
     let observed = result.clone();
+    let owner_ref = &owner;
     let allocation = owner.run(async move {
         let timer = Rc::new(RefCell::new(Timer::new(Duration::from_secs(60))));
         let shared_timer = timer.clone();
         let guard = CreateTimerOnDrop(observed);
         let (started_tx, started_rx) = futures::channel::oneshot::channel();
         let mut started_tx = Some(started_tx);
-        let handle = crate::spawn_local(futures_lite::future::poll_fn(move |cx| {
+        let future = futures_lite::future::poll_fn(move |cx| {
             let _ = &guard;
             assert!(Pin::new(&mut *shared_timer.borrow_mut())
                 .poll(cx)
@@ -690,11 +908,28 @@ fn replacing_timer_waker_allows_timer_use_in_destructor() {
                 tx.send(()).expect("start receiver disappeared");
             }
             Poll::<()>::Pending
-        }))
-        .detach();
+        });
+        let (handle, queue) = if remove_queue {
+            let queue = crate::executor().create_task_queue(
+                crate::Shares::default(),
+                crate::Latency::NotImportant,
+                "removed",
+            );
+            let handle = crate::spawn_local_into(future, queue)
+                .expect("spawn failed")
+                .detach();
+            (handle, Some(queue))
+        } else {
+            (crate::spawn_local(future).detach(), None)
+        };
         let allocation = AllocationProbe::track_handle(&handle);
         drop(handle);
         started_rx.await.expect("task did not start");
+        if let Some(queue) = queue {
+            owner_ref
+                .remove_task_queue(queue)
+                .expect("queue removal failed");
+        }
 
         futures_lite::future::poll_fn(|cx| {
             assert!(Pin::new(&mut *timer.borrow_mut()).poll(cx).is_pending());

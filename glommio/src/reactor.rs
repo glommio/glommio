@@ -54,23 +54,19 @@ impl SharedChannels {
         }
     }
 
-    fn process_shared_channels(&mut self) -> usize {
-        let mut woke = self.connection_wakers.len();
-        for waker in self.connection_wakers.drain(..) {
-            wake!(waker);
-        }
+    /// Detaches ready wakers so their callbacks can reenter the registry.
+    fn take_ready_wakers(&mut self) -> SmallVec<[Waker; 8]> {
+        let mut ready = SmallVec::new();
+        ready.extend(self.connection_wakers.drain(..));
 
         for (pending, check) in self.wakers_map.values_mut() {
             if pending.is_empty() {
                 continue;
             }
             let room = std::cmp::min(check.as_ref().unwrap()(), pending.len());
-            for waker in pending.drain(0..room).rev() {
-                woke += 1;
-                wake!(waker);
-            }
+            ready.extend(pending.drain(0..room).rev());
         }
-        woke
+        ready
     }
 }
 
@@ -108,34 +104,28 @@ impl Timers {
         None
     }
 
-    fn insert(&mut self, id: u64, when: Instant, waker: Waker) {
-        if let Some(when) = self.timers_by_id.get_mut(&id) {
-            self.timers.remove(&(*when, id));
-        }
-        self.timers_by_id.insert(id, when);
+    /// Returns the replaced waker so it can be dropped outside the registry borrow.
+    fn insert(&mut self, id: u64, when: Instant, waker: Waker) -> Option<Waker> {
+        let previous = self
+            .timers_by_id
+            .insert(id, when)
+            .and_then(|previous| self.timers.remove(&(previous, id)));
         self.timers.insert((when, id), waker);
+        previous
     }
 
-    /// Return the duration until next event and the number of
-    /// ready and woke timers.
-    fn process_timers(&mut self) -> (Option<Duration>, usize) {
-        let now = Instant::now();
+    /// Detaches expired timers before invoking their wakers outside the borrow.
+    fn take_ready(&mut self) -> BTreeMap<(Instant, u64), Waker> {
+        let pending = self.timers.split_off(&(Instant::now(), 0));
+        mem::replace(&mut self.timers, pending)
+    }
 
-        // Split timers into ready and pending timers.
-        let pending = self.timers.split_off(&(now, 0));
-        let ready = mem::replace(&mut self.timers, pending);
-        let woke = ready.len();
-        for (_, waker) in ready {
-            wake!(waker);
-        }
-
-        // Calculate the duration until the next event.
-        let next = self
-            .timers
+    /// Computes the next delay after callbacks have changed timer registrations.
+    fn next_timer(&self) -> Option<Duration> {
+        self.timers
             .keys()
             .next()
-            .map(|(when, _)| when.saturating_duration_since(now));
-        (next, woke)
+            .map(|(when, _)| when.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -243,8 +233,8 @@ impl Reactor {
     }
 
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
-        let mut channels = self.shared_channels.borrow_mut();
-        channels.wakers_map.remove(&id);
+        let removed = self.shared_channels.borrow_mut().wakers_map.remove(&id);
+        drop(removed);
     }
 
     pub(crate) fn add_shared_channel_connection_waker(&self, waker: Waker) {
@@ -741,10 +731,11 @@ impl Reactor {
 
     /// Registers a timer in the reactor.
     ///
-    /// Returns the inserted timer's ID.
+    /// Drops the replaced waker after releasing the registry borrow so task
+    /// cleanup can deregister other timers.
     pub(crate) fn insert_timer(&self, id: u64, when: Instant, waker: Waker) {
-        let mut timers = self.timers.borrow_mut();
-        timers.insert(id, when, waker);
+        let previous = self.timers.borrow_mut().insert(id, when, waker);
+        drop(previous);
     }
 
     /// Deregisters a timer from the reactor.
@@ -758,31 +749,39 @@ impl Reactor {
         timers.timers.contains_key(id)
     }
 
-    /// Processes ready timers and extends the list of wakers to wake.
-    ///
-    /// Returns the duration until the next timer
-    fn process_timers(&self) -> (Option<Duration>, usize) {
-        let mut timers = self.timers.borrow_mut();
-        timers.process_timers()
+    /// Wakes expired timers after releasing the registry borrow.
+    fn process_timers(&self) -> usize {
+        let ready = self.timers.borrow_mut().take_ready();
+        let woke = ready.len();
+        for waker in ready.into_values() {
+            wake!(waker);
+        }
+        woke
     }
 
-    /// Releases the channel registry before foreign wakes can drop task futures.
+    /// Releases the channel registry before local or foreign wake callbacks.
     fn process_shared_channels(&self) -> usize {
-        let processed = self.shared_channels.borrow_mut().process_shared_channels();
+        let ready = self.shared_channels.borrow_mut().take_ready_wakers();
+        let processed = ready.len();
+        for waker in ready {
+            wake!(waker);
+        }
         processed + self.sys.process_foreign_wakes()
     }
 
     pub(crate) fn process_shared_channels_by_id(&self, id: u64) -> usize {
-        match self.shared_channels.borrow_mut().wakers_map.get_mut(&id) {
-            Some(wakers) => {
-                let processed = wakers.0.len();
-                wakers.0.drain(..).for_each(|w| {
-                    wake!(w);
-                });
-                processed
-            }
-            None => 0,
+        let ready = self
+            .shared_channels
+            .borrow_mut()
+            .wakers_map
+            .get_mut(&id)
+            .map(|(pending, _)| mem::take(pending))
+            .unwrap_or_default();
+        let processed = ready.len();
+        for waker in ready {
+            wake!(waker);
         }
+        processed
     }
 
     pub(crate) fn rush_dispatch(&self, source: &Source) -> io::Result<()> {
@@ -795,16 +794,16 @@ impl Reactor {
     pub(crate) fn spin_poll_io(&self) -> io::Result<bool> {
         let mut woke = 0;
         self.sys.poll_io(&mut woke)?;
-        woke += self.process_timers().1;
+        woke += self.process_timers();
         woke += self.process_shared_channels();
 
         Ok(woke > 0)
     }
 
     fn process_external_events(&self) -> (Option<Duration>, usize) {
-        let (next_timer, mut woke) = self.process_timers();
+        let mut woke = self.process_timers();
         woke += self.process_shared_channels();
-        (next_timer, woke)
+        (self.timers.borrow().next_timer(), woke)
     }
 
     /// Processes new events, blocking until the first event or the timeout.

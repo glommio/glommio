@@ -9,18 +9,16 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 use crate::{
-    executor::{maybe_activate, TaskQueue},
+    executor::{with_executor_context, TaskQueue},
     task::{registry::TaskRegistry, task_impl, JoinHandle},
     Latency,
 };
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     future::Future,
-    marker::PhantomData,
     panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
-    rc::Rc,
+    rc::{Rc, Weak},
     task::{Context, Poll},
 };
 
@@ -90,54 +88,60 @@ impl<T> Future for Task<T> {
     }
 }
 
+/// Shared scheduling metadata outlives queue removal without retaining its owner.
 #[derive(Debug)]
-struct LocalQueue {
-    queue: RefCell<VecDeque<Runnable>>,
+pub(super) struct Scheduler {
+    queue: Weak<RefCell<TaskQueue>>,
+    owner: Weak<TaskRegistry>,
+    owner_id: usize,
 }
 
-impl LocalQueue {
-    fn new() -> Self {
-        LocalQueue {
-            queue: RefCell::new(VecDeque::new()),
+impl Scheduler {
+    #[inline]
+    fn schedule(&self, runnable: Runnable) {
+        with_executor_context(|context| match context {
+            Some(context) if context.id() == self.owner_id => match self.queue.upgrade() {
+                Some(queue) => context.schedule(queue, runnable),
+                None => context.schedule_cleanup(runnable),
+            },
+            _ => self.schedule_inactive(runnable),
+        });
+    }
+
+    #[cold]
+    fn schedule_inactive(&self, runnable: Runnable) {
+        if let Some(context) = self.owner.upgrade().and_then(|owner| owner.context()) {
+            match self.queue.upgrade() {
+                Some(queue) if !runnable.is_cancelled() => context.schedule(queue, runnable),
+                queue => context.with_cleanup(queue, || drop(runnable)),
+            }
+        }
+    }
+}
+
+impl UnwindSafe for Scheduler {}
+
+impl RefUnwindSafe for Scheduler {}
+
+impl Scheduler {
+    /// Creates the scheduling state shared by a queue and its tasks.
+    pub(super) fn new(
+        queue: Weak<RefCell<TaskQueue>>,
+        owner_id: usize,
+        registry: &Rc<TaskRegistry>,
+    ) -> Self {
+        Self {
+            queue,
+            owner: Rc::downgrade(registry),
+            owner_id,
         }
     }
 
-    pub(crate) fn push(&self, runnable: Runnable) {
-        self.queue.borrow_mut().push_back(runnable);
-    }
-
-    pub(crate) fn pop(&self) -> Option<Runnable> {
-        self.queue.borrow_mut().pop_front()
-    }
-}
-
-/// A single-threaded executor.
-#[derive(Debug)]
-pub(crate) struct LocalExecutor {
-    local_queue: LocalQueue,
-
-    /// Make sure the type is `!Send` and `!Sync`.
-    _marker: PhantomData<Rc<()>>,
-}
-
-impl UnwindSafe for LocalExecutor {}
-
-impl RefUnwindSafe for LocalExecutor {}
-
-impl LocalExecutor {
-    /// Creates a new single-threaded executor.
-    pub(crate) fn new() -> LocalExecutor {
-        LocalExecutor {
-            local_queue: LocalQueue::new(),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Spawns a thread-local future onto this executor.
+    /// Transfers the caller's scheduler reference into a new task.
     fn spawn<T>(
-        &self,
-        executor_id: usize,
-        registry: &TaskRegistry,
+        self: Rc<Self>,
+        owner_id: usize,
+        registry: &Rc<TaskRegistry>,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> (Runnable, JoinHandle<T>) {
@@ -145,30 +149,17 @@ impl LocalExecutor {
             Latency::Matters(_) => true,
             Latency::NotImportant => false,
         };
-        let tq = Rc::downgrade(&tq);
-
-        // The function that schedules a runnable task when it gets woken up.
-        let schedule = move |runnable: Runnable| {
-            let tq = tq.upgrade();
-
-            if let Some(tq) = tq {
-                {
-                    let queue = tq.borrow();
-                    queue.ex.local_queue.push(runnable);
-                }
-                maybe_activate(tq);
-            }
-        };
+        let schedule = move |runnable: Runnable| self.schedule(runnable);
 
         // Create a task, push it into the queue by scheduling it, and return its `Task`
         // handle.
-        task_impl::spawn_local(executor_id, registry, future, schedule, latency_matters)
+        task_impl::spawn_local(owner_id, registry, future, schedule, latency_matters)
     }
 
     pub(crate) fn spawn_and_run<T>(
-        &self,
+        self: Rc<Self>,
         executor_id: usize,
-        registry: &TaskRegistry,
+        registry: &Rc<TaskRegistry>,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
@@ -178,25 +169,14 @@ impl LocalExecutor {
     }
 
     pub(crate) fn spawn_and_schedule<T>(
-        &self,
+        self: Rc<Self>,
         executor_id: usize,
-        registry: &TaskRegistry,
+        registry: &Rc<TaskRegistry>,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
         let (runnable, handle) = self.spawn(executor_id, registry, tq, future);
         runnable.schedule();
         Task(Some(handle))
-    }
-
-    /// Gets one task from the queue, if one exists.
-    ///
-    /// Returns an option rapping the task.
-    pub(crate) fn get_task(&self) -> Option<Runnable> {
-        self.local_queue.pop()
-    }
-
-    pub(crate) fn is_active(&self) -> bool {
-        !self.local_queue.queue.borrow().is_empty()
     }
 }

@@ -9,7 +9,7 @@ use core::{fmt, future::Future, marker::PhantomData, mem, ptr::NonNull};
 use crate::task::debugging::TaskDebugger;
 use crate::{
     dbg_context,
-    task::{header::Header, raw::RawTask, registry::TaskRegistry, JoinHandle},
+    task::{header::Header, raw::RawTask, registry::TaskRegistry, state::CLOSED, JoinHandle},
 };
 
 /// Creates a new local task.
@@ -78,6 +78,18 @@ pub struct Task {
 }
 
 impl Task {
+    /// Whether this runnable only needs destruction rather than another poll.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        unsafe { (*(self.raw_task.as_ptr() as *const Header)).state & CLOSED != 0 }
+    }
+
+    /// Cancels a queued runnable without destroying its future inline.
+    pub(crate) fn cancel(&self) {
+        let ptr = self.raw_task.as_ptr();
+        let header = ptr as *const Header;
+        unsafe { ((*header).vtable.cancel)(ptr) };
+    }
+
     /// Schedules the task.
     ///
     /// This is a convenience method that simply reschedules the task by passing

@@ -506,12 +506,24 @@ where
     }
 
     /// Drops outputs locally and routes abandoned futures through owner cleanup.
+    /// An acquire load of one reference proves exclusive ownership of a cleaned task.
     unsafe fn drop_handle(ptr: *const ()) {
         let header = ptr as *mut Header;
         (*header).state &= !HANDLE;
         let output = Self::take_output(ptr);
-        Self::finish(ptr);
-        Self::drop_waker(ptr);
+        if (*header).state & SCHEDULE_DROPPED != 0
+            && (*header).references.load(Ordering::Acquire) == 1
+        {
+            Self::destroy(ptr);
+        } else {
+            defer!(Self::drop_waker(ptr));
+            Self::finish(ptr);
+            if (*header).state & (SCHEDULED | RUNNING | CLOSED | COMPLETED) == 0
+                && (*header).references.load(Ordering::Acquire) == 2
+            {
+                Self::cancel(ptr);
+            }
+        }
         drop(output);
     }
 

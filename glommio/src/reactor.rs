@@ -223,6 +223,12 @@ impl Reactor {
         self.io_scheduler.inform_requirements(req);
     }
 
+    /// Returns the I/O requirements to restore after a temporary cleanup context.
+    #[cfg(test)]
+    pub(crate) fn io_requirements(&self) -> IoRequirements {
+        self.io_scheduler.requirements()
+    }
+
     pub(crate) fn register_shared_channel<F>(&self, test_function: Box<F>) -> u64
     where
         F: Fn() -> usize + 'static,

@@ -182,6 +182,11 @@ jobs:
 
           cargo "${args[@]}"
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2.87.10
+        with:
+          tool: nextest@0.9.143
+
       - name: Run tests
         shell: bash
         env:

@@ -88,6 +88,9 @@ impl FromRawFd for TcpListener {
     /// Convert an already bound and listening RawFd into a TcpListener
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         let sk = Socket::from_raw_fd(fd);
+        // The caller built this fd, so it may not be non-blocking yet.
+        sk.set_nonblocking(true)
+            .expect("failed to put the listener in non-blocking mode");
         let listener = sk.into();
 
         TcpListener {
@@ -133,6 +136,8 @@ impl TcpListener {
         let sk = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         let addr = socket2::SockAddr::from(addr);
         sk.set_reuse_port(true)?;
+        // yolo_accept needs this: a blocking listener parks the executor.
+        sk.set_nonblocking(true)?;
         sk.bind(&addr)?;
         sk.listen(1024)?;
         let listener = sk.into();

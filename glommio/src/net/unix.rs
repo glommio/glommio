@@ -94,6 +94,8 @@ impl UnixListener {
         let sk = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         let addr = socket2::SockAddr::unix(addr.as_ref())?;
 
+        // See `TcpListener::bind`: `yolo_accept` requires this.
+        sk.set_nonblocking(true)?;
         sk.bind(&addr)?;
         sk.listen(128)?;
         let listener = sk.into();

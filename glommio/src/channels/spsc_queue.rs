@@ -332,6 +332,14 @@ pub(crate) trait BufferHalf {
     fn connect(&self, id: usize);
     fn peer_id(&self) -> usize;
 
+    /// Marks the *other* half disconnected.
+    ///
+    /// For when the peer cannot be reached rather than has said goodbye: it
+    /// registered an executor id and that executor no longer exists, so
+    /// nothing will ever arrive from it and nothing sent to it can be
+    /// noticed. Indistinguishable, from this side, from a peer that hung up.
+    fn disconnect_peer(&self);
+
     /// Returns the total capacity of this queue
     ///
     /// This value represents the total capacity of the queue when it is full.
@@ -363,6 +371,11 @@ impl<T> BufferHalf for Producer<T> {
 
     fn peer_id(&self) -> usize {
         self.buffer.pcache.consumer_id.load(Ordering::Acquire)
+    }
+
+    fn disconnect_peer(&self) {
+        // We are the producer, so the peer is the consumer.
+        self.buffer.disconnect_consumer();
     }
 }
 
@@ -418,6 +431,11 @@ impl<T> BufferHalf for Consumer<T> {
 
     fn peer_id(&self) -> usize {
         self.buffer.ccache.producer_id.load(Ordering::Acquire)
+    }
+
+    fn disconnect_peer(&self) {
+        // We are the consumer, so the peer is the producer.
+        self.buffer.disconnect_producer();
     }
 }
 

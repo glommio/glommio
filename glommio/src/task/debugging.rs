@@ -126,7 +126,7 @@ impl TaskDebugger {
             }
 
             let header = unsafe { &*(ptr as *const Header) };
-            if Some(header.notifier.id()) != executor_id() && header.debugging.get() {
+            if Some(header.executor_id) != executor_id() && header.debugging.get() {
                 dbg.context.push(ctx);
                 dbg.debug_foreign_task(ptr);
                 return true;

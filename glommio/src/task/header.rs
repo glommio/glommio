@@ -6,15 +6,9 @@
 use core::{fmt, task::Waker};
 #[cfg(feature = "debugging")]
 use std::cell::Cell;
-use std::sync::{
-    atomic::{AtomicI32, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::{
-    sys::SleepNotifier,
-    task::{raw::TaskVTable, state::*, utils::abort_on_panic},
-};
+use crate::task::{raw::TaskVTable, state::*, utils::abort_on_panic};
 
 pub(crate) type RefCount = i32;
 pub(crate) type AtomicRefCount = AtomicI32;
@@ -24,8 +18,27 @@ pub(crate) type AtomicRefCount = AtomicI32;
 /// This header is stored right at the beginning of every heap-allocated task.
 pub(crate) struct Header {
     /// ID of the executor to which task belongs to or in other words by which
-    /// task was spawned by
-    pub(crate) notifier: Arc<SleepNotifier>,
+    /// task was spawned by.
+    ///
+    /// Deliberately an id rather than an `Arc<SleepNotifier>`. Holding the
+    /// notifier here would mean resolving it from the global registry on every
+    /// spawn, which serialises all executors on a single lock, and would keep
+    /// the executor's eventfd alive for as long as any task outlives it. The
+    /// notifier is instead resolved from the id on the foreign-wake path, which
+    /// is rare. See `RawTask::notifier`.
+    pub(crate) executor_id: usize,
+
+    /// Index of the task queue this task belongs to.
+    ///
+    /// As with `executor_id`, this is an index rather than an
+    /// `Rc<RefCell<TaskQueue>>` or a `Weak` to one. Capturing the queue in the
+    /// schedule closure made that closure non-zero-sized, which in turn forced
+    /// `RawTask::schedule` to clone and drop a waker as a lifetime guard on
+    /// every single wake -- two atomic read-modify-writes per task switch, for
+    /// eight bytes of capture. Resolving the queue from this index on the
+    /// owning thread keeps the closure zero-sized and skips the guard entirely.
+    ///
+    pub(crate) task_queue_index: usize,
 
     /// Current state of the task.
     pub(crate) state: u8,
@@ -112,7 +125,7 @@ impl Header {
 
         format!(
             "thread:{}|{:>9}|{:>7}|{:>9}|{:>6}|{:>6}|refs:{}",
-            self.notifier.id(),
+            self.executor_id,
             test!(SCHEDULED),
             test!(RUNNING),
             test!(COMPLETED),
@@ -134,7 +147,7 @@ impl fmt::Debug for Header {
                 "current_thread_id",
                 &crate::executor::executor_id().unwrap_or(usize::MAX),
             )
-            .field("thread_id", &self.notifier.id())
+            .field("thread_id", &self.executor_id)
             .field("scheduled", &(state & SCHEDULED != 0))
             .field("running", &(state & RUNNING != 0))
             .field("completed", &(state & COMPLETED != 0))

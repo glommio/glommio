@@ -190,6 +190,14 @@ impl PartialEq for TaskQueue {
 impl Eq for TaskQueue {}
 
 impl TaskQueue {
+    /// The index this queue is registered under in the executor's queue map.
+    ///
+    /// Stored in each task's header so its schedule function can find the
+    /// queue without capturing a reference to it. See `schedule_runnable`.
+    pub(crate) fn index(&self) -> usize {
+        self.stats.index.index()
+    }
+
     fn new<S>(
         index: TaskQueueHandle,
         name: S,
@@ -1084,6 +1092,52 @@ impl<T> PoolThreadHandles<T> {
                 }
             })
             .collect::<Vec<_>>()
+    }
+}
+
+/// Pushes a woken task back onto its task queue and activates that queue.
+///
+/// The task carries the index of its queue in its header rather than a
+/// reference to it, so this resolves the queue from the executor running on
+/// this thread. That is sound because every caller of a task's schedule
+/// function -- `do_wake`, `drop_waker` and `run` in `task::raw` -- first checks
+/// that the current thread owns the task, and routes to the notifier otherwise.
+///
+/// Keeping the queue out of the schedule closure is what lets that closure be
+/// zero-sized, which lets `RawTask::schedule` skip the waker clone/drop guard
+/// it would otherwise need. See `Header::task_queue_index`.
+///
+/// A missing queue means the queue was destroyed, or the executor is shutting
+/// down; in both cases the runnable is dropped, which cancels the task. This
+/// matches the previous behaviour, where the closure held a `Weak` to the queue
+/// and did nothing when it failed to upgrade.
+pub(crate) fn schedule_runnable(runnable: multitask::Runnable) {
+    let handle = TaskQueueHandle {
+        index: runnable.task_queue_index(),
+    };
+
+    #[cfg(any(not(nightly), not(feature = "native-tls")))]
+    {
+        if LOCAL_EX.is_set() {
+            LOCAL_EX.with(|local_ex| {
+                if let Some(tq) = local_ex.get_queue(&handle) {
+                    tq.borrow().ex.push_task(runnable);
+                    maybe_activate(tq);
+                }
+            });
+        }
+    }
+
+    #[cfg(all(nightly, feature = "native-tls"))]
+    {
+        // SAFETY: `LOCAL_EX` is a thread-local raw pointer to the executor
+        // running on this thread; it is null when none is running.
+        if let Some(local_ex) = unsafe { LOCAL_EX.as_ref() } {
+            if let Some(tq) = local_ex.get_queue(&handle) {
+                tq.borrow().ex.push_task(runnable);
+                maybe_activate(tq);
+            }
+        }
     }
 }
 

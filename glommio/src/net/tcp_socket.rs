@@ -351,11 +351,12 @@ pub struct AcceptedTcpStream {
 
 impl AcceptedTcpStream {
     /// Returns the socket address of the remote peer
+    ///
+    /// The `from_raw_fd` call isn't intended to close the socket. Hence the
+    /// intentional leak below.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
         let socket = unsafe { Socket::from_raw_fd(self.fd) };
         let sock_addr = socket.peer_addr()?;
-        // The above from_raw_fd call isn't intended to close the socket. Hence the
-        // intentional leak here.
         let _ = socket.into_raw_fd();
         Ok(sock_addr.as_socket().unwrap())
     }
@@ -494,7 +495,11 @@ impl TcpStream {
     ///
     /// It is an error to pass a zero `Duration` to this function.
     ///
-    /// Timeouts are implemented using `io_uring`'s `IORING_OP_LINK_TIMEOUT`.
+    /// Timeouts are implemented using `io_uring`'s `IORING_OP_LINK_TIMEOUT`:
+    /// `connect_timeout` submits two sqes to io_uring, a connect sqe
+    /// soft-linked with a `LINK_TIMEOUT` sqe. If the timeout fires, the
+    /// connect sqe fails with `ECANCELED`. We map that error to `TimedOut` to
+    /// match the standard library's API.
     ///
     /// # Examples
     ///
@@ -528,9 +533,6 @@ impl TcpStream {
         let source =
             reactor.connect_timeout(socket.as_raw_fd(), SockaddrStorage::from(addr), duration);
 
-        // connect_timeout submits two sqes to io_uring: a connect sqe soft-linked
-        // with a LINK_TIMEOUT sqe. If the timeout fires, the connect sqe fails with
-        // ECANCELED. We map that error to TimedOut to match the standard library's API.
         source
             .collect_rw()
             .await
@@ -979,11 +981,13 @@ mod tests {
             listener_handle.await.unwrap();
 
             let res = TcpStream::connect(addr).await;
-            // server is now dead, connection must fail
-            assert!(res.is_err())
+            assert!(res.is_err(), "server is now dead, connection must fail")
         });
     }
 
+    /// The timer gives the spawned tasks time to be sent down to the ring,
+    /// after which we can establish 128 connections and all of that would
+    /// accept.
     #[test]
     fn parallel_accept() {
         test_executor!(async move {
@@ -1000,12 +1004,8 @@ mod tests {
                     .detach(),
                 );
             }
-            // give it some time to make sure that all tasks above were sent down to
-            // the ring
             Timer::new(Duration::from_millis(100)).await;
 
-            // Now we should be able to establish 128 connections and all of that would
-            // accept
             for _ in 0..128 {
                 handles.push(
                     crate::spawn_local(async move {
@@ -1125,8 +1125,11 @@ mod tests {
             let listener_handle = crate::spawn_local(async move {
                 let mut stream = listener.accept().await?.buffered();
                 let buf = stream.fill_buf().await?;
-                // likely both messages were coalesced together
-                assert_eq!(&buf[0..4], b"msg1");
+                assert_eq!(
+                    &buf[0..4],
+                    b"msg1",
+                    "likely both messages were coalesced together"
+                );
                 stream.consume(4);
                 let buf = stream.fill_buf().await?;
                 assert_eq!(buf, b"msg2");
@@ -1239,12 +1242,13 @@ mod tests {
         });
     }
 
-    // adapted from socket2 test:
-    // https://docs.rs/socket2/0.3.19/src/socket2/socket.rs.html#971-982
+    /// Adapted from socket2 test:
+    /// <https://docs.rs/socket2/0.3.19/src/socket2/socket.rs.html#971-982>
+    ///
+    /// This IP is unroutable, so connections should always time out.
     #[test]
     fn tcp_connect_timeout_error() {
         test_executor!(async move {
-            // this IP is unroutable, so connections should always time out
             match TcpStream::connect_timeout("10.255.255.1:80", Duration::from_millis(250)).await {
                 Ok(_) => panic!("unexpected success"),
                 Err(GlommioError::IoError(ref e)) if e.kind() == io::ErrorKind::TimedOut => {}
@@ -1281,6 +1285,7 @@ mod tests {
         });
     }
 
+    /// Tries to overflow the amount of wakers possible.
     #[test]
     fn tcp_force_poll() {
         test_executor!(async move {
@@ -1291,7 +1296,6 @@ mod tests {
                 let mut stream = listener.accept().await?;
                 poll_fn(|cx| {
                     let mut buf = [0u8; 64];
-                    // try to overflow the amount of wakers possible
                     for _ in 0..64_000 {
                         if Pin::new(&mut stream).poll_read(cx, &mut buf).is_ready() {
                             panic!("should be pending");
@@ -1370,6 +1374,8 @@ mod tests {
         });
     }
 
+    /// Sets timeouts to verify they get cleaned up; creates a new stream and
+    /// verifies timeouts are reset.
     #[test]
     fn tcp_stream_into_raw_fd_with_timeouts() {
         test_executor!(async move {
@@ -1378,7 +1384,6 @@ mod tests {
 
             let stream = TcpStream::connect(addr).await.unwrap();
 
-            // Set timeouts to verify they get cleaned up
             stream
                 .set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
@@ -1394,7 +1399,6 @@ mod tests {
             let raw_fd = stream.into_raw_fd();
             assert_eq!(original_fd, raw_fd);
 
-            // Create a new stream and verify timeouts are reset
             let restored_stream = unsafe { TcpStream::from_raw_fd(raw_fd) };
             assert_eq!(restored_stream.read_timeout(), None);
             assert_eq!(restored_stream.write_timeout(), None);
@@ -1403,15 +1407,18 @@ mod tests {
         });
     }
 
+    /// A connection is accepted and used on one executor, converted back to
+    /// an `AcceptedTcpStream` with `into_accepted()`, migrated to a second
+    /// executor, and resumed there - all on the same underlying fd.
+    ///
+    /// ex1: accept, do the first exchange, then hand the live connection off.
+    /// ex2: bind the migrated connection and resume the same TCP session.
+    /// ex3: client driving both stages over a single connection.
     #[test]
     fn tcp_stream_into_accepted_round_trip() {
-        // A connection is accepted and used on one executor, converted back to
-        // an AcceptedTcpStream with into_accepted(), migrated to a second
-        // executor, and resumed there - all on the same underlying fd.
         let (stream_sender, stream_receiver) = shared_channel::new_bounded(1);
         let (addr_sender, addr_receiver) = shared_channel::new_bounded(1);
 
-        // ex1: accept, do the first exchange, then hand the live connection off.
         let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let stream_sender = stream_sender.connect().await;
@@ -1427,12 +1434,10 @@ mod tests {
                 assert_eq!(&buf, b"ping");
                 stream.write_all(b"pong").await.unwrap();
 
-                // Dispose of glommio state but keep the fd open, then migrate it.
                 stream_sender.try_send(stream.into_accepted()).unwrap();
             })
             .unwrap();
 
-        // ex2: bind the migrated connection and resume the same TCP session.
         let ex2 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let stream_receiver = stream_receiver.connect().await;
@@ -1446,7 +1451,6 @@ mod tests {
             })
             .unwrap();
 
-        // ex3: client driving both stages over a single connection.
         let ex3 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let addr_receiver = addr_receiver.connect().await;

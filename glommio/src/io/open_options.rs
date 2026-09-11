@@ -25,7 +25,7 @@ pub struct OpenOptions {
     create_new: bool,
     tmpfile: bool,
     tmpfile_linkable: bool,
-    // system-specific
+    /// System-specific.
     pub(super) custom_flags: libc::c_int,
     pub(super) mode: libc::mode_t,
 }
@@ -50,9 +50,7 @@ impl OpenOptions {
             create_new: false,
             tmpfile: false,
             tmpfile_linkable: false,
-            // system-specific
             custom_flags: 0,
-            // previously, we defaulted to 0o644, but 0o666 is used by libstd
             mode: 0o666,
         }
     }
@@ -244,12 +242,4 @@ impl OpenOptions {
 }
 
 #[cfg(test)]
-mod test {
-    /*
-    use super::*;
-    use crate::test_utils::*;
-    use crate::{ByteSliceMutExt, Local};
-    */
-
-    // TODO: add tests
-}
+mod test {}

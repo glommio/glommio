@@ -258,8 +258,8 @@ impl DmaStreamReaderState {
         (pos & self.buffer_size_mask) >> self.buffer_size_shift
     }
 
-    // returns true if heir was no waker for this buffer_id
-    // otherwise, it replaces the existing one and returns false
+    /// Returns true if heir was no waker for this `buffer_id`, otherwise, it
+    /// replaces the existing one and returns false.
     fn add_waker(&mut self, buffer_id: u64, waker: Waker) -> bool {
         self.wakermap.insert(buffer_id, waker).is_none()
     }
@@ -449,6 +449,9 @@ impl DmaStreamReader {
     /// ```
     ///
     /// [`DmaStreamReader`]: struct.DmaStreamReader.html
+    ///
+    /// Note that the end range is exclusive, so if we didn't cross a buffer
+    /// boundary we don't discard anything.
     pub fn skip(&mut self, bytes: u64) {
         let mut state = self.state.borrow_mut();
         let buffer_id = state.buffer_id(self.current_pos);
@@ -461,8 +464,6 @@ impl DmaStreamReader {
                 candidate_read_ahead_pos,
             );
 
-            // remember the end range is exclusive so if we didn't cross a buffer
-            // we don't discard anything
             for id in buffer_id..new_buffer_id {
                 state.discard_buffer(id);
             }
@@ -549,7 +550,6 @@ impl DmaStreamReader {
             let start_id = state.buffer_id(self.current_pos);
             let offset = state.offset_of(self.current_pos);
 
-            // enforce max_pos
             if self.current_pos + len > state.max_pos {
                 len = state.max_pos - self.current_pos;
             }
@@ -702,9 +702,13 @@ impl DmaStreamWriterBuilder {
 
 #[derive(Debug)]
 enum FileStatus {
-    Open,    // Open, can be closed.
-    Closing, // We are closing it.
-    Closed,  // It was closed, but the poll
+    /// Open, can be closed.
+    Open,
+    /// We are closing it.
+    Closing,
+    /// It was closed, but the poll may still need to wake the writer to
+    /// deliver the final result.
+    Closed,
 }
 
 #[derive(Debug)]
@@ -754,15 +758,16 @@ impl DmaStreamWriterFlushState {
             .push_back((flush_pos, FlushStatus::Pending(Some(handle))));
     }
 
+    /// Notes:
+    /// - writes can complete out-of-order
+    /// - `flushes` is maintained in sorted order of position
+    ///
+    /// We will update the status of `flush_pos` to complete. We also count
+    /// contiguous completed flushes from the front, `flushed_pos` can be
+    /// updated accordingly and we don't need to track them anymore, so drain
+    /// that range.
     fn on_complete(&mut self, flush_pos: u64) -> u64 {
         self.pending_flush_count -= 1;
-        // note:
-        // - writes can complete out-of-order
-        // - `flushes` is maintained in sorted order of position
-        // we will update the status of `flush_pos` to complete.
-        // we also count contiguous completed flushes from the front,
-        // `flushed_pos` can be updated accordingly and we don't
-        // need to track them anymore, so drain that range.
         let mut drainable_len = 0usize;
         let mut counting = true;
         for (pos, status) in &mut self.flushes {
@@ -802,11 +807,11 @@ struct DmaStreamWriterState {
     sync_on_close: bool,
 }
 
+/// We do it like this so that the write and read close errors are exactly the
+/// same. The reader uses enhanced errors, so it has a message in the inner
+/// attribute of `io::Error`.
 macro_rules! already_closed {
     () => {
-        // We do it like this so that the write and read close errors are exactly the
-        // same. The reader uses enhanced errors, so it has a message in
-        // the inner attribute of io::Error
         Poll::Ready(Err(io::Error::new(
             io::ErrorKind::Other,
             format!("{}", io::Error::from_raw_os_error(libc::EBADF)),
@@ -947,6 +952,8 @@ impl DmaStreamWriterState {
         true
     }
 
+    /// When the file that is closing registers a waker, we don't want to wake
+    /// it now.
     fn flush_one_buffer(&mut self, buffer: DmaBuffer, state: Rc<RefCell<Self>>, file: Rc<DmaFile>) {
         let aligned_pos = self.aligned_pos;
         let flush_pos = self.current_pos();
@@ -957,8 +964,6 @@ impl DmaStreamWriterState {
                 state.flush_state.on_complete(flush_pos);
             }
 
-            // When the file is closing registers a waker, we don't want to
-            // wake it now.
             if let FileStatus::Open = state.file_status {
                 if let Some(waker) = state.waker.take() {
                     drop(state);
@@ -1266,8 +1271,9 @@ impl DmaStreamWriter {
         self.sync_inner().await
     }
 
-    // internal function that does everything that close does (flushes buffers, etc,
-    // but leaves the file open. Useful for the immutable file abstraction.
+    /// Internal function that does everything that close does (flushes
+    /// buffers, etc), but leaves the file open. Useful for the immutable file
+    /// abstraction.
     pub(super) fn poll_seal(
         &mut self,
         cx: &Context<'_>,
@@ -1516,7 +1522,7 @@ mod test {
                         for filename in $filenames.iter() {
                             $files.push(DmaFile::create(filename).await.unwrap());
                         }
-                        let $files = $files; // remove mut
+                        let $files = $files;
 
                         $code
                     });
@@ -1552,8 +1558,6 @@ mod test {
         reader.close().await.unwrap();
     });
 
-    // other tests look like they may be doing this, but the buffer_size can be
-    // rounded up So this one writes a bit more data
     file_stream_write_test!(write_more_than_write_behind, path, _k, filename, file, {
         let mut writer = DmaStreamWriterBuilder::new(file)
             .with_buffer_size(128 << 10)
@@ -1652,7 +1656,6 @@ mod test {
         reader.close().await.unwrap();
     });
 
-    // note the size is 128k + 2bytes
     file_stream_read_test!(read_exact_unaligned_file_size, path, _k, file, file_size: 131074, {
         let mut reader = DmaStreamReaderBuilder::new(file)
             .with_buffer_size(1 << 10)
@@ -1755,7 +1758,6 @@ mod test {
         reader.close().await.unwrap();
     });
 
-    // note the size is 128k + 2 bytes
     file_stream_read_test!(read_get_buffer_aligned, path, _k, file, _file_size: 131074, {
         let mut reader = DmaStreamReaderBuilder::new(file)
             .with_buffer_size(1024)
@@ -1805,7 +1807,6 @@ mod test {
 
         reader.skip(12160);
 
-        // EOF
         match reader.get_buffer_aligned(128).await {
             Err(_) => panic!("Expected success"),
             Ok(res) => {
@@ -2041,9 +2042,6 @@ mod test {
         reader.close().await.unwrap();
     });
 
-    // Unfortunately we don't record the file type so we won't know if it is
-    // writeable or not until we actually try. In this test we'll try on close,
-    // when we force a flush
     file_stream_write_test!(write_with_readable_file, path, _k, filename, _file, {
         let rfile = DmaFile::open(&filename).await.unwrap();
 
@@ -2071,11 +2069,17 @@ mod test {
         assert_eq!(writer.current_pos(), 0);
         writer.write_all(&[0, 1, 2, 3, 4]).await.unwrap();
         assert_eq!(writer.current_pos(), 5);
-        // The write above is not enough to cause a flush
-        assert_eq!(writer.current_flushed_pos(), 0);
+        assert_eq!(
+            writer.current_flushed_pos(),
+            0,
+            "the write above is not enough to cause a flush"
+        );
         writer.close().await.unwrap();
-        // Close implies a forced-flush and a sync.
-        assert_eq!(writer.current_flushed_pos(), 5);
+        assert_eq!(
+            writer.current_flushed_pos(),
+            5,
+            "close implies a forced-flush and a sync"
+        );
     });
 
     file_stream_write_test!(flushed_position_big_buffer, path, _k, filename, file, {
@@ -2125,7 +2129,6 @@ mod test {
         writer.write_all(&buffer).await.unwrap();
         assert_eq!(writer.sync().await.unwrap(), 5000);
         assert_eq!(file_size(&filename), 8192);
-        // write more
         writer.write_all(&buffer).await.unwrap();
         writer.close().await.unwrap();
 
@@ -2140,31 +2143,43 @@ mod test {
             let mut state = DmaStreamWriterFlushState::new(4);
 
             state.on_start(8, handle_gen());
-            // flushes: [8->Pending(Some)]
-            assert_eq!(state.take_pending_handles().len(), 1);
-            // flushes: [8->Pending(None)]
-            assert_eq!(state.take_pending_handles().len(), 0);
-            // flushes: [8->Pending(None)]
-            assert_eq!(state.flushes.len(), 1);
+            assert_eq!(
+                state.take_pending_handles().len(),
+                1,
+                "flushes: [8->Pending(Some)]"
+            );
+            assert_eq!(
+                state.take_pending_handles().len(),
+                0,
+                "flushes: [8->Pending(None)]"
+            );
+            assert_eq!(state.flushes.len(), 1, "flushes: [8->Pending(None)]");
             assert_eq!(state.pending_flush_count, 1);
             assert_eq!(state.on_complete(8), 8);
-            // flushes: []
-            assert_eq!(state.flushes.len(), 0);
+            assert_eq!(state.flushes.len(), 0, "flushes: []");
 
             state.on_start(16, handle_gen());
             state.on_start(24, handle_gen());
             state.on_start(32, handle_gen());
-            // flushes: [16->Pending, 24->Pending, 32->Pending]
-            assert_eq!(state.flushes.len(), 3);
+            assert_eq!(
+                state.flushes.len(),
+                3,
+                "flushes: [16->Pending, 24->Pending, 32->Pending]"
+            );
             assert_eq!(state.on_complete(24), 8);
-            // flushes: [16->Pending, 24->Complete, 32->Pending]
+            assert_eq!(
+                state.flushes.len(),
+                3,
+                "flushes: [16->Pending, 24->Complete, 32->Pending]"
+            );
             assert_eq!(state.on_complete(32), 8);
-            assert_eq!(state.flushes.len(), 3);
             assert_eq!(state.pending_flush_count, 1);
-            // flushes: [16->Pending, 24->Complete, 32->Complete]
-            assert_eq!(32, state.on_complete(16));
-            // flushes: []
-            assert_eq!(state.flushes.len(), 0);
+            assert_eq!(
+                32,
+                state.on_complete(16),
+                "flushes: [16->Pending, 24->Complete, 32->Complete]"
+            );
+            assert_eq!(state.flushes.len(), 0, "flushes: []");
         });
     }
 

@@ -5,8 +5,6 @@
 //!
 use core::{fmt, future::Future, marker::PhantomData, mem, ptr::NonNull};
 
-#[cfg(feature = "debugging")]
-use crate::task::debugging::TaskDebugger;
 use crate::{
     dbg_context,
     task::{header::Header, raw::RawTask, registry::TaskRegistry, state::CLOSED, JoinHandle},

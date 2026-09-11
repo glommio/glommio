@@ -85,12 +85,12 @@ pub use crate::task::{join_handle::JoinHandle, task_impl::Task};
 macro_rules! dbg_context {
     ($ptr:expr, $name:tt, $($body:tt)*) => {{
         #[cfg(feature = "debugging")]
-        let entered = TaskDebugger::enter($ptr, $name);
+        let entered = $crate::task::debugging::TaskDebugger::enter($ptr, $name);
 
         #[cfg(feature = "debugging")]
-        defer! {
+        $crate::defer! {
             if entered {
-                TaskDebugger::leave();
+                $crate::task::debugging::TaskDebugger::leave();
             }
         }
 

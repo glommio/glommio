@@ -12,8 +12,6 @@ use core::{
     task::{Context, Poll},
 };
 
-#[cfg(feature = "debugging")]
-use crate::task::debugging::TaskDebugger;
 use crate::{
     dbg_context,
     task::{header::Header, state::*},

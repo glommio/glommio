@@ -102,7 +102,7 @@ where
     const RAW_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
         Self::clone_waker,
         Self::wake,
-        Self::wake_by_ref,
+        Self::do_wake,
         Self::drop_waker,
     );
 
@@ -283,10 +283,6 @@ where
     unsafe fn wake(ptr: *const ()) {
         // Preserve ownership even if a synchronous scheduling callback panics.
         let _waker = Waker::from_raw(RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE));
-        Self::do_wake(ptr);
-    }
-
-    unsafe fn wake_by_ref(ptr: *const ()) {
         Self::do_wake(ptr);
     }
 

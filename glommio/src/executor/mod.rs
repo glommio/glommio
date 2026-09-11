@@ -36,7 +36,7 @@ use crate::{
     error::BuilderErrorKind,
     executor::stall::StallDetector,
     io::DmaBuffer,
-    parking, reactor,
+    reactor,
     sys::{self, blocking::BlockingThreadPool},
     task::{self, registry::TaskRegistry, waker_fn::dummy_waker},
     GlommioError, IoRequirements, IoStats, Latency, Shares,
@@ -1157,7 +1157,6 @@ pub struct LocalExecutorConfig {
 #[derive(Debug)]
 pub struct LocalExecutor {
     context: ExecutorContext,
-    parker: parking::Parker,
     stall_detector: RefCell<Option<StallDetector>>,
 }
 
@@ -1217,7 +1216,6 @@ impl LocalExecutor {
             Some(cpu_set) => bind_to_cpu_set(cpu_set)?,
             None => config.spin_before_park = None,
         }
-        let p = parking::Parker::new();
         let queues = Rc::new(RefCell::new(ExecutorQueues::new(
             config.preempt_timer,
             config.spin_before_park,
@@ -1241,7 +1239,6 @@ impl LocalExecutor {
                 id,
                 reactor,
             },
-            parker: p,
             stall_detector: RefCell::new(
                 config
                     .detect_stalls
@@ -1319,10 +1316,6 @@ impl LocalExecutor {
         Err(GlommioError::queue_not_found(handle.index))
     }
 
-    fn spawn_internal<T>(&self, future: impl Future<Output = T>) -> multitask::Task<T> {
-        self.context.spawn_internal(future)
-    }
-
     /// Spawns a task directly onto this executor instance.
     ///
     /// Unlike [`spawn_local`], this uses the executor you already have a
@@ -1350,14 +1343,7 @@ impl LocalExecutor {
     /// [`spawn_local`]: crate::spawn_local
     /// [`run`]: LocalExecutor::run
     pub fn spawn<T>(&self, future: impl Future<Output = T>) -> Task<T> {
-        Task(self.spawn_internal(future))
-    }
-
-    fn spawn_into<T, F>(&self, future: F, handle: TaskQueueHandle) -> Result<multitask::Task<T>>
-    where
-        F: Future<Output = T>,
-    {
-        self.context.spawn_into(future, handle)
+        Task(self.context.spawn_internal(future))
     }
 
     fn preempt_timer_duration(&self) -> Duration {
@@ -1515,6 +1501,7 @@ impl LocalExecutor {
             let spin_before_park = self.spin_before_park().unwrap_or_default();
 
             let future = this
+                .context
                 .spawn_into(future, TaskQueueHandle::default())
                 .unwrap()
                 .detach();
@@ -1535,8 +1522,9 @@ impl LocalExecutor {
                 // requests that are latency sensitive we want them out of the
                 // ring ASAP (before we run the task queues). We will also use
                 // the opportunity to install the timer.
-                this.parker
-                    .poll_io(|| Some(this.preempt_timer_duration()))
+                this.context
+                    .reactor
+                    .react(|| Some(this.preempt_timer_duration()))
                     .expect("Failed to poll io! This is actually pretty bad!");
 
                 // run user code
@@ -1561,8 +1549,9 @@ impl LocalExecutor {
                                     "parking with {} runnable task queues: nothing will wake us",
                                     this.context.queues.borrow().active_executors.len()
                                 );
-                                this.parker
-                                    .park()
+                                this.context
+                                    .reactor
+                                    .react(|| None)
                                     .expect("Failed to park! This is actually pretty bad!");
                                 break;
                             }
@@ -3119,6 +3108,7 @@ mod test {
             // and can be running overcommited or in whichever shared infrastructure, we'll
             // allow the timer to fire in up to 1s. If it didn't fire in 1s, that's broken.
             let nolat = local_ex
+                .context
                 .spawn_into(
                     crate::enclose! { (nolat_started, lat_status)
                         async move {
@@ -3142,6 +3132,7 @@ mod test {
                 .unwrap();
 
             let lat = local_ex
+                .context
                 .spawn_into(
                     crate::enclose! { (nolat_started, lat_status)
                         async move {
@@ -3222,6 +3213,7 @@ mod test {
             let second_status = Rc::new(RefCell::new(0));
 
             let first = local_ex
+                .context
                 .spawn_into(
                     crate::enclose! { (first_started, second_status)
                         async move {
@@ -3249,6 +3241,7 @@ mod test {
                 .unwrap();
 
             let second = local_ex
+                .context
                 .spawn_into(
                     crate::enclose! { (first_started, second_status)
                         async move {

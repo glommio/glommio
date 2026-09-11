@@ -6,6 +6,7 @@
 
 use crate::{
     io::{glommio_file::GlommioFile, read_result::ReadResult, OpenOptions},
+    sys::Statx,
     GlommioError,
 };
 use std::{
@@ -253,6 +254,11 @@ impl BufferedFile {
     /// once.
     pub async fn stat(&self) -> Result<Stat> {
         self.file.statx().await.map(Into::into)
+    }
+
+    /// Performs a statx operation on a file
+    pub async fn statx(&self) -> Result<Statx> {
+        self.file.statx().await
     }
 
     /// Closes this file.

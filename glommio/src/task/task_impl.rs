@@ -154,14 +154,8 @@ impl Task {
         dbg_context!(ptr, "run", {
             let header = ptr as *const Header;
             mem::forget(self);
-            #[cfg(feature = "debugging")]
-            TaskDebugger::set_current_task(ptr);
             unsafe { ((*header).vtable.run)(ptr) }
         })
-    }
-
-    pub(crate) fn run_right_away(self) -> bool {
-        self.run()
     }
 }
 

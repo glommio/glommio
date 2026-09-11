@@ -104,7 +104,12 @@ mod test {
 
     impl Drop for OwnerGuard {
         fn drop(&mut self) {
-            REGISTRY.with(TaskRegistry::shutdown);
+            REGISTRY.with(|registry| {
+                registry.request_shutdown();
+                registry.cleanup_active.set(true);
+                while registry.shutdown_next() {}
+                registry.cleanup_active.set(false);
+            });
         }
     }
 
@@ -141,7 +146,7 @@ mod test {
         let sink: Collected = Default::default();
         let (runnable, mut handle) = spawn_capturing(async { 42u32 }, sink.clone());
 
-        runnable.run_right_away();
+        runnable.run();
         assert!(
             sink.borrow().is_empty(),
             "a ready task should not reschedule"
@@ -172,7 +177,7 @@ mod test {
         // Detaching: the task must still be safe to run and must tear itself
         // down afterwards, with no handle left to collect the output.
         drop(handle);
-        runnable.run_right_away();
+        runnable.run();
         assert!(sink.borrow().is_empty());
     }
 
@@ -227,7 +232,7 @@ mod test {
         // The first run leaves the task pending. Waking from inside the poll
         // marks it scheduled, and `run` hands it back through the schedule
         // function on the way out.
-        runnable.run_right_away();
+        runnable.run();
         let rescheduled = sink.borrow_mut().pop().expect("task should reschedule");
         rescheduled.run();
         assert_eq!(poll_once(&mut handle), Poll::Ready(Some(5)));
@@ -244,7 +249,7 @@ mod test {
         assert!(std::mem::size_of_val(&big) >= 2048);
 
         let (runnable, mut handle) = spawn_capturing(big, sink.clone());
-        runnable.run_right_away();
+        runnable.run();
         assert_eq!(poll_once(&mut handle), Poll::Ready(Some(7)));
     }
 
@@ -265,7 +270,7 @@ mod test {
         let flag = dropped.clone();
         let (runnable, handle) = spawn_capturing(async move { NotifyOnDrop(flag) }, sink.clone());
 
-        runnable.run_right_away();
+        runnable.run();
         assert!(!*dropped.borrow(), "output held by the handle");
         drop(handle);
         assert!(*dropped.borrow(), "output dropped with the handle");
@@ -279,7 +284,7 @@ mod test {
         let sink: Collected = Default::default();
         for i in 0..64u32 {
             let (runnable, mut handle) = spawn_capturing(async move { i }, sink.clone());
-            runnable.run_right_away();
+            runnable.run();
             assert_eq!(poll_once(&mut handle), Poll::Ready(Some(i)));
         }
         assert!(sink.borrow().is_empty());

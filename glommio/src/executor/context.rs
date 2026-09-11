@@ -10,7 +10,7 @@ use crate::{task::registry::TaskRegistry, GlommioError, IoRequirements, Latency,
 
 use super::{multitask, ExecutorQueues, Result, TaskQueue, TaskQueueHandle, LOCAL_EX};
 
-/// A temporary owner context built from the executor's existing shared resources.
+/// Shared resources used by the executor and retained independently during cleanup.
 #[derive(Debug)]
 pub(crate) struct ExecutorContext {
     pub(super) queues: Rc<RefCell<ExecutorQueues>>,

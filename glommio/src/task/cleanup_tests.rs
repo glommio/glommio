@@ -74,7 +74,7 @@ fn synchronous_schedule<const N: usize>(run: bool, panic: bool) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -114,7 +114,7 @@ fn owned_schedule_after_shutdown<const N: usize>() {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -154,6 +154,75 @@ fn owned_schedule_after_shutdown<const N: usize>() {
     future_drops.assert_dropped_once();
     schedule_drops.assert_dropped_once();
     allocation.assert_freed();
+}
+
+/// A scheduling closure can release its runnable while the closure is being destroyed.
+fn schedule_destructor_reenters_cleanup<const N: usize>() {
+    struct ReleaseRunnable {
+        runnable: RefCell<Option<task_impl::Task>>,
+        calls: Rc<Cell<usize>>,
+        reschedule: bool,
+        _guard: DropGuard,
+    }
+
+    impl ReleaseRunnable {
+        fn schedule(&self, task: task_impl::Task) {
+            self.calls.set(self.calls.get() + 1);
+            assert!(
+                self.runnable.borrow_mut().replace(task).is_none(),
+                "a runnable was scheduled twice before being released",
+            );
+        }
+    }
+
+    impl Drop for ReleaseRunnable {
+        fn drop(&mut self) {
+            let task = self.runnable.get_mut().take().expect("runnable was lost");
+            if self.reschedule {
+                task.schedule();
+            } else {
+                drop(task);
+            }
+        }
+    }
+
+    for reschedule in [false, true] {
+        let ex = executor();
+        let future_drops = DropProbe::new();
+        let schedule_drops = DropProbe::new();
+        let future = CleanupFuture::<N>::new(true, future_drops.guard());
+        let polls = future.polls.clone();
+        let calls = Rc::new(Cell::new(0));
+        let guard = ReleaseRunnable {
+            runnable: RefCell::new(None),
+            calls: calls.clone(),
+            reschedule,
+            _guard: schedule_drops.guard(),
+        };
+        let (task, handle) = task_impl::spawn_local(
+            ex.id(),
+            0,
+            ex.task_registry(),
+            future,
+            move |task| guard.schedule(task),
+            false,
+        );
+        let allocation = AllocationProbe::track_handle(&handle);
+        task.schedule();
+        drop(ex);
+
+        assert_eq!(polls.get(), 0, "shutdown polled the future");
+        assert_eq!(
+            calls.get(),
+            1,
+            "shutdown invoked the schedule callback again"
+        );
+        future_drops.assert_dropped_once();
+        schedule_drops.assert_dropped_once();
+        allocation.assert_live();
+        drop(handle);
+        allocation.assert_freed();
+    }
 }
 
 struct NestedScheduleFuture<const N: usize> {
@@ -200,7 +269,7 @@ fn nested_synchronous_schedule<const N: usize>(panic: bool) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -248,9 +317,10 @@ fn abandoned_future<const N: usize>(foreign: bool) {
     let polls = future.polls.clone();
 
     ex.run(async {
-        let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
+        let (task, handle) =
+            task_impl::spawn_local(ex.id(), 0, ex.task_registry(), future, drop, false);
         let allocation = AllocationProbe::track_handle(&handle);
-        task.run_right_away();
+        task.run();
         drop(handle);
         future_drops.assert_not_dropped();
         let waker = saved_waker
@@ -283,9 +353,10 @@ fn cleanup_notification_before_foreign_release<const N: usize>() {
     let polls = future.polls.clone();
 
     ex.run(async {
-        let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
+        let (task, handle) =
+            task_impl::spawn_local(ex.id(), 0, ex.task_registry(), future, drop, false);
         let allocation = AllocationProbe::track_handle(&handle);
-        task.run_right_away();
+        task.run();
         drop(handle);
         future_drops.assert_not_dropped();
         let waker = saved_waker
@@ -782,7 +853,7 @@ fn last_handle_destructor_can_spawn_after_releasing_executor() {
 
     let owner = Rc::new(executor());
     let weak_owner = Rc::downgrade(&owner);
-    let weak_registry = Rc::downgrade(&owner.tasks);
+    let weak_registry = Rc::downgrade(owner.task_registry());
     let child_drops = DropProbe::new();
     let child_allocation = Rc::new(RefCell::new(None));
     let succeeded = Rc::new(Cell::new(None));
@@ -850,8 +921,8 @@ fn shutdown_drain_defers_nested_cleanup() {
 
     let owner = executor();
     let other = executor();
-    let weak_registry = Rc::downgrade(&owner.tasks);
-    let weak_other_registry = Rc::downgrade(&other.tasks);
+    let weak_registry = Rc::downgrade(owner.task_registry());
+    let weak_other_registry = Rc::downgrade(other.task_registry());
     let sibling_drops = DropProbe::new();
     let sibling_guard = sibling_drops.guard();
     let sibling = owner
@@ -1051,9 +1122,10 @@ fn handle_and_waker_release_race<const N: usize>() {
             let future = CleanupFuture::<N>::new(true, future_drops.guard());
             let saved_waker = future.waker.clone();
             let polls = future.polls.clone();
-            let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
+            let (task, handle) =
+                task_impl::spawn_local(ex.id(), 0, ex.task_registry(), future, drop, false);
             let allocation = AllocationProbe::track_handle(&handle);
-            task.run_right_away();
+            task.run();
             let waker = saved_waker
                 .borrow_mut()
                 .take()
@@ -1089,7 +1161,7 @@ fn sole_waker_completes_detached_future<const N: usize>(foreign: bool, by_ref: b
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             |task| {
                 task.run();
@@ -1097,7 +1169,7 @@ fn sole_waker_completes_detached_future<const N: usize>(foreign: bool, by_ref: b
             false,
         );
         let allocation = AllocationProbe::track_handle(&handle);
-        task.run_right_away();
+        task.run();
         drop(handle);
         let waker = saved_waker
             .borrow_mut()
@@ -1178,11 +1250,12 @@ fn runnable_and_waker_release_race<const N: usize>() {
                 _padding: [0; N],
             };
             assert_eq!(std::mem::size_of_val(&future) >= 2048, N >= 2048);
-            let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, drop, false);
+            let (task, handle) =
+                task_impl::spawn_local(ex.id(), 0, ex.task_registry(), future, drop, false);
             let allocation = AllocationProbe::track_handle(&handle);
             drop(handle);
             // The foreign waker release races the runnable release after Pending.
-            task.run_right_away();
+            task.run();
             worker.join().expect("foreign waker drop panicked");
             crate::sys::get_sleep_notifier_for(ex.id())
                 .unwrap()
@@ -1213,7 +1286,7 @@ fn panicking_scheduler<const N: usize>(trigger: SchedulePanicTrigger) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |_task| {
                 let _ = &schedule_guard;
@@ -1225,10 +1298,10 @@ fn panicking_scheduler<const N: usize>(trigger: SchedulePanicTrigger) {
         drop(handle);
         let outcome = if matches!(trigger, SchedulePanicTrigger::Poll) {
             catch_unwind(AssertUnwindSafe(|| {
-                task.run_right_away();
+                task.run();
             }))
         } else {
-            task.run_right_away();
+            task.run();
             let waker = saved_waker
                 .borrow_mut()
                 .take()
@@ -1298,6 +1371,11 @@ test_sizes!(
     owned_schedule_after_shutdown_inline,
     owned_schedule_after_shutdown_boxed,
     owned_schedule_after_shutdown
+);
+test_sizes!(
+    schedule_destructor_reenters_cleanup_inline,
+    schedule_destructor_reenters_cleanup_boxed,
+    schedule_destructor_reenters_cleanup
 );
 test_sizes!(
     nested_synchronous_schedule_inline,

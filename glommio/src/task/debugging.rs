@@ -25,7 +25,6 @@ pub struct TaskDebugger {
     registry: HashMap<*const (), TaskInfo>,
     filter: fn(Option<&'static str>) -> bool,
     task_count: Arc<AtomicUsize>,
-    current_task: Option<*const ()>,
     context: Vec<&'static str>,
 }
 
@@ -90,7 +89,6 @@ impl TaskDebugger {
                         registry: HashMap::new(),
                         filter: has_label,
                         task_count: Arc::new(AtomicUsize::new(0)),
-                        current_task: None,
                         context: Vec::new(),
                     });
                 }
@@ -121,17 +119,6 @@ impl TaskDebugger {
         });
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn update(ptr: *const ()) {
-        Self::try_with(|dbg| {
-            if let Some(info) = dbg.registry.get_mut(&ptr) {
-                if dbg.label.is_some() {
-                    info.label = dbg.label;
-                }
-            }
-        });
-    }
-
     pub(crate) fn enter(ptr: *const (), ctx: &'static str) -> bool {
         if unsafe { (*(ptr as *const Header)).owner_thread } != std::thread::current().id() {
             return false;
@@ -140,7 +127,7 @@ impl TaskDebugger {
         Self::try_with(|dbg| {
             if let Some(info) = dbg.registry.get(&ptr) {
                 dbg.context.push(ctx);
-                dbg.debug_task(info, "");
+                dbg.debug_task_info(info, "");
                 return true;
             }
             false
@@ -154,10 +141,6 @@ impl TaskDebugger {
         });
     }
 
-    fn debug_task(&self, info: &TaskInfo, msg: &str) {
-        self.debug_task_info(info, msg);
-    }
-
     fn debug_task_info(&self, info: &TaskInfo, msg: &str) {
         let header = unsafe { &*(info.ptr as *const Header) };
         log::debug!(
@@ -168,12 +151,6 @@ impl TaskDebugger {
             self.context.join("|"),
             msg,
         )
-    }
-
-    pub(crate) fn set_current_task(ptr: *const ()) {
-        Self::try_with(|dbg| {
-            dbg.current_task = Some(ptr);
-        });
     }
 }
 

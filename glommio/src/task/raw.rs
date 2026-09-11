@@ -467,6 +467,7 @@ where
 
     /// Cleans and unlinks the task, returning whether the caller must release
     /// the registry reference. Keeping it counted lets run combine both releases.
+    /// SCHEDULE_DROPPED prevents reentry while the schedule closure is destroyed.
     unsafe fn cleanup_owner(ptr: *const ()) -> bool {
         let raw = Self::from_ptr(ptr);
         let header = raw.header as *mut Header;
@@ -478,11 +479,9 @@ where
             return false;
         }
         (*header).active.store(false, Ordering::Release);
-        (*header).scheduling = true;
         (*header).state |= SCHEDULE_DROPPED;
         abort_on_panic(|| (raw.schedule as *mut S).drop_in_place());
         Header::notify(header, None);
-        (*header).scheduling = false;
 
         #[cfg(feature = "debugging")]
         TaskDebugger::detach(ptr);

@@ -280,7 +280,7 @@ fn schedule_capture<const N: usize>() {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -289,7 +289,7 @@ fn schedule_capture<const N: usize>() {
             false,
         );
         let allocation = AllocationProbe::track_handle(&handle);
-        task.run_right_away();
+        task.run();
         assert!(handle.await.is_some());
         allocation
     });

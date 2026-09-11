@@ -76,7 +76,7 @@ fn drop_initial_runnable<const N: usize>(drop_handle_first: bool) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -118,18 +118,13 @@ fn run_initial_runnable<const N: usize>(drop_handle_first: bool, right_away: boo
     let schedule_drops = DropProbe::new();
     let schedule_guard = schedule_drops.guard();
     let (future, polls) = future::<N>(&future_drops, &output_drops, 0, false);
-    let run = if right_away {
-        Task::run_right_away
-    } else {
-        Task::run
-    };
     let scheduled = Rc::new(RefCell::new(None));
     let schedule_slot = scheduled.clone();
     let allocation = ex.run(async {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -149,9 +144,9 @@ fn run_initial_runnable<const N: usize>(drop_handle_first: bool, right_away: boo
         };
         if drop_handle_first {
             drop(handle);
-            assert!(!run(task));
+            assert!(!task.run());
         } else {
-            assert!(!run(task));
+            assert!(!task.run());
             future_drops.assert_dropped_once();
             output_drops.assert_not_dropped();
             allocation.assert_live();
@@ -183,7 +178,7 @@ fn reschedule_queued_runnable<const N: usize>() {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 let _ = &schedule_guard;
@@ -244,7 +239,7 @@ fn captured_callback<const N: usize>(callback: Callback) {
         let (task, handle) = task_impl::spawn_local(
             ex.id(),
             0,
-            &ex.tasks,
+            ex.task_registry(),
             future,
             move |task| {
                 // Keep an independent observer alive while consuming the last runnable.
@@ -311,7 +306,8 @@ fn zero_sized_callback<const N: usize, const RUN: bool>() {
             }
         };
         assert_eq!(std::mem::size_of_val(&schedule), 0);
-        let (task, handle) = task_impl::spawn_local(ex.id(), 0, &ex.tasks, future, schedule, false);
+        let (task, handle) =
+            task_impl::spawn_local(ex.id(), 0, ex.task_registry(), future, schedule, false);
         let allocation = AllocationProbe::track_handle(&handle);
         drop(handle);
         task.schedule();

@@ -174,7 +174,7 @@ impl Scheduler {
         future: impl Future<Output = T>,
     ) -> Task<T> {
         let (runnable, handle) = self.spawn(registry, tq, future);
-        runnable.run_right_away();
+        runnable.run();
         Task(Some(handle))
     }
 

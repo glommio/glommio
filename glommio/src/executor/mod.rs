@@ -1156,11 +1156,8 @@ pub struct LocalExecutorConfig {
 /// struct.LocalExecutorBuilder.html#method.spawn
 #[derive(Debug)]
 pub struct LocalExecutor {
-    queues: Rc<RefCell<ExecutorQueues>>,
-    pub(crate) tasks: Rc<TaskRegistry>,
+    context: ExecutorContext,
     parker: parking::Parker,
-    id: usize,
-    reactor: Rc<reactor::Reactor>,
     stall_detector: RefCell<Option<StallDetector>>,
 }
 
@@ -1179,26 +1176,23 @@ enum TaskQueueRun {
 }
 
 impl LocalExecutor {
-    fn context(&self) -> ExecutorContext {
-        ExecutorContext {
-            queues: self.queues.clone(),
-            tasks: self.tasks.clone(),
-            id: self.id,
-            reactor: self.reactor.clone(),
-        }
+    /// Gives lifecycle tests access to the executor's task registry.
+    #[cfg(test)]
+    pub(crate) fn task_registry(&self) -> &Rc<TaskRegistry> {
+        &self.context.tasks
     }
 
     fn init(&mut self) {
         let io_requirements = IoRequirements::new(Latency::NotImportant, 0);
-        self.queues.borrow_mut().available_executors.insert(
+        self.context.queues.borrow_mut().available_executors.insert(
             0,
             TaskQueue::new(
                 Default::default(),
                 "default",
                 Shares::Static(1000),
                 io_requirements,
-                self.id,
-                &self.tasks,
+                self.context.id,
+                &self.context.tasks,
             ),
         );
     }
@@ -1241,11 +1235,13 @@ impl LocalExecutor {
         )));
         trace!(id = id, "Creating executor");
         Ok(LocalExecutor {
-            queues,
-            tasks,
+            context: ExecutorContext {
+                queues,
+                tasks,
+                id,
+                reactor,
+            },
             parker: p,
-            id,
-            reactor,
             stall_detector: RefCell::new(
                 config
                     .detect_stalls
@@ -1270,7 +1266,7 @@ impl LocalExecutor {
     ) -> Result<()> {
         self.stall_detector.replace(
             handler
-                .map(|x| StallDetector::new(self.id, x))
+                .map(|x| StallDetector::new(self.context.id, x))
                 .transpose()?,
         );
         Ok(())
@@ -1286,7 +1282,7 @@ impl LocalExecutor {
     /// println!("My ID: {}", local_ex.id());
     /// ```
     pub fn id(&self) -> usize {
-        self.id
+        self.context.id
     }
 
     #[cfg(test)]
@@ -1294,14 +1290,14 @@ impl LocalExecutor {
     where
         S: Into<String>,
     {
-        self.context().create_task_queue(shares, latency, name)
+        self.context.create_task_queue(shares, latency, name)
     }
 
     /// Removes a task queue.
     ///
     /// The task queue cannot be removed if there are still pending tasks.
     pub fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
-        let mut queues = self.queues.borrow_mut();
+        let mut queues = self.context.queues.borrow_mut();
         if queues
             .active_executing
             .as_ref()
@@ -1324,7 +1320,7 @@ impl LocalExecutor {
     }
 
     fn spawn_internal<T>(&self, future: impl Future<Output = T>) -> multitask::Task<T> {
-        self.context().spawn_internal(future)
+        self.context.spawn_internal(future)
     }
 
     /// Spawns a task directly onto this executor instance.
@@ -1361,20 +1357,20 @@ impl LocalExecutor {
     where
         F: Future<Output = T>,
     {
-        self.context().spawn_into(future, handle)
+        self.context.spawn_into(future, handle)
     }
 
     fn preempt_timer_duration(&self) -> Duration {
-        self.queues.borrow().preempt_timer_duration
+        self.context.queues.borrow().preempt_timer_duration
     }
 
     fn spin_before_park(&self) -> Option<Duration> {
-        self.queues.borrow().spin_before_park
+        self.context.queues.borrow().spin_before_park
     }
 
     #[inline(always)]
     pub(crate) fn need_preempt(&self) -> bool {
-        self.reactor.need_preempt()
+        self.context.reactor.need_preempt()
     }
 
     /// Services task queues until preempted or until none is runnable.
@@ -1385,9 +1381,9 @@ impl LocalExecutor {
     /// answer.
     fn run_task_queues(&self) -> TaskQueueRun {
         loop {
-            self.reactor.sys.install_eventfd();
+            self.context.reactor.sys.install_eventfd();
             if self.need_preempt() {
-                return if self.queues.borrow().active_executors.is_empty() {
+                return if self.context.queues.borrow().active_executors.is_empty() {
                     TaskQueueRun::Idle
                 } else {
                     TaskQueueRun::Runnable
@@ -1400,7 +1396,7 @@ impl LocalExecutor {
     }
 
     fn run_one_task_queue(&self) -> bool {
-        let mut tq = self.queues.borrow_mut();
+        let mut tq = self.context.queues.borrow_mut();
         let candidate = tq.active_executors.pop();
         tq.stats.scheduler_runs += 1;
 
@@ -1416,7 +1412,8 @@ impl LocalExecutor {
             let now = Instant::now();
             let mut queue_ref = queue.borrow_mut();
             queue_ref.prepare_to_run(now);
-            self.reactor
+            self.context
+                .reactor
                 .inform_io_requirements(queue_ref.io_requirements);
             now
         };
@@ -1459,7 +1456,7 @@ impl LocalExecutor {
             (state.is_active(), last_vruntime)
         };
 
-        let mut tq = self.queues.borrow_mut();
+        let mut tq = self.context.queues.borrow_mut();
         tq.active_executing = None;
         tq.stats.executor_runtime += runtime;
         tq.stats.tasks_executed += tasks_executed_this_loop;
@@ -1529,7 +1526,7 @@ impl LocalExecutor {
                     // can't be canceled, and join handle is None only upon
                     // cancellation or panic. So in case of panic this just propagates
                     let cur_time = Instant::now();
-                    this.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                    this.context.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
                     break t.unwrap();
                 }
 
@@ -1547,7 +1544,7 @@ impl LocalExecutor {
 
                 // account for runtime and poll/sleep if possible
                 let cur_time = Instant::now();
-                this.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                this.context.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
                 pre_time = cur_time;
                 if queues == TaskQueueRun::Idle {
                     if let Poll::Ready(t) = future.as_mut().poll(cx) {
@@ -1557,12 +1554,12 @@ impl LocalExecutor {
                         // future is probably the one setting up the task queues and etc.
                         break t.unwrap();
                     } else {
-                        while !this.reactor.spin_poll_io().unwrap() {
+                        while !this.context.reactor.spin_poll_io().unwrap() {
                             if pre_time.elapsed() > spin_before_park {
                                 debug_assert!(
-                                    this.queues.borrow().active_executors.is_empty(),
+                                    this.context.queues.borrow().active_executors.is_empty(),
                                     "parking with {} runnable task queues: nothing will wake us",
-                                    this.queues.borrow().active_executors.len()
+                                    this.context.queues.borrow().active_executors.len()
                                 );
                                 this.parker
                                     .park()
@@ -1581,20 +1578,20 @@ impl LocalExecutor {
             executor_id().is_none(),
             "There is already an LocalExecutor running on this thread"
         );
-        self.context().enter(|| run(self))
+        self.context.enter(|| run(self))
     }
 }
 
 impl Drop for LocalExecutor {
     fn drop(&mut self) {
         let shutdown = || {
-            sys::get_sleep_notifier_for(self.id)
+            sys::get_sleep_notifier_for(self.context.id)
                 .expect("executor's sleep notifier disappeared before shutdown")
                 .close_foreign_wakes();
-            self.tasks.request_shutdown();
+            self.context.tasks.request_shutdown();
         };
 
-        self.context().with_cleanup(None, shutdown);
+        self.context.with_cleanup(None, shutdown);
     }
 }
 

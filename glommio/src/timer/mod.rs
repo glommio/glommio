@@ -4,7 +4,11 @@
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
 //! glommio::timer is a module that provides timing related primitives.
+pub(crate) mod slab;
 mod timer_impl;
+mod timing_wheel;
+
+pub(crate) mod reactor_adapter;
 
 use std::{future::Future, time::Duration};
 pub use timer_impl::{Timer, TimerActionOnce, TimerActionRepeat};

@@ -18,9 +18,9 @@ type Result<T> = crate::Result<T, ()>;
 
 #[derive(Debug)]
 struct Inner {
-    id: u64,
-
-    is_charged: bool,
+    /// Handle to the registered timer. `None` until the first poll registers
+    /// it, since the reactor mints the handle rather than the caller.
+    id: Option<crate::timer::slab::TimerId>,
 
     /// When this timer fires.
     when: Instant,
@@ -31,9 +31,10 @@ struct Inner {
 impl Inner {
     fn reset(&mut self, dur: Duration) {
         let mut waker = None;
-        if self.is_charged {
-            // Deregister the timer from the reactor.
-            waker = self.reactor.upgrade().unwrap().remove_timer(self.id);
+        // Deregister the timer from the reactor. Holding a handle is what it
+        // means to be registered, so there is nothing else to consult.
+        if let Some(id) = self.id.take() {
+            waker = self.reactor.upgrade().unwrap().remove_timer(id);
         }
 
         // Update the timeout.
@@ -41,10 +42,12 @@ impl Inner {
 
         if let Some(waker) = waker {
             // Re-register the timer with the new timeout.
-            self.reactor
-                .upgrade()
-                .unwrap()
-                .insert_timer(self.id, self.when, waker);
+            self.id = Some(
+                self.reactor
+                    .upgrade()
+                    .unwrap()
+                    .insert_timer(self.when, waker),
+            );
         }
     }
 }
@@ -105,23 +108,9 @@ impl Timer {
         let reactor = crate::executor().reactor();
         Timer {
             inner: Rc::new(RefCell::new(Inner {
-                id: reactor.register_timer(),
-                is_charged: false,
+                id: None,
                 when: Instant::now() + dur,
                 reactor: Rc::downgrade(&reactor),
-            })),
-        }
-    }
-
-    // Useful in generating repeat timers that have a constant
-    // id. Not for external usage.
-    fn from_id(id: u64, dur: Duration) -> Timer {
-        Timer {
-            inner: Rc::new(RefCell::new(Inner {
-                id,
-                is_charged: false,
-                when: Instant::now() + dur,
-                reactor: Rc::downgrade(&crate::executor().reactor()),
             })),
         }
     }
@@ -154,12 +143,14 @@ impl Timer {
 impl Drop for Timer {
     fn drop(&mut self) {
         let inner = self.inner.borrow_mut();
-        if inner.is_charged {
+        {
             // Deregister the timer from the reactor. Reactor can be dropped already
             // if that is the case then reactor already removed the timer, and we do not
             // need to do anything
             if let Some(reactor) = inner.reactor.upgrade() {
-                reactor.remove_timer(inner.id);
+                if let Some(id) = inner.id {
+                    reactor.remove_timer(id);
+                }
             }
         }
     }
@@ -173,16 +164,23 @@ impl Future for Timer {
 
         if Instant::now() >= inner.when {
             // Deregister the timer from the reactor if needed
-            inner.reactor.upgrade().unwrap().remove_timer(inner.id);
+            if let Some(id) = inner.id.take() {
+                inner.reactor.upgrade().unwrap().remove_timer(id);
+            }
             Poll::Ready(inner.when)
         } else {
-            // Register the timer in the reactor.
-            inner
+            // Register the timer in the reactor, replacing any registration
+            // this timer already holds -- the handle is minted per insert, so
+            // leaving the old one behind would leave a timer nobody can reach.
+            if let Some(stale) = inner.id.take() {
+                inner.reactor.upgrade().unwrap().remove_timer(stale);
+            }
+            let id = inner
                 .reactor
                 .upgrade()
                 .unwrap()
-                .insert_timer(inner.id, inner.when, cx.waker().clone());
-            inner.is_charged = true;
+                .insert_timer(inner.when, cx.waker().clone());
+            inner.id = Some(id);
             Poll::Pending
         }
     }
@@ -231,8 +229,6 @@ pub struct TimerActionOnce<T> {
 #[derive(Debug)]
 pub struct TimerActionRepeat {
     handle: JoinHandle<()>,
-    timer_id: u64,
-    reactor: Weak<Reactor>,
 }
 
 impl<T: 'static> TimerActionOnce<T> {
@@ -310,8 +306,7 @@ impl<T: 'static> TimerActionOnce<T> {
         tq: TaskQueueHandle,
     ) -> Result<TimerActionOnce<T>> {
         let reactor = crate::executor().reactor();
-        let timer_id = reactor.register_timer();
-        let timer = Timer::from_id(timer_id, when);
+        let timer = Timer::new(when);
         let inner = timer.inner.clone();
 
         let task = crate::spawn_local_into(
@@ -475,10 +470,11 @@ impl<T: 'static> TimerActionOnce<T> {
     /// [`cancel`]: struct.TimerActionOnce.html#method.cancel
     /// [`join`]: struct.TimerActionOnce.html#method.join
     pub fn destroy(&self) {
-        self.reactor
-            .upgrade()
-            .unwrap()
-            .remove_timer(self.inner.borrow().id);
+        if let Some(id) = self.inner.borrow_mut().id.take() {
+            if let Some(reactor) = self.reactor.upgrade() {
+                reactor.remove_timer(id);
+            }
+        }
         self.handle.cancel();
     }
 
@@ -614,13 +610,10 @@ impl TimerActionRepeat {
         G: Fn() -> F + 'static,
         F: Future<Output = Option<Duration>> + 'static,
     {
-        let reactor = crate::executor().reactor();
-        let timer_id = reactor.register_timer();
-
         let task = crate::spawn_local_into(
             async move {
                 while let Some(period) = action_gen().await {
-                    Timer::from_id(timer_id, period).await;
+                    Timer::new(period).await;
                 }
             },
             tq,
@@ -628,8 +621,6 @@ impl TimerActionRepeat {
 
         Ok(TimerActionRepeat {
             handle: task.detach(),
-            timer_id,
-            reactor: Rc::downgrade(&reactor),
         })
     }
 
@@ -699,10 +690,16 @@ impl TimerActionRepeat {
     /// Cancel an existing [`TimerActionRepeat`], without waiting for it to
     /// return
     ///
-    /// This is a non-async version of [`cancel`]. It will remove the timer if
-    /// it hasn't fired already and destroy the [`TimerActionRepeat`] releasing
-    /// the resources associated with it, but without blocking the current
-    /// task. It is still possible to [`join`] the task if needed.
+    /// This is a non-async version of [`cancel`]. It destroys the
+    /// [`TimerActionRepeat`] and releases the resources associated with it
+    /// without blocking the current task. It is still possible to [`join`] the
+    /// task if needed.
+    ///
+    /// A repeat action arms a fresh timer for each iteration, so there is no
+    /// one registration for this to withdraw. Any timer currently armed is
+    /// dropped along with the cancelled task, which happens on a later turn of
+    /// the executor rather than here. [`TimerActionOnce::destroy`] does
+    /// withdraw immediately, because a single action has a single timer.
     ///
     /// # Examples
     ///
@@ -725,7 +722,10 @@ impl TimerActionRepeat {
     /// [`cancel`]: struct.TimerActionRepeat.html#method.cancel
     /// [`join`]: struct.TimerActionRepeat.html#method.join
     pub fn destroy(&self) {
-        self.reactor.upgrade().unwrap().remove_timer(self.timer_id);
+        // Cancelling the task drops whichever `Timer` the loop is currently
+        // waiting on, and that timer's `Drop` withdraws its registration.
+        // There is no stable handle to withdraw here: each iteration mints a
+        // new one.
         self.handle.cancel();
     }
 

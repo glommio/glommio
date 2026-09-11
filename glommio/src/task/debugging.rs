@@ -106,17 +106,13 @@ impl TaskDebugger {
         counter
     }
 
-    pub(crate) fn register(ptr: *const ()) -> bool {
+    pub(crate) fn register(ptr: *const ()) {
         Self::try_with(|dbg| {
             let label = dbg.label.take();
             if (dbg.filter)(label) {
                 dbg.registry.insert(ptr, TaskInfo::new(ptr, label));
-                true
-            } else {
-                false
             }
-        })
-        .unwrap_or(false)
+        });
     }
 
     pub(crate) fn detach(ptr: *const ()) {

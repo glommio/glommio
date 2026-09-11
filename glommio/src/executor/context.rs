@@ -65,6 +65,8 @@ impl ExecutorContext {
         queue: Option<Rc<RefCell<TaskQueue>>>,
         f: impl FnOnce() -> T,
     ) -> T {
+        let was_active = self.tasks.cleanup_active.replace(true);
+        defer!(self.tasks.cleanup_active.set(was_active));
         self.enter(|| {
             let queue = queue
                 .or_else(|| self.queues.borrow().active_executing.clone())
@@ -74,7 +76,7 @@ impl ExecutorContext {
             let previous = self.queues.borrow_mut().active_executing.replace(queue);
             self.reactor.inform_io_requirements(requirements);
             defer! {
-                if self.tasks.is_shutting_down() {
+                if !was_active && self.tasks.is_shutting_down() {
                     self.finish_shutdown();
                 }
                 let current = std::mem::replace(
@@ -88,22 +90,22 @@ impl ExecutorContext {
         })
     }
 
-    /// Runs before removing cleanup TLS, including after nested executor drops.
+    /// Drains shutdown work once the outermost cleanup callback has returned.
+    /// Take one runnable at a time so destructors run without queue borrows and
+    /// any tasks or queues they create are included in the next iteration.
     fn finish_shutdown(&self) {
-        self.tasks.shutdown();
-        let queues: Vec<_> = self
-            .queues
-            .borrow()
-            .available_executors
-            .values()
-            .cloned()
-            .collect();
-        for queue in queues {
-            loop {
-                let task = queue.borrow_mut().get_task();
-                let Some(task) = task else { break };
-                drop(task);
+        loop {
+            if self.tasks.shutdown_next() {
+                continue;
             }
+            let task = self
+                .queues
+                .borrow()
+                .available_executors
+                .values()
+                .find_map(|queue| queue.borrow_mut().get_task());
+            let Some(task) = task else { break };
+            drop(task);
         }
     }
 
@@ -192,9 +194,8 @@ impl ExecutorContext {
             .or_else(|| self.get_queue(&TaskQueueHandle { index: 0 }))
             .unwrap();
 
-        let id = self.id;
         let scheduler = tq.borrow().scheduler.clone();
-        scheduler.spawn_and_run(id, &self.tasks, tq, future)
+        scheduler.spawn_and_run(&self.tasks, tq, future)
     }
 
     pub(super) fn spawn_into<T, F>(
@@ -209,9 +210,8 @@ impl ExecutorContext {
             .get_queue(&handle)
             .ok_or_else(|| GlommioError::queue_not_found(handle.index))?;
         let scheduler = tq.borrow().scheduler.clone();
-        let id = self.id;
 
-        Ok(scheduler.spawn_and_schedule(id, &self.tasks, tq, future))
+        Ok(scheduler.spawn_and_schedule(&self.tasks, tq, future))
     }
 }
 
@@ -220,7 +220,6 @@ impl ExecutorContext {
 #[cfg_attr(test, derive(Default))]
 pub(crate) struct WeakExecutorContext {
     queues: Weak<RefCell<ExecutorQueues>>,
-    tasks: Weak<TaskRegistry>,
     id: usize,
     reactor: Weak<Reactor>,
 }
@@ -230,20 +229,18 @@ impl WeakExecutorContext {
         id: usize,
         queues: &Rc<RefCell<ExecutorQueues>>,
         reactor: &Rc<Reactor>,
-        tasks: Weak<TaskRegistry>,
     ) -> Self {
         Self {
             queues: Rc::downgrade(queues),
-            tasks,
             id,
             reactor: Rc::downgrade(reactor),
         }
     }
 
-    pub(crate) fn upgrade(&self) -> Option<ExecutorContext> {
+    pub(crate) fn upgrade(&self, tasks: &Rc<TaskRegistry>) -> Option<ExecutorContext> {
         Some(ExecutorContext {
             queues: self.queues.upgrade()?,
-            tasks: self.tasks.upgrade()?,
+            tasks: tasks.clone(),
             id: self.id,
             reactor: self.reactor.upgrade()?,
         })

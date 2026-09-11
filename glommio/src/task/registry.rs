@@ -5,7 +5,7 @@
 //
 //! Tracks tasks whose thread-local resources still belong to an executor.
 
-use std::{cell::Cell, ptr};
+use std::{cell::Cell, ptr, rc::Rc};
 
 use crate::executor::{ExecutorContext, WeakExecutorContext};
 
@@ -19,6 +19,8 @@ pub(crate) struct TaskRegistry {
     head: Cell<*mut Header>,
     context: WeakExecutorContext,
     shutting_down: Cell<bool>,
+    /// Covers the outer cleanup callback and its shutdown drain.
+    pub(crate) cleanup_active: Cell<bool>,
 }
 
 impl TaskRegistry {
@@ -27,17 +29,23 @@ impl TaskRegistry {
             head: Cell::new(ptr::null_mut()),
             context,
             shutting_down: Cell::new(false),
+            cleanup_active: Cell::new(false),
         }
     }
 
     /// Retains the resources needed while task cleanup can destroy its executor.
-    pub(crate) fn context(&self) -> Option<ExecutorContext> {
-        self.context.upgrade()
+    pub(crate) fn context(self: &Rc<Self>) -> Option<ExecutorContext> {
+        self.context.upgrade(self)
     }
 
-    /// Cleanup contexts must also drain tasks spawned after reentrant shutdown.
+    /// Cleanup contexts must also drain tasks spawned after shutdown is requested.
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.shutting_down.get()
+    }
+
+    /// Defers shutdown work to the outermost cleanup context.
+    pub(crate) fn request_shutdown(&self) {
+        self.shutting_down.set(true);
     }
 
     /// Registers a task protected by its counted executor reference.
@@ -70,18 +78,15 @@ impl TaskRegistry {
         (*task).next = ptr::null_mut();
     }
 
-    /// Cancels and cleans each task while its executor is still available.
-    pub(crate) fn shutdown(&self) {
-        self.shutting_down.set(true);
-        loop {
-            let task = self.head.get();
-            if task.is_null() {
-                break;
-            }
-            // Shutdown unlinks this task. Read the head again afterward: its
-            // destructors can also remove other tasks or create new tasks, so
-            // retaining a next pointer across the callback would be unsafe.
-            unsafe { ((*task).vtable.shutdown)(task.cast()) };
+    /// Cleans one registered task, including tasks added by earlier destructors.
+    /// Shutdown unlinks the task before callbacks can change the registry.
+    pub(crate) fn shutdown_next(&self) -> bool {
+        debug_assert!(self.shutting_down.get() && self.cleanup_active.get());
+        let task = self.head.get();
+        if task.is_null() {
+            return false;
         }
+        unsafe { ((*task).vtable.shutdown)(task.cast()) };
+        true
     }
 }

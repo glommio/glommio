@@ -746,7 +746,7 @@ fn last_handle_drop_with_captured_executor_finishes() {
     );
 }
 
-/// A destructor can keep using its context after releasing the public executor.
+/// Shutdown waits for the outer destructor, which can spawn after releasing its executor.
 #[test]
 fn last_handle_destructor_can_spawn_after_releasing_executor() {
     struct ReleaseThenSpawn {
@@ -754,6 +754,7 @@ fn last_handle_destructor_can_spawn_after_releasing_executor() {
         child_drops: DropProbe,
         child_allocation: Rc<RefCell<Option<AllocationProbe>>>,
         succeeded: Rc<Cell<Option<bool>>>,
+        sibling_drops: DropProbe,
     }
 
     impl Drop for ReleaseThenSpawn {
@@ -762,6 +763,7 @@ fn last_handle_destructor_can_spawn_after_releasing_executor() {
                 let owner = self.owner.take().expect("executor already released");
                 let id = owner.id();
                 drop(owner);
+                self.sibling_drops.assert_not_dropped();
                 assert_eq!(crate::executor::executor_id(), Some(id));
                 let _queue = crate::executor().current_task_queue();
                 let guard = self.child_drops.guard();
@@ -784,11 +786,21 @@ fn last_handle_destructor_can_spawn_after_releasing_executor() {
     let child_drops = DropProbe::new();
     let child_allocation = Rc::new(RefCell::new(None));
     let succeeded = Rc::new(Cell::new(None));
+    let sibling_drops = DropProbe::new();
+    let sibling_guard = sibling_drops.guard();
+    let sibling = owner
+        .spawn(async move {
+            pending::<()>().await;
+            drop(sibling_guard);
+        })
+        .detach();
+    let sibling_allocation = AllocationProbe::track_handle(&sibling);
     let guard = ReleaseThenSpawn {
         owner: Some(owner.clone()),
         child_drops: child_drops.clone(),
         child_allocation: child_allocation.clone(),
         succeeded: succeeded.clone(),
+        sibling_drops: sibling_drops.clone(),
     };
     let handle = owner
         .spawn(async move {
@@ -808,6 +820,9 @@ fn last_handle_destructor_can_spawn_after_releasing_executor() {
     assert_eq!(crate::executor::executor_id(), None);
     assert_eq!(weak_owner.strong_count(), 0);
     assert_eq!(weak_registry.strong_count(), 0);
+    sibling_drops.assert_dropped_once();
+    drop(sibling);
+    sibling_allocation.assert_freed();
     allocation.assert_freed();
     child_drops.assert_dropped_once();
     child_allocation
@@ -815,6 +830,84 @@ fn last_handle_destructor_can_spawn_after_releasing_executor() {
         .as_ref()
         .expect("cleanup did not spawn a child task")
         .assert_freed();
+}
+
+/// Cleanup reached through another executor must not recursively drain its owner.
+#[test]
+fn shutdown_drain_defers_nested_cleanup() {
+    struct CancelAndObserve {
+        handle: Option<super::JoinHandle<()>>,
+        sibling_drops: DropProbe,
+        observed: Rc<Cell<Option<usize>>>,
+    }
+
+    impl Drop for CancelAndObserve {
+        fn drop(&mut self) {
+            drop(self.handle.take());
+            self.observed.set(Some(self.sibling_drops.drops()));
+        }
+    }
+
+    let owner = executor();
+    let other = executor();
+    let weak_registry = Rc::downgrade(&owner.tasks);
+    let weak_other_registry = Rc::downgrade(&other.tasks);
+    let sibling_drops = DropProbe::new();
+    let sibling_guard = sibling_drops.guard();
+    let sibling = owner
+        .spawn(async move {
+            pending::<()>().await;
+            drop(sibling_guard);
+        })
+        .detach();
+    let sibling_allocation = AllocationProbe::track_handle(&sibling);
+    let cancelled_drops = DropProbe::new();
+    let cancelled_guard = cancelled_drops.guard();
+    let cancelled = owner
+        .spawn(async move {
+            pending::<()>().await;
+            drop(cancelled_guard);
+        })
+        .detach();
+    let cancelled_allocation = AllocationProbe::track_handle(&cancelled);
+    let observed = Rc::new(Cell::new(None));
+    let guard = CancelAndObserve {
+        handle: Some(cancelled),
+        sibling_drops: sibling_drops.clone(),
+        observed: observed.clone(),
+    };
+    let other_task = other
+        .spawn(async move {
+            pending::<()>().await;
+            drop(guard);
+        })
+        .detach();
+    let other_allocation = AllocationProbe::track_handle(&other_task);
+    let trigger = owner
+        .spawn(async move {
+            pending::<()>().await;
+            drop(other);
+        })
+        .detach();
+    let trigger_allocation = AllocationProbe::track_handle(&trigger);
+
+    drop(owner);
+
+    assert_eq!(
+        observed.get(),
+        Some(0),
+        "nested cancellation recursively drained the owner's remaining tasks",
+    );
+    assert_eq!(crate::executor::executor_id(), None);
+    assert_eq!(weak_registry.strong_count(), 0);
+    assert_eq!(weak_other_registry.strong_count(), 0);
+    sibling_drops.assert_dropped_once();
+    cancelled_drops.assert_dropped_once();
+    drop((sibling, other_task, trigger));
+    sibling_allocation.assert_freed();
+    cancelled_allocation.assert_freed();
+    other_allocation.assert_freed();
+    trigger_allocation.assert_freed();
 }
 
 /// A removed queue drops canceled runnables synchronously, including their executor.

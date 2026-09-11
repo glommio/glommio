@@ -1236,14 +1236,9 @@ impl LocalExecutor {
             config.record_io_latencies,
             blocking_thread,
         )?);
-        let tasks = Rc::new_cyclic(|tasks| {
-            TaskRegistry::new(WeakExecutorContext::new(
-                id,
-                &queues,
-                &reactor,
-                tasks.clone(),
-            ))
-        });
+        let tasks = Rc::new(TaskRegistry::new(WeakExecutorContext::new(
+            id, &queues, &reactor,
+        )));
         trace!(id = id, "Creating executor");
         Ok(LocalExecutor {
             queues,
@@ -1596,7 +1591,7 @@ impl Drop for LocalExecutor {
             sys::get_sleep_notifier_for(self.id)
                 .expect("executor's sleep notifier disappeared before shutdown")
                 .close_foreign_wakes();
-            self.tasks.shutdown();
+            self.tasks.request_shutdown();
         };
 
         self.context().with_cleanup(None, shutdown);

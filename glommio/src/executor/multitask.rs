@@ -140,8 +140,7 @@ impl Scheduler {
     /// Transfers the caller's scheduler reference into a new task.
     fn spawn<T>(
         self: Rc<Self>,
-        owner_id: usize,
-        registry: &Rc<TaskRegistry>,
+        registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> (Runnable, JoinHandle<T>) {
@@ -153,6 +152,7 @@ impl Scheduler {
             };
             (latency_matters, tq.index())
         };
+        let owner_id = self.owner_id;
         let schedule = move |runnable: Runnable| self.schedule(runnable);
 
         // Create a task, push it into the queue by scheduling it, and return its `Task`
@@ -169,24 +169,22 @@ impl Scheduler {
 
     pub(crate) fn spawn_and_run<T>(
         self: Rc<Self>,
-        executor_id: usize,
-        registry: &Rc<TaskRegistry>,
+        registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
-        let (runnable, handle) = self.spawn(executor_id, registry, tq, future);
+        let (runnable, handle) = self.spawn(registry, tq, future);
         runnable.run_right_away();
         Task(Some(handle))
     }
 
     pub(crate) fn spawn_and_schedule<T>(
         self: Rc<Self>,
-        executor_id: usize,
-        registry: &Rc<TaskRegistry>,
+        registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
     ) -> Task<T> {
-        let (runnable, handle) = self.spawn(executor_id, registry, tq, future);
+        let (runnable, handle) = self.spawn(registry, tq, future);
         runnable.schedule();
         Task(Some(handle))
     }

@@ -422,10 +422,10 @@ where
             return;
         }
         let was_scheduling = mem::replace(&mut (*header).scheduling, true);
-        let _guard = ScheduleGuard {
-            raw,
-            was_scheduling,
-        };
+        defer! {
+            (*header).scheduling = was_scheduling;
+            Self::finish(ptr);
+        }
         (*raw.schedule)(Task {
             raw_task: NonNull::new_unchecked(ptr as *mut ()),
         });
@@ -637,32 +637,6 @@ where
             Self::drop_waker(ptr);
         }
         false
-    }
-}
-
-/// Protects the borrowed scheduling closure until the callback returns.
-struct ScheduleGuard<F, R, S>
-where
-    F: Future<Output = R>,
-    S: Fn(Task),
-{
-    raw: RawTask<F, R, S>,
-    // Recursive callbacks restore true until the outermost invocation exits.
-    was_scheduling: bool,
-}
-
-impl<F, R, S> Drop for ScheduleGuard<F, R, S>
-where
-    F: Future<Output = R>,
-    S: Fn(Task),
-{
-    fn drop(&mut self) {
-        unsafe {
-            let header = self.raw.header as *mut Header;
-            (*header).scheduling = self.was_scheduling;
-            // This may release the last reference. Do not access the task again.
-            RawTask::<F, R, S>::finish(header as *const ());
-        }
     }
 }
 

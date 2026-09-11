@@ -358,6 +358,8 @@ impl<T> GlommioError<T> {
         })
     }
 
+    /// Return the interior resource if the error contains one. If the error doesn't represent a resource then None is
+    /// returned.
     pub fn into_inner(self) -> Option<T> {
         match self {
             GlommioError::Closed(ResourceType::Channel(t)) => Some(t),

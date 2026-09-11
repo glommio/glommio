@@ -13,13 +13,15 @@ use std::{
     net::{Shutdown, TcpStream},
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
     rc::Rc,
-    sync::{atomic::Ordering, Arc, RwLock},
+    sync::{atomic::Ordering, Arc, Mutex, RwLock},
     task::Waker,
     time::Duration,
 };
 
 pub(super) mod blocking;
 pub(crate) mod hardware_topology;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 macro_rules! syscall {
     ($fn:ident $args:tt) => {{
@@ -262,6 +264,8 @@ pub(crate) struct SleepNotifier {
     should_notify: AtomicBool,
     foreign_wakes: crossbeam::channel::Receiver<Waker>,
     waker_sender: crossbeam::channel::Sender<Waker>,
+    foreign_wakes_closed: AtomicBool,
+    foreign_wakes_lock: Mutex<()>,
 }
 
 lazy_static! {
@@ -295,6 +299,8 @@ impl SleepNotifier {
             should_notify: AtomicBool::new(false),
             waker_sender,
             foreign_wakes,
+            foreign_wakes_closed: AtomicBool::new(false),
+            foreign_wakes_lock: Mutex::new(()),
         }))
     }
 
@@ -323,14 +329,44 @@ impl SleepNotifier {
     /// most likely happened because the remote executor already died, in which
     /// case they were no longer interested in this notification. But log.
     pub(crate) fn queue_waker(&self, waker: Waker, force_notify: bool) {
-        if self.waker_sender.send(waker).is_err() {
+        let guard = self.foreign_wakes_lock.lock().unwrap();
+        if !self.accepts_foreign_wakes() {
+            // Dropping a waker can reenter this notifier; never do so while
+            // holding the queue acceptance lock.
+            drop(guard);
+            drop(waker);
+            return;
+        }
+        let result = self.waker_sender.send(waker);
+        drop(guard);
+
+        if result.is_err() {
             debug!(
                 "Executor {} cannot send the waker to its destination!",
                 self.id()
             );
         }
 
+        #[cfg(test)]
+        test_support::after_foreign_wake_queued();
+
         self.notify(force_notify);
+    }
+
+    /// Whether a foreign waker can still be handed to the owning executor.
+    pub(crate) fn accepts_foreign_wakes(&self) -> bool {
+        !self.foreign_wakes_closed.load(Ordering::Acquire)
+    }
+
+    /// Rejects new foreign notifications and drops queued wakers on the owner.
+    pub(crate) fn close_foreign_wakes(&self) {
+        let guard = self.foreign_wakes_lock.lock().unwrap();
+        self.foreign_wakes_closed.store(true, Ordering::Release);
+        drop(guard);
+
+        while let Ok(waker) = self.foreign_wakes.try_recv() {
+            drop(waker);
+        }
     }
 
     pub(crate) fn process_foreign_wakes(&self) -> usize {

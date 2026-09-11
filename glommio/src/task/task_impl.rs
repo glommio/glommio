@@ -9,15 +9,8 @@ use core::{fmt, future::Future, marker::PhantomData, mem, ptr::NonNull};
 use crate::task::debugging::TaskDebugger;
 use crate::{
     dbg_context,
-    task::{
-        header::{Header, RefCount},
-        raw::RawTask,
-        state::*,
-        JoinHandle,
-    },
+    task::{header::Header, raw::RawTask, registry::TaskRegistry, state::CLOSED, JoinHandle},
 };
-
-use std::sync::atomic::Ordering;
 
 /// Creates a new local task.
 ///
@@ -31,6 +24,7 @@ use std::sync::atomic::Ordering;
 /// [`JoinHandle`]: struct.JoinHandle.html
 pub(crate) fn spawn_local<F, R, S>(
     executor_id: usize,
+    registry: &TaskRegistry,
     future: F,
     schedule: S,
     latency_matters: bool,
@@ -42,9 +36,9 @@ where
     // Allocate large futures on the heap.
     let raw_task = if mem::size_of::<F>() >= 2048 {
         let future = alloc::boxed::Box::pin(future);
-        RawTask::<_, R, S>::allocate(future, schedule, executor_id, latency_matters)
+        RawTask::<_, R, S>::allocate(future, schedule, executor_id, registry, latency_matters)
     } else {
-        RawTask::<_, R, S>::allocate(future, schedule, executor_id, latency_matters)
+        RawTask::<_, R, S>::allocate(future, schedule, executor_id, registry, latency_matters)
     };
 
     let task = Task { raw_task };
@@ -84,6 +78,18 @@ pub struct Task {
 }
 
 impl Task {
+    /// Whether this runnable only needs destruction rather than another poll.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        unsafe { (*(self.raw_task.as_ptr() as *const Header)).state & CLOSED != 0 }
+    }
+
+    /// Cancels a queued runnable without destroying its future inline.
+    pub(crate) fn cancel(&self) {
+        let ptr = self.raw_task.as_ptr();
+        let header = ptr as *const Header;
+        unsafe { ((*header).vtable.cancel)(ptr) };
+    }
+
     /// Schedules the task.
     ///
     /// This is a convenience method that simply reschedules the task by passing
@@ -132,37 +138,16 @@ impl Task {
     }
 
     pub(crate) fn run_right_away(self) -> bool {
-        let ptr = self.raw_task.as_ptr();
-        let header = ptr as *const Header;
-        mem::forget(self);
-
-        unsafe {
-            let refs = (*header).references.fetch_add(1, Ordering::Relaxed);
-            assert_ne!(refs, RefCount::MAX);
-            ((*header).vtable.run)(ptr)
-        }
+        self.run()
     }
 }
 
 impl Drop for Task {
     fn drop(&mut self) {
         let ptr = self.raw_task.as_ptr();
-        let header = ptr as *mut Header;
+        let header = ptr as *const Header;
 
         unsafe {
-            // Cancel the task.
-            (*header).cancel();
-
-            // Drop the future.
-            ((*header).vtable.drop_future)(ptr);
-
-            // Mark the task as unscheduled.
-            (*header).state &= !SCHEDULED;
-
-            // Notify the awaiter that the future has been dropped.
-            (*header).notify(None);
-
-            // Drop the task reference.
             ((*header).vtable.drop_task)(ptr);
         }
     }

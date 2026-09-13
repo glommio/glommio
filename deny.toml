@@ -17,6 +17,9 @@ private = { ignore = true }
 
 [advisories]
 version = 2
+yanked       = "deny"
+unmaintained = "all"
+unsound      = "all"
 
 [bans]
 multiple-versions = "allow"

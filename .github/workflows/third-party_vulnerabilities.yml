@@ -3,6 +3,9 @@ name: Third-party vulnerabilities
 permissions: write-all
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
   push:
     branches:
       - main
@@ -12,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
 
       - name: Run checks on third-party dependencies
         uses: EmbarkStudios/cargo-deny-action@v2

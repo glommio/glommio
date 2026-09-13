@@ -30,7 +30,6 @@ ahash                 = "0.8"
 backtrace             = { version = "0.3" }
 bencher               = "0.1.5"
 bitflags              = "2.10"
-bitmaps               = "3.2"
 buddy-alloc           = "0.6"
 concurrent-queue      = "2.5"
 crossbeam             = "0.8"

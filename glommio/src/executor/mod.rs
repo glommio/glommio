@@ -53,8 +53,7 @@ use std::{
     future::Future,
     io,
     marker::PhantomData,
-    mem::MaybeUninit,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
@@ -2173,6 +2172,24 @@ pub unsafe fn spawn_scoped_local_into<'a, T>(
 #[derive(Debug)]
 pub struct ExecutorProxy {}
 
+/// What a blocking job left behind.
+///
+/// One value rather than a result beside a panic flag, so "produced nothing"
+/// and "produced a value" are different things the compiler can tell apart,
+/// and "panicked *and* produced" cannot be written down at all. The previous
+/// shape was a `MaybeUninit` that only the closure knew it had filled: a
+/// closure that unwound left it untouched, and reading it then was undefined
+/// rather than merely wrong.
+enum BlockingOutcome<R> {
+    /// Handed to the pool, not yet run.
+    Pending,
+    /// Ran and returned.
+    Produced(R),
+    /// Ran and unwound. Carried so the caller sees its own panic rather than a
+    /// substitute, as [`std::thread::JoinHandle::join`] does.
+    Panicked(Box<dyn std::any::Any + Send>),
+}
+
 impl ExecutorProxy {
     /// Checks if this task has run for too long and need to be preempted. This
     /// is useful for situations where we can't call .await, for instance,
@@ -2889,13 +2906,34 @@ impl ExecutorProxy {
     ///         .await;
     /// });
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `func` panics, the panic is resumed on the awaiting task, as
+    /// [`std::thread::JoinHandle::join`] does. The pool thread survives and
+    /// keeps serving later work.
+    ///
+    /// The caller allocates the return value's storage for `func` to fill, so
+    /// a panic that was swallowed here would leave the caller to read memory
+    /// that was never written.
+    ///
+    /// An operation that unwinds anywhere other than `func` itself is turned
+    /// into a failed source by the pool, which trips this function's assertion
+    /// on the source rather than reaching the outcome. The caller is woken
+    /// either way; only the message differs.
     pub fn spawn_blocking<F, R>(&self, func: F) -> impl Future<Output = R>
     where
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let result = Arc::new(Mutex::new(MaybeUninit::<R>::uninit()));
-        let f_inner = enclose::enclose!((result) move || {result.lock().unwrap().write(func());});
+        let outcome = Arc::new(Mutex::new(BlockingOutcome::Pending));
+        let f_inner = enclose::enclose!((outcome) move || {
+            let produced = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) {
+                Ok(value) => BlockingOutcome::Produced(value),
+                Err(payload) => BlockingOutcome::Panicked(payload),
+            };
+            *outcome.lock().unwrap() = produced;
+        });
 
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         let waiter =
@@ -2913,14 +2951,15 @@ impl ExecutorProxy {
         async move {
             let source = waiter.await;
             assert!(source.collect_rw().await.is_ok());
-            unsafe {
-                let res_arc = Arc::try_unwrap(result).expect("leak");
-                let ret = std::mem::replace(
-                    &mut *res_arc.lock().unwrap().deref_mut(),
-                    MaybeUninit::<R>::uninit(),
-                )
-                .assume_init();
-                ret
+            let Ok(cell) = Arc::try_unwrap(outcome) else {
+                unreachable!("the blocking pool still holds the outcome")
+            };
+            match cell.into_inner().expect("the outcome mutex was poisoned") {
+                BlockingOutcome::Produced(value) => value,
+                BlockingOutcome::Panicked(payload) => std::panic::resume_unwind(payload),
+                BlockingOutcome::Pending => {
+                    unreachable!("the blocking pool reported success without an outcome")
+                }
             }
         }
     }

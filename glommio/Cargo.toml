@@ -47,6 +47,7 @@ rlimit                = "0.10"
 scopeguard            = "1.2"
 signal-hook           = { version = "0.4" }
 sketches-ddsketch     = "0.3"
+slab-wheel            = "0.0.1"
 smallvec              = { version = "1.15", features = ["union"] }
 socket2               = { version = "0.6", features = ["all"] }
 tracing               = "0.1"

@@ -6,6 +6,11 @@
 //! glommio::timer is a module that provides timing related primitives.
 mod timer_impl;
 
+/// The wheel's handle type, named where the rest of the crate expects it.
+pub(crate) use slab_wheel::Key as TimerId;
+
+pub(crate) mod reactor_adapter;
+
 use std::{future::Future, time::Duration};
 pub use timer_impl::{Timer, TimerActionOnce, TimerActionRepeat};
 

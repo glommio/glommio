@@ -302,6 +302,7 @@ impl GlommioFile {
         }
     }
 
+    #[expect(clippy::result_large_err)]
     pub(crate) async fn try_take_last_clone_unlocking_guard(
         self,
         guard: OwnedGlommioFile,

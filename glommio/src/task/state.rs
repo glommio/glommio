@@ -44,7 +44,15 @@ pub(crate) const CLOSED: u8 = 1 << 3;
 
 /// Set if the [`JoinHandle`] still exists.
 ///
-/// The [`JoinHandle`] is a special case in that it is only tracked by this
-/// flag, while all other task references ([`Task`] and [`Waker`]s) are tracked
-/// by the reference count.
+/// The handle also owns a counted reference, protecting an unread output even
+/// after the executor has released its reference.
 pub(crate) const HANDLE: u8 = 1 << 4;
+
+/// Set before dropping the future, including during cancellation or unwinding.
+pub(crate) const FUTURE_DROPPED: u8 = 1 << 5;
+
+/// Set before dropping the owner-thread schedule closure.
+pub(crate) const SCHEDULE_DROPPED: u8 = 1 << 6;
+
+/// Set while the union contains an unread output.
+pub(crate) const OUTPUT_PRESENT: u8 = 1 << 7;

@@ -4,10 +4,8 @@
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
 use core::{fmt, task::Waker};
-#[cfg(feature = "debugging")]
-use std::cell::Cell;
 use std::sync::{
-    atomic::{AtomicI32, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
     Arc,
 };
 
@@ -33,8 +31,23 @@ pub(crate) struct Header {
     /// Latency matters or not
     pub(crate) latency_matters: bool,
 
-    /// Current reference count of the task.
+    /// Counts the registry, handle, runnable, wakers, and temporary callback
+    /// guards. Only the last release may destroy the allocation.
     pub(crate) references: AtomicRefCount,
+
+    /// Whether a waker may still request execution. Foreign threads only access
+    /// this flag, the reference count, and immutable header fields.
+    pub(crate) active: AtomicBool,
+
+    /// Points to the registry head or the preceding task's `next` field. A null
+    /// link means unregistered. The registry reference remains counted until
+    /// owner cleanup finishes, including after unlinking during shutdown.
+    pub(crate) prev_link: *mut *mut Header,
+    pub(crate) next: *mut Header,
+
+    /// Protects the schedule closure from destruction during its invocation or
+    /// reentrant owner cleanup.
+    pub(crate) scheduling: bool,
 
     /// The task that is blocked on the `JoinHandle`.
     ///
@@ -49,32 +62,21 @@ pub(crate) struct Header {
     pub(crate) vtable: &'static TaskVTable,
 
     #[cfg(feature = "debugging")]
-    pub(crate) debugging: Cell<bool>,
+    pub(crate) owner_thread: std::thread::ThreadId,
+
+    #[cfg(feature = "debugging")]
+    pub(crate) debugger_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Header {
-    /// Cancels the task.
-    ///
-    /// This method will mark the task as closed, but it won't reschedule the
-    /// task or drop its future.
-    pub(crate) fn cancel(&mut self) {
-        // If the task has been completed or closed, it can't be canceled.
-        if self.state & (COMPLETED | CLOSED) != 0 {
-            return;
-        }
-
-        // Mark the task as closed.
-        self.state |= CLOSED;
-    }
-
     /// Notifies the awaiter blocked on this task.
     ///
     /// If the awaiter is the same as the current waker, it will not be
     /// notified.
     #[inline]
-    pub(crate) fn notify(&mut self, current: Option<&Waker>) {
+    pub(crate) unsafe fn notify(header: *mut Self, current: Option<&Waker>) {
         // Take the waker out.
-        let waker = self.awaiter.take();
+        let waker = (*header).awaiter.take();
 
         if let Some(w) = waker {
             // We need a safeguard against panics because waking can panic.
@@ -91,9 +93,13 @@ impl Header {
     /// This method is called when `JoinHandle` is polled and the task has not
     /// completed.
     #[inline]
-    pub(crate) fn register(&mut self, waker: &Waker) {
-        // Put the waker into the awaiter field.
-        abort_on_panic(|| self.awaiter = Some(waker.clone()));
+    pub(crate) unsafe fn register(header: *mut Self, waker: &Waker) {
+        // Do not hold a mutable borrow across a user-provided waker callback.
+        abort_on_panic(|| {
+            let waker = waker.clone();
+            let previous = (*header).awaiter.replace(waker);
+            drop(previous);
+        });
     }
 
     #[cfg(feature = "debugging")]

@@ -11,16 +11,15 @@ use core::{
     ptr::NonNull,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-#[cfg(feature = "debugging")]
-use std::cell::Cell;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{fence, AtomicBool, Ordering};
 
 #[cfg(feature = "debugging")]
 use crate::task::debugging::TaskDebugger;
 use crate::{
-    dbg_context, sys,
+    sys,
     task::{
         header::{AtomicRefCount, Header, RefCount},
+        registry::TaskRegistry,
         state::*,
         utils::{abort, abort_on_panic, extend},
         Task,
@@ -29,20 +28,23 @@ use crate::{
 
 /// The vtable for a task.
 pub(crate) struct TaskVTable {
-    /// Schedules the task.
+    /// Schedules an existing runnable, consuming its counted reference.
     pub(crate) schedule: unsafe fn(*const ()),
-
-    /// Drops the future inside the task.
-    pub(crate) drop_future: unsafe fn(*const ()),
 
     /// Returns a pointer to the output stored after completion.
     pub(crate) get_output: unsafe fn(*const ()) -> *const (),
 
-    /// Drops the task.
-    pub(crate) drop_task: unsafe fn(ptr: *const ()),
+    /// Cancels and releases a runnable task.
+    pub(crate) drop_task: unsafe fn(*const ()),
 
-    /// Destroys the task.
-    pub(crate) destroy: unsafe fn(*const ()),
+    /// Cancels the task through its join handle.
+    pub(crate) cancel: unsafe fn(*const ()),
+
+    /// Drops the join handle and any unread output.
+    pub(crate) drop_handle: unsafe fn(*const ()),
+
+    /// Destroys owner-thread resources during executor shutdown.
+    pub(crate) shutdown: unsafe fn(*const ()),
 
     /// Runs the task.
     pub(crate) run: unsafe fn(*const ()) -> bool,
@@ -104,14 +106,25 @@ where
         Self::drop_waker,
     );
 
+    // Cleanup notifications must not be confused with genuine wakes: consuming
+    // the sole external waker of a detached task must still poll its future.
+    const CLEANUP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        Self::clone_cleanup_waker,
+        Self::wake_cleanup,
+        Self::do_cleanup,
+        Self::drop_waker,
+    );
+
     /// Allocates a task with the given `future` and `schedule` function.
     ///
-    /// It is assumed that initially only the `Task` reference and the
-    /// `JoinHandle` exist.
+    /// The initial runnable, join handle, and executor registry each own one
+    /// counted reference.
+    /// The registry comes from the owning executor, which need not be running.
     pub(crate) fn allocate(
         future: F,
         schedule: S,
         executor_id: usize,
+        registry: &TaskRegistry,
         latency_matters: bool,
     ) -> NonNull<()> {
         // Compute the layout of the task for allocation. Abort if the computation
@@ -132,18 +145,25 @@ where
                 notifier: sys::get_sleep_notifier_for(executor_id).unwrap(),
                 state: SCHEDULED | HANDLE,
                 latency_matters,
-                references: AtomicRefCount::new(0),
+                references: AtomicRefCount::new(3),
+                active: AtomicBool::new(true),
+                prev_link: core::ptr::null_mut(),
+                next: core::ptr::null_mut(),
+                scheduling: false,
                 awaiter: None,
                 vtable: &TaskVTable {
-                    schedule: Self::schedule,
-                    drop_future: Self::drop_future,
+                    schedule: Self::schedule_owned,
                     get_output: Self::get_output,
                     drop_task: Self::drop_task,
-                    destroy: Self::destroy,
+                    cancel: Self::cancel,
+                    drop_handle: Self::drop_handle,
+                    shutdown: Self::shutdown,
                     run: Self::run,
                 },
                 #[cfg(feature = "debugging")]
-                debugging: Cell::new(false),
+                owner_thread: std::thread::current().id(),
+                #[cfg(feature = "debugging")]
+                debugger_count: TaskDebugger::counter(),
             });
 
             // Write the schedule function as the third field of the task.
@@ -152,10 +172,10 @@ where
             // Write the future as the fourth field of the task.
             raw.future.write(future);
 
+            registry.insert(raw.header as *mut Header);
+
             #[cfg(feature = "debugging")]
-            if TaskDebugger::register(raw_task.as_ptr()) {
-                dbg_context!(raw_task.as_ptr(), "allocate", {});
-            }
+            TaskDebugger::register(raw_task.as_ptr());
 
             raw_task
         }
@@ -219,363 +239,438 @@ where
         }
     }
 
-    /// Wakes a waker.
+    /// Wakes a task. Only the owning executor may access its local state.
     unsafe fn do_wake(ptr: *const ()) {
         let raw = Self::from_ptr(ptr);
+        if !(*raw.header).active.load(Ordering::Acquire) {
+            return;
+        }
         if Self::thread_id() != Some(raw.my_id()) {
-            dbg_context!(ptr, "foreign", {
-                let notifier = raw.notifier();
-                notifier.queue_waker(
-                    Waker::from_raw(Self::clone_waker(ptr)),
-                    (*raw.header).latency_matters,
-                );
-            });
-        } else {
-            let state = (*raw.header).state;
+            // Closing the queue can synchronously drop the supplied waker.
+            let notifier = (*raw.header).notifier.clone();
+            notifier.queue_waker(
+                Waker::from_raw(Self::clone_waker(ptr)),
+                (*raw.header).latency_matters,
+            );
+            return;
+        }
 
-            // If the task is completed or closed, it can't be woken up.
-            if state & (COMPLETED | CLOSED) == 0 {
-                // If the task is already scheduled do nothing.
-                if state & SCHEDULED == 0 {
-                    // Mark the task as scheduled.
-                    (*(raw.header as *mut Header)).state = state | SCHEDULED;
-                    if state & RUNNING == 0 {
-                        // Schedule the task.
-                        Self::schedule(ptr);
-                    }
-                }
+        let header = raw.header as *mut Header;
+        let state = (*header).state;
+        if state & (COMPLETED | CLOSED | SCHEDULED) == 0 {
+            (*header).state |= SCHEDULED;
+            if state & RUNNING == 0 {
+                Self::schedule(ptr);
             }
         }
     }
 
-    /// Wakes a waker.
     unsafe fn wake(ptr: *const ()) {
-        dbg_context!(ptr, "wake", {
-            Self::do_wake(ptr);
-            Self::drop_waker(ptr);
-        });
+        // Preserve ownership even if a synchronous scheduling callback panics.
+        let _waker = Waker::from_raw(RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE));
+        Self::do_wake(ptr);
     }
 
-    /// Wakes a waker by reference.
     unsafe fn wake_by_ref(ptr: *const ()) {
-        dbg_context!(ptr, "wake_by_ref", {
-            Self::do_wake(ptr);
-        });
+        Self::do_wake(ptr);
     }
 
-    /// Clones a waker.
     unsafe fn clone_waker(ptr: *const ()) -> RawWaker {
-        dbg_context!(ptr, "clone_waker", {
-            let raw = Self::from_ptr(ptr);
-            Self::increment_references(&*(raw.header as *mut Header));
-            RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE)
-        })
+        Self::increment_references(ptr as *const Header);
+        RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE)
     }
 
     #[inline]
-    #[track_caller]
-    fn increment_references(header: &Header) {
-        let refs = header.references.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(refs, RefCount::MAX, "Waker invariant broken: {header:?}");
+    unsafe fn increment_references(header: *const Header) {
+        let refs = (*header).references.fetch_add(1, Ordering::Relaxed);
+        if refs <= 0 || refs == RefCount::MAX {
+            abort();
+        }
+    }
+
+    /// Releases a reference after publishing any owner-thread cleanup. The last
+    /// release may run anywhere: no future, output, or schedule closure remains.
+    #[inline]
+    unsafe fn release(ptr: *const ()) {
+        Self::release_references(ptr, 1);
     }
 
     #[inline]
-    #[track_caller]
-    fn decrement_references(header: &Header) -> RefCount {
-        let refs = header.references.fetch_sub(1, Ordering::Relaxed);
-        assert_ne!(refs, 0, "Waker invariant broken: {header:?}");
-        refs - 1
+    unsafe fn release_references(ptr: *const (), count: RefCount) {
+        let header = ptr as *const Header;
+        let refs = (*header).references.fetch_sub(count, Ordering::Release);
+        if refs < count {
+            abort();
+        }
+        if refs == count {
+            fence(Ordering::Acquire);
+            Self::destroy(ptr);
+        }
+        // A concurrent final release may free the allocation immediately after
+        // our decrement. Do not access the header on the nonfinal path.
     }
 
-    /// Drops a waker.
-    ///
-    /// This function will decrement the reference count. If it drops to
-    /// zero, the associated join handle has been dropped too, and the task
-    /// has not been completed, then it will get scheduled one more time so
-    /// that its future gets dropped by the executor.
-    #[inline]
+    /// Keep our reference while arranging owner cleanup of an abandoned future.
+    /// A CAS is necessary: concurrent drops must not both miss the transition to
+    /// just the registry and the last waker, or touch memory after releasing it.
+    /// Foreign cleanup transfers this reference to the notification so the owner
+    /// can finish cleanup even before the submitting thread returns.
     unsafe fn drop_waker(ptr: *const ()) {
-        dbg_context!(ptr, "drop_waker", {
-            let raw = Self::from_ptr(ptr);
-
-            if Self::thread_id() != Some(raw.my_id()) {
-                dbg_context!(ptr, "foreign", {
-                    // In case the task complete before the last foreign waker
-                    // is dropped, schedule it once more to ensure the task
-                    // will be destroyed
-                    if Self::decrement_references(&*(raw.header as *mut Header)) == 0 {
-                        let notifier = raw.notifier();
-                        notifier.queue_waker(
-                            Waker::from_raw(Self::clone_waker(ptr)),
-                            (*raw.header).latency_matters,
-                        );
-                    }
-                    return;
-                });
+        let header = ptr as *const Header;
+        let mut refs = (*header).references.load(Ordering::Acquire);
+        loop {
+            if refs <= 0 {
+                abort();
             }
-
-            let refs = Self::decrement_references(&*(raw.header as *mut Header));
-
-            let state = (*raw.header).state;
-
-            // If this was the last reference to the task and the `JoinHandle` has been
-            // dropped too, then we need to decide how to destroy the task.
-            if (refs == 0) && state & HANDLE == 0 {
-                if state & (COMPLETED | CLOSED) == 0 {
-                    if state & SCHEDULED == 0 {
-                        // If the task was not completed nor closed, close it and schedule one more
-                        // time so that its future gets dropped by the
-                        // executor.
-                        Self::schedule(ptr);
-                    }
-                    (*(raw.header as *mut Header)).state = SCHEDULED | CLOSED;
-                } else {
-                    // Otherwise, destroy the task right away.
-                    Self::destroy(ptr);
-                }
-            }
-        });
-    }
-
-    /// Drops a task.
-    ///
-    /// This function will decrement the reference count. If it drops to
-    /// zero and the associated join handle has been dropped too, then the
-    /// task gets destroyed.
-    #[inline]
-    unsafe fn drop_task(ptr: *const ()) {
-        dbg_context!(ptr, "drop_task", {
-            let raw = Self::from_ptr(ptr);
-
-            // Decrement the reference count.
-            let refs = Self::decrement_references(&*(raw.header as *mut Header));
-
-            let state = (*raw.header).state;
-
-            // If this was the last reference to the task and the `JoinHandle` has been
-            // dropped too, then destroy the task.
-            if refs == 0 && state & HANDLE == 0 {
+            if refs == 1 {
+                // There are no weak task references: ownership cannot be
+                // recreated without an existing counted reference. This acquire
+                // load proves exclusive ownership and observes prior cleanup.
                 Self::destroy(ptr);
+                return;
             }
-        });
+            if refs == 2
+                && (*header).active.load(Ordering::Acquire)
+                && (*header).notifier.accepts_foreign_wakes()
+            {
+                if Self::thread_id() != Some((*header).notifier.id()) {
+                    let notifier = (*header).notifier.clone();
+                    notifier.queue_waker(
+                        Waker::from_raw(RawWaker::new(ptr, &Self::CLEANUP_WAKER_VTABLE)),
+                        (*header).latency_matters,
+                    );
+                } else {
+                    defer!(Self::release(ptr));
+                    Self::do_cleanup(ptr);
+                }
+                return;
+            }
+            match (*header).references.compare_exchange_weak(
+                refs,
+                refs - 1,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(current) => refs = current,
+            }
+        }
     }
 
-    /// Schedules a task for running.
-    ///
-    /// This function doesn't modify the state of the task. It only passes the
-    /// task reference to its schedule function.
+    unsafe fn clone_cleanup_waker(ptr: *const ()) -> RawWaker {
+        Self::increment_references(ptr as *const Header);
+        RawWaker::new(ptr, &Self::CLEANUP_WAKER_VTABLE)
+    }
+
+    unsafe fn wake_cleanup(ptr: *const ()) {
+        let _waker = Waker::from_raw(RawWaker::new(ptr, &Self::CLEANUP_WAKER_VTABLE));
+        Self::do_cleanup(ptr);
+    }
+
+    /// A last-drop notification schedules cancellation without polling again.
+    /// Destruction runs through the scheduler so it has a task queue context and
+    /// does not reenter reactor resources borrowed by the waker's caller.
+    unsafe fn do_cleanup(ptr: *const ()) {
+        let raw = Self::from_ptr(ptr);
+        let header = raw.header as *mut Header;
+        if !(*header).active.load(Ordering::Acquire) {
+            return;
+        }
+        if Self::thread_id() != Some(raw.my_id()) {
+            let notifier = (*header).notifier.clone();
+            notifier.queue_waker(
+                Waker::from_raw(Self::clone_cleanup_waker(ptr)),
+                (*header).latency_matters,
+            );
+        } else if (*header).state & (HANDLE | SCHEDULED | RUNNING) == 0
+            && (*header).references.load(Ordering::Acquire) == 2
+        {
+            Self::cancel(ptr);
+        }
+    }
+
+    /// Creates a new runnable when a wake or cancellation needs to schedule it.
     unsafe fn schedule(ptr: *const ()) {
-        dbg_context!(ptr, "schedule", {
-            let raw = Self::from_ptr(ptr);
-            Self::increment_references(&*(raw.header as *mut Header));
+        Self::increment_references(ptr as *const Header);
+        Self::schedule_owned(ptr);
+    }
 
-            // Calling of schedule functions itself does not increment references,
-            // if the schedule function has captured variables, increment references
-            // so if task being dropped inside schedule function , function itself
-            // will keep valid data till the end of execution.
-            let guard = if mem::size_of::<S>() > 0 {
-                Some(Waker::from_raw(Self::clone_waker(ptr)))
-            } else {
-                None
-            };
-
-            let task = Task {
-                raw_task: NonNull::new_unchecked(ptr as *mut ()),
-            };
-
-            (*raw.schedule)(task);
-            drop(guard);
+    /// Transfers a counted runnable into the schedule closure. The registry's
+    /// reference protects the closure until the guard permits owner cleanup,
+    /// including when the callback runs or drops the task synchronously.
+    unsafe fn schedule_owned(ptr: *const ()) {
+        let raw = Self::from_ptr(ptr);
+        let header = raw.header as *mut Header;
+        if (*header).state & SCHEDULE_DROPPED != 0 {
+            Self::release(ptr);
+            return;
+        }
+        let was_scheduling = mem::replace(&mut (*header).scheduling, true);
+        let _guard = ScheduleGuard {
+            raw,
+            was_scheduling,
+        };
+        (*raw.schedule)(Task {
+            raw_task: NonNull::new_unchecked(ptr as *mut ()),
         });
     }
 
-    /// Drops the future inside a task.
-    #[inline]
+    /// Marks the union empty before calling user code in the destructor.
     unsafe fn drop_future(ptr: *const ()) {
         let raw = Self::from_ptr(ptr);
-
-        // We need a safeguard against panics because the destructor can panic.
-        abort_on_panic(|| {
-            raw.future.drop_in_place();
-        })
+        let header = raw.header as *mut Header;
+        if (*header).state & FUTURE_DROPPED == 0 {
+            (*header).state |= FUTURE_DROPPED;
+            abort_on_panic(|| raw.future.drop_in_place());
+        }
     }
 
-    /// Returns a pointer to the output inside a task.
-    unsafe fn get_output(ptr: *const ()) -> *const () {
+    /// Moves the output out so its destructor can unwind after task cleanup.
+    unsafe fn take_output(ptr: *const ()) -> Option<R> {
         let raw = Self::from_ptr(ptr);
-        raw.output as *const ()
+        let header = raw.header as *mut Header;
+        if (*header).state & OUTPUT_PRESENT != 0 {
+            (*header).state = ((*header).state & !OUTPUT_PRESENT) | CLOSED;
+            Some(raw.output.read())
+        } else {
+            None
+        }
     }
 
-    /// Cleans up task's resources and deallocates it.
-    ///
-    /// The schedule function and header will be dropped, and the task will then
-    /// get deallocated. The task must be closed before this function is called.
-    #[inline]
+    unsafe fn get_output(ptr: *const ()) -> *const () {
+        Self::from_ptr(ptr).output as *const ()
+    }
+
+    /// Releases owner-only resources and then the registry's reference. The
+    /// registry protects all destructor callbacks; its release may free the task.
+    unsafe fn finish(ptr: *const ()) {
+        if Self::cleanup_owner(ptr) {
+            Self::release(ptr);
+        }
+    }
+
+    /// Cleans and unlinks the task, returning whether the caller must release
+    /// the registry reference. Keeping it counted lets run combine both releases.
+    unsafe fn cleanup_owner(ptr: *const ()) -> bool {
+        let raw = Self::from_ptr(ptr);
+        let header = raw.header as *mut Header;
+        if (*header).state & SCHEDULE_DROPPED != 0
+            || (*header).state & FUTURE_DROPPED == 0
+            || (*header).state & RUNNING != 0
+            || (*header).scheduling
+        {
+            return false;
+        }
+        (*header).active.store(false, Ordering::Release);
+        (*header).scheduling = true;
+        (*header).state |= SCHEDULE_DROPPED;
+        abort_on_panic(|| (raw.schedule as *mut S).drop_in_place());
+        Header::notify(header, None);
+        (*header).scheduling = false;
+
+        #[cfg(feature = "debugging")]
+        TaskDebugger::detach(ptr);
+        if !(*header).prev_link.is_null() {
+            TaskRegistry::remove(header);
+        }
+        true
+    }
+
+    /// Cancels without polling. RUNNING also protects the future while its
+    /// destructor is executing, so reentrant handle/waker operations defer work.
+    unsafe fn close(ptr: *const ()) {
+        let header = ptr as *mut Header;
+        (*header).state |= CLOSED;
+        (*header).active.store(false, Ordering::Release);
+        if (*header).state & RUNNING == 0 {
+            (*header).state = ((*header).state & !SCHEDULED) | RUNNING;
+            Self::drop_future(ptr);
+            (*header).state &= !RUNNING;
+            Header::notify(header, None);
+        }
+    }
+
+    unsafe fn cancel(ptr: *const ()) {
+        let header = ptr as *mut Header;
+        let state = (*header).state;
+        if state & (COMPLETED | CLOSED) != 0 {
+            return;
+        }
+        (*header).state |= CLOSED;
+        (*header).active.store(false, Ordering::Release);
+        if state & (SCHEDULED | RUNNING) == 0 {
+            (*header).state |= SCHEDULED;
+            Self::schedule(ptr);
+        }
+        Header::notify(header, None);
+    }
+
+    /// Drops outputs locally and routes abandoned futures through owner cleanup.
+    /// An acquire load of one reference proves exclusive ownership of a cleaned task.
+    unsafe fn drop_handle(ptr: *const ()) {
+        let header = ptr as *mut Header;
+        (*header).state &= !HANDLE;
+        let output = Self::take_output(ptr);
+        if (*header).state & SCHEDULE_DROPPED != 0
+            && (*header).references.load(Ordering::Acquire) == 1
+        {
+            Self::destroy(ptr);
+        } else {
+            defer!(Self::drop_waker(ptr));
+            Self::finish(ptr);
+            if (*header).state & (SCHEDULED | RUNNING | CLOSED | COMPLETED) == 0
+                && (*header).references.load(Ordering::Acquire) == 2
+            {
+                Self::cancel(ptr);
+            }
+        }
+        drop(output);
+    }
+
+    unsafe fn drop_task(ptr: *const ()) {
+        Self::close(ptr);
+        Self::finish(ptr);
+        Self::release(ptr);
+    }
+
+    /// Unlinks before invoking destructors, which can reenter executor shutdown.
+    /// A running poll or schedule callback retains the registry reference until
+    /// its guard can finish cleanup, even if the registry itself is destroyed.
+    unsafe fn shutdown(ptr: *const ()) {
+        // The registry may own the only reference at shutdown entry.
+        Self::increment_references(ptr as *const Header);
+        TaskRegistry::remove(ptr as *mut Header);
+        Self::close(ptr);
+        Self::finish(ptr);
+        Self::release(ptr);
+    }
+
+    /// Only the inert header is left when the count reaches zero. In particular,
+    /// the !Send output was taken or destroyed before releasing the handle.
     unsafe fn destroy(ptr: *const ()) {
-        dbg_context!(ptr, "destroy", {
-            #[cfg(feature = "debugging")]
-            TaskDebugger::unregister(ptr);
-
-            let raw = Self::from_ptr(ptr);
-            let task_layout = Self::task_layout();
-
-            // We need a safeguard against panics because destructors can panic.
-            abort_on_panic(|| {
-                // Drop the schedule function.
-                (raw.schedule as *mut S).drop_in_place();
-
-                // Drop the header so resources owned by it, such as the executor's
-                // sleep notifier, are released before the task allocation is freed.
-                (raw.header as *mut Header).drop_in_place();
-            });
-
-            // Finally, deallocate the memory reserved by the task.
-            alloc::alloc::dealloc(ptr as *mut u8, task_layout.layout);
-        });
+        let header = ptr as *mut Header;
+        // The acquire load or fence in the final release observes owner cleanup.
+        debug_assert_eq!(
+            (*header).state & (FUTURE_DROPPED | SCHEDULE_DROPPED | OUTPUT_PRESENT | HANDLE),
+            FUTURE_DROPPED | SCHEDULE_DROPPED,
+        );
+        debug_assert!((*header).prev_link.is_null());
+        debug_assert!((*header).awaiter.is_none());
+        #[cfg(feature = "debugging")]
+        (*header).debugger_count.fetch_sub(1, Ordering::Relaxed);
+        abort_on_panic(|| header.drop_in_place());
+        let layout = Self::task_layout().layout;
+        #[cfg(test)]
+        crate::task::test_support::deallocate(ptr as *mut u8, layout);
+        #[cfg(not(test))]
+        alloc::alloc::dealloc(ptr as *mut u8, layout);
     }
 
-    /// Runs a task.
-    ///
-    /// If polling its future panics, the task will be closed and the panic will
-    /// be propagated into the caller.
+    /// Polls once while holding the runnable reference, transferring it when a
+    /// wake received during polling schedules the task again.
     unsafe fn run(ptr: *const ()) -> bool {
         let raw = Self::from_ptr(ptr);
-
-        let mut state = (*raw.header).state;
-
-        // Update the task's state before polling its future.
-        // If the task has already been closed, drop the task reference and return.
-        if state & CLOSED != 0 {
-            // Drop the future.
-            Self::drop_future(ptr);
-
-            // Mark the task as unscheduled.
-            (*(raw.header as *mut Header)).state &= !SCHEDULED;
-
-            // Notify the awaiter that the future has been dropped.
-            (*(raw.header as *mut Header)).notify(None);
-
-            // Drop the task reference.
+        let header = raw.header as *mut Header;
+        if (*header).state & (CLOSED | COMPLETED) != 0 {
             Self::drop_task(ptr);
             return false;
         }
-
-        state = (state & !SCHEDULED) | RUNNING;
-        (*(raw.header as *mut Header)).state = state;
-
-        // Create a context from the raw task pointer and the vtable inside the its
-        // header.
+        (*header).state = ((*header).state & !SCHEDULED) | RUNNING;
         let waker = ManuallyDrop::new(Waker::from_raw(RawWaker::new(ptr, &Self::RAW_WAKER_VTABLE)));
-        let cx = &mut Context::from_waker(&waker);
-
-        // Poll the inner future, but surround it with a guard that closes the task in
-        // case polling panics.
-        let guard = Guard(raw);
-        let poll = <F as Future>::poll(Pin::new_unchecked(&mut *raw.future), cx);
-        mem::forget(guard);
-
-        //state could be updated after the coll to the poll
-        state = (*raw.header).state;
-
-        let mut ret = false;
+        let guard = PollGuard(raw);
+        let poll = Pin::new_unchecked(&mut *raw.future).poll(&mut Context::from_waker(&waker));
 
         match poll {
-            Poll::Ready(out) => {
-                // Replace the future with its output.
+            Poll::Ready(output) => {
+                (*header).active.store(false, Ordering::Release);
                 Self::drop_future(ptr);
-                raw.output.write(out);
-
-                // A place where the output will be stored in case it needs to be dropped.
-                let mut output = None;
-
-                // The task is now completed.
-                // If the handle is dropped, we'll need to close it and drop the output.
-                let new = if state & HANDLE == 0 {
-                    (state & !RUNNING & !SCHEDULED) | COMPLETED | CLOSED
-                } else {
-                    (state & !RUNNING & !SCHEDULED) | COMPLETED
-                };
-
-                (*(raw.header as *mut Header)).state = new;
-
-                // If the handle is dropped or if the task was closed while running,
-                // now it's time to drop the output.
-                if state & HANDLE == 0 || state & CLOSED != 0 {
-                    // Read the output.
-                    output = Some(raw.output.read());
+                raw.output.write(output);
+                (*header).state = ((*header).state & !SCHEDULED) | COMPLETED | OUTPUT_PRESENT;
+                if (*header).state & HANDLE == 0 || (*header).state & CLOSED != 0 {
+                    drop(Self::take_output(ptr));
                 }
-
-                // Notify the awaiter that the task has been completed.
-                (*(raw.header as *mut Header)).notify(None);
-
-                drop(output);
+                (*header).state &= !RUNNING;
+                Header::notify(header, None);
             }
             Poll::Pending => {
-                // The task is still not completed.
-
-                // If the task was closed while running, we'll need to unschedule in case it
-                // was woken up and then destroy it.
-                let new = if state & CLOSED != 0 {
-                    state & !RUNNING & !SCHEDULED
-                } else {
-                    state & !RUNNING
-                };
-
-                if state & CLOSED != 0 {
+                if (*header).state & CLOSED != 0 {
                     Self::drop_future(ptr);
-                }
-
-                (*(raw.header as *mut Header)).state = new;
-
-                // If the task was closed while running, we need to notify the awaiter.
-                // If the task was woken up while running, we need to schedule it.
-                // Otherwise, we just drop the task reference.
-                if state & CLOSED != 0 {
-                    // Notify the awaiter that the future has been dropped.
-                    (*(raw.header as *mut Header)).notify(None);
-                } else if state & SCHEDULED != 0 {
-                    // The thread that woke the task up didn't reschedule it because
-                    // it was running so now it's our responsibility to do so.
-                    Self::schedule(ptr);
-                    ret = true;
+                    (*header).state &= !(RUNNING | SCHEDULED);
+                    Header::notify(header, None);
+                } else {
+                    (*header).state &= !RUNNING;
+                    if (*header).state & SCHEDULED != 0 {
+                        // The callback owns the runnable from here, including
+                        // if it runs, drops, or panics synchronously.
+                        mem::forget(guard);
+                        Self::schedule_owned(ptr);
+                        return true;
+                    } else if (*header).state & HANDLE == 0
+                        && (*header).references.load(Ordering::Acquire) == 2
+                    {
+                        Self::close(ptr);
+                    }
                 }
             }
         }
-        Self::drop_task(ptr);
+        let release_registry = Self::cleanup_owner(ptr);
+        mem::forget(guard);
+        if release_registry {
+            Self::release_references(ptr, 2);
+        } else {
+            Self::drop_waker(ptr);
+        }
+        false
+    }
+}
 
-        return ret;
+/// Protects the borrowed scheduling closure until the callback returns.
+struct ScheduleGuard<F, R, S>
+where
+    F: Future<Output = R>,
+    S: Fn(Task),
+{
+    raw: RawTask<F, R, S>,
+    // Recursive callbacks restore true until the outermost invocation exits.
+    was_scheduling: bool,
+}
 
-        /// A guard that closes the task if polling its future panics.
-        struct Guard<F, R, S>(RawTask<F, R, S>)
-        where
-            F: Future<Output = R>,
-            S: Fn(Task);
+impl<F, R, S> Drop for ScheduleGuard<F, R, S>
+where
+    F: Future<Output = R>,
+    S: Fn(Task),
+{
+    fn drop(&mut self) {
+        unsafe {
+            let header = self.raw.header as *mut Header;
+            (*header).scheduling = self.was_scheduling;
+            // This may release the last reference. Do not access the task again.
+            RawTask::<F, R, S>::finish(header as *const ());
+        }
+    }
+}
 
-        impl<F, R, S> Drop for Guard<F, R, S>
-        where
-            F: Future<Output = R>,
-            S: Fn(Task),
-        {
-            fn drop(&mut self) {
-                let raw = self.0;
-                let ptr = raw.header as *const ();
+/// Cancels a task and releases its runnable reference if polling unwinds.
+struct PollGuard<F, R, S>(RawTask<F, R, S>)
+where
+    F: Future<Output = R>,
+    S: Fn(Task);
 
-                unsafe {
-                    // Mark the task as not running and not scheduled.
-                    (*(raw.header as *mut Header)).state =
-                        ((*(raw.header)).state & !RUNNING & !SCHEDULED) | CLOSED;
-
-                    // Drop tasks future, and drop the task reference.
-                    // The thread that closed the task didn't drop the future because it
-                    // was running, so now it's our responsibility to do so.
-                    RawTask::<F, R, S>::drop_future(ptr);
-
-                    // Notify the awaiter that the future has been dropped.
-                    (*(raw.header as *mut Header)).notify(None);
-
-                    // Drop the task reference.
-                    RawTask::<F, R, S>::drop_task(ptr);
-                }
-            }
+impl<F, R, S> Drop for PollGuard<F, R, S>
+where
+    F: Future<Output = R>,
+    S: Fn(Task),
+{
+    fn drop(&mut self) {
+        unsafe {
+            let header = self.0.header as *mut Header;
+            (*header).state |= CLOSED | RUNNING;
+            (*header).active.store(false, Ordering::Release);
+            RawTask::<F, R, S>::drop_future(header as *const ());
+            (*header).state &= !(RUNNING | SCHEDULED);
+            Header::notify(header, None);
+            RawTask::<F, R, S>::finish(header as *const ());
+            RawTask::<F, R, S>::release(header as *const ());
         }
     }
 }

@@ -358,6 +358,11 @@ impl<T> GlommioError<T> {
         })
     }
 
+    /// Returns the value the failed operation was carrying, if there was one.
+    ///
+    /// A channel send that fails hands the item back rather than dropping it,
+    /// so the caller can retry or report it. Every other error carries no
+    /// value and returns [`None`].
     pub fn into_inner(self) -> Option<T> {
         match self {
             GlommioError::Closed(ResourceType::Channel(t)) => Some(t),

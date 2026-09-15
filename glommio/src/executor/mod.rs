@@ -541,6 +541,14 @@ impl LocalExecutorBuilder {
 
     /// Names the thread-to-be. Currently, the name is used for identification
     /// only in panic messages.
+    ///
+    /// This applies to [`LocalExecutorBuilder::spawn`] and
+    /// [`LocalExecutorPoolBuilder`], which create the threads they name.
+    /// [`LocalExecutorBuilder::make`] creates no thread: it builds an executor
+    /// that runs on the calling thread, and a thread's name is fixed when it
+    /// is created and cannot be changed afterwards. A name given to a builder
+    /// that is then `make`d therefore has no effect, and panic messages carry
+    /// whatever the calling thread was already called.
     #[must_use = "The builder must be built to be useful"]
     pub fn name(mut self, name: &str) -> LocalExecutorBuilder {
         self.name = String::from(name);

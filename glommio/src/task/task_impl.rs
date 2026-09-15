@@ -31,6 +31,7 @@ use std::sync::atomic::Ordering;
 /// [`JoinHandle`]: struct.JoinHandle.html
 pub(crate) fn spawn_local<F, R, S>(
     executor_id: usize,
+    task_queue_index: usize,
     future: F,
     schedule: S,
     latency_matters: bool,
@@ -42,9 +43,21 @@ where
     // Allocate large futures on the heap.
     let raw_task = if mem::size_of::<F>() >= 2048 {
         let future = alloc::boxed::Box::pin(future);
-        RawTask::<_, R, S>::allocate(future, schedule, executor_id, latency_matters)
+        RawTask::<_, R, S>::allocate(
+            future,
+            schedule,
+            executor_id,
+            task_queue_index,
+            latency_matters,
+        )
     } else {
-        RawTask::<_, R, S>::allocate(future, schedule, executor_id, latency_matters)
+        RawTask::<_, R, S>::allocate(
+            future,
+            schedule,
+            executor_id,
+            task_queue_index,
+            latency_matters,
+        )
     };
 
     let task = Task { raw_task };
@@ -84,6 +97,18 @@ pub struct Task {
 }
 
 impl Task {
+    /// Returns the index of the task queue this task belongs to.
+    ///
+    /// Used by the schedule function to find its queue without capturing a
+    /// reference to it, which is what keeps that closure zero-sized. See
+    /// `Header::task_queue_index`.
+    pub(crate) fn task_queue_index(&self) -> usize {
+        let header = self.raw_task.as_ptr() as *const Header;
+        // SAFETY: `raw_task` points at a live task allocation for as long as
+        // this `Task` reference exists, and the header is its first field.
+        unsafe { (*header).task_queue_index }
+    }
+
     /// Schedules the task.
     ///
     /// This is a convenience method that simply reschedules the task by passing

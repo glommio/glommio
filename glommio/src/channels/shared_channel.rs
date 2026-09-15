@@ -134,7 +134,14 @@ impl<T: BufferHalf> Future for Connector<T> {
             }
             // usize::MAX (the disconnected) always has a placeholder notifier that never
             // returns its fd. So if the other side disconnected it will unblock us here
-            id => Poll::Ready(sys::get_sleep_notifier_for(id).unwrap()),
+            id => Poll::Ready(sys::get_sleep_notifier_for(id).unwrap_or_else(|| {
+                // The id outlives the notifier: the peer's executor drops it on
+                // its own schedule, while the id stays until the peer half is.
+                // An executor that is gone cannot be woken, so it is disconnected.
+                self.buffer.disconnect_peer();
+                sys::get_sleep_notifier_for(usize::MAX)
+                    .expect("the disconnected notifier is a static and always exists")
+            })),
         }
     }
 }
@@ -485,16 +492,19 @@ impl<T: Send + Sized> Drop for ConnectedSender<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::LocalExecutor;
     use crate::{
         timer::{sleep, Timer},
         LocalExecutorBuilder, Placement,
     };
-    use futures_lite::{FutureExt, StreamExt};
+    use futures_lite::{future::poll_fn, FutureExt, StreamExt};
     use std::{
+        future::Future,
         sync::{
             atomic::{AtomicUsize, Ordering},
             mpsc, Arc,
         },
+        task::Poll,
         time::Duration,
     };
 
@@ -1010,5 +1020,30 @@ mod test {
 
         ex1.join().unwrap();
         ex2.join().unwrap();
+    }
+
+    #[test]
+    fn peer_connect_after_canceled_connection_and_retained_task_waker() {
+        let (sender, receiver) = new_bounded::<u8>(1);
+        let executor = LocalExecutor::default();
+        let retained_waker = executor.run(async move {
+            let mut connection = Box::pin(sender.connect());
+            let waker = poll_fn(|cx| {
+                assert!(connection.as_mut().poll(cx).is_pending());
+                Poll::Ready(cx.waker().clone())
+            })
+            .await;
+            drop(connection);
+            waker
+        });
+        drop(executor);
+        // The notifier is released off the executor thread, so the id outlives it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let executor = LocalExecutor::default();
+        executor.run(async move {
+            drop(receiver.connect().await);
+        });
+        drop(retained_waker);
     }
 }

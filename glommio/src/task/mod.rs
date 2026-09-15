@@ -52,6 +52,7 @@
 pub mod debugging;
 pub(crate) mod header;
 pub(crate) mod join_handle;
+mod lifecycle_tests;
 pub(crate) mod raw;
 pub(crate) mod state;
 pub(crate) mod task_impl;

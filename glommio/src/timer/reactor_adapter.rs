@@ -8,7 +8,7 @@
 //! parallel `HashMap` from timer to deadline and answered "when is the next
 //! timer" by scanning it, which made every poll cost the whole population.
 
-use slab_wheel::{Key, Millis, TimingWheel};
+use super::wheel::{Key, Millis, TimingWheel};
 use std::{
     task::Waker,
     time::{Duration, Instant},

@@ -2212,7 +2212,10 @@ pub(crate) mod test {
         let spawned_task = crate::executor()
             .spawn_local(async move {
                 crate::executor()
-                    .spawn_blocking(move || {
+                    // The oneshot halves this closure carries hold bare
+                    // `UnsafeCell`s, so the closure is not `UnwindSafe`. The
+                    // test owns both ends and reads neither after a panic.
+                    .spawn_blocking(std::panic::AssertUnwindSafe(move || {
                         let local_ex = crate::executor::LocalExecutorBuilder::new(
                             crate::executor::Placement::Unbound,
                         )
@@ -2238,7 +2241,7 @@ pub(crate) mod test {
                                 .await
                                 .expect("Close on background thread should succeed");
                         })
-                    })
+                    }))
                     .await
             })
             .detach();

@@ -127,13 +127,6 @@ impl BlockingThreadOp {
 pub(super) enum BlockingThreadResult {
     Syscall(i64),
     Fn,
-    /// An operation unwound where none should.
-    ///
-    /// Reported as an error rather than swallowed, so the caller resumes and
-    /// can see something went wrong. It carries a real errno because the
-    /// result travels through `OsResult`, which reads `raw_os_error` and
-    /// unwraps it: an error with no OS code behind it panics on the way back.
-    Panicked,
 }
 
 impl TryFrom<BlockingThreadResult> for std::io::Result<usize> {
@@ -143,7 +136,6 @@ impl TryFrom<BlockingThreadResult> for std::io::Result<usize> {
         match value {
             BlockingThreadResult::Syscall(x) => Ok(to_result(x)),
             BlockingThreadResult::Fn => Ok(Ok(0)),
-            BlockingThreadResult::Panicked => Ok(Err(io::Error::from_raw_os_error(libc::EIO))),
         }
     }
 }
@@ -177,19 +169,12 @@ impl BlockingThread {
     /// instead of failing. Panicking there used to take the process with it
     /// under `panic = "abort"`.
     ///
-    /// The loop catches an unwinding operation rather than letting it end the
-    /// loop. A worker that dies mid-operation never sends its response and
-    /// never notifies the reactor, so the awaiting task waits forever, and the
-    /// pool is one thread smaller for the life of the executor; once every
-    /// worker has gone that way, submitting work fails and takes the executor
-    /// thread with it.
-    ///
-    /// Nothing reaches that path today. [`crate::executor::ExecutorProxy::spawn_blocking`]
-    /// guards the caller's closure where it is built, and the syscall
-    /// operations answer `EFAULT` rather than panicking. It is here because
-    /// `run_blocking` is reachable from anywhere in the crate, so the next
-    /// caller to submit an unguarded closure would otherwise reinstate the
-    /// hang.
+    /// The loop does not guard against an unwinding operation, because none
+    /// can reach it. [`crate::executor::ExecutorProxy::spawn_blocking`]
+    /// catches where the closure is built, and the syscall operations answer
+    /// `EFAULT` rather than panicking. A guard here would have to assert
+    /// unwind safety over the caller's closure a second time, to protect
+    /// against something that cannot happen.
     pub(super) fn new(
         reactor_sleep_notifier: Arc<SleepNotifier>,
         rx: Arc<Receiver<BlockingThreadReq>>,
@@ -201,20 +186,15 @@ impl BlockingThread {
                 bind_to_cpu_set(bindings).expect("failed to bind blocking thread");
             }
             while let Ok(el) = rx.recv() {
+                let res = el.op.execute();
                 let id = el.id;
-                let latency_sensitive = el.latency_sensitive;
-
-                let res =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| el.op.execute()))
-                        .unwrap_or(BlockingThreadResult::Panicked);
-
                 let resp = BlockingThreadResp { id, res };
 
                 if tx.send(resp).is_err() {
                     warn!("blocking job {id} finished after its executor went away");
                     break;
                 }
-                reactor_sleep_notifier.notify(latency_sensitive);
+                reactor_sleep_notifier.notify(el.latency_sensitive);
             }
         }))
     }

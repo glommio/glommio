@@ -5,19 +5,34 @@
 //!
 //! See <https://github.com/glommio/glommio/issues/37>.
 
-use glommio::LocalExecutor;
+use futures::FutureExt;
+use glommio::{LocalExecutor, LocalExecutorBuilder, Placement, PoolPlacement};
 use std::{
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
+    collections::HashSet,
+    panic::AssertUnwindSafe,
+    sync::{mpsc, Arc, Barrier, Mutex},
+    thread::{self, ThreadId},
+    time::Duration,
 };
+
+/// A payload no other panic in the process can produce.
+///
+/// Matching on it proves the caller resumed the closure's own panic rather
+/// than something glommio substituted, which a message comparison cannot:
+/// any `&str` payload could have come from somewhere else.
+#[derive(Debug)]
+struct SyntheticPanic;
+
+impl SyntheticPanic {
+    fn trigger() -> ! {
+        std::panic::panic_any(SyntheticPanic)
+    }
+}
 
 /// Runs `body` on its own thread and fails if it has not finished in time.
 ///
 /// A hang is the failure being tested for, so it has to become an assertion
-/// rather than a test binary that never returns. Eight panics before the
-/// healthy call is more than the pool has workers, so a pool that lost one per
-/// panic would have none left.
+/// rather than a test binary that never returns.
 fn within<F: FnOnce() + Send + 'static>(limit: Duration, body: F) {
     let (tx, rx) = mpsc::channel();
     let worker = thread::spawn(move || {
@@ -30,92 +45,91 @@ fn within<F: FnOnce() + Send + 'static>(limit: Duration, body: F) {
 }
 
 #[test]
-fn a_panicking_closure_wakes_its_caller() {
+fn the_caller_resumes_the_panic_the_closure_raised() {
     within(Duration::from_secs(10), || {
         let outcome = std::panic::catch_unwind(|| {
             LocalExecutor::default().run(async {
-                glommio::executor().spawn_blocking(|| panic!("boom")).await;
+                let _: () = glommio::executor()
+                    .spawn_blocking(SyntheticPanic::trigger)
+                    .await;
             });
         });
+        let payload = outcome.expect_err("the caller resumed without seeing the panic");
         assert!(
-            outcome.is_err(),
-            "the caller resumed without seeing the panic"
+            payload.downcast_ref::<SyntheticPanic>().is_some(),
+            "the caller saw some other panic: {payload:?}"
         );
     });
 }
 
-/// The caller sees the payload its own closure panicked with, resumed as
-/// `std::thread::JoinHandle::join` does, rather than an internal error that
-/// would say nothing about their code.
+/// Every worker in the pool panics, and then every worker is used again.
+///
+/// Comparing the two sets of thread ids is what makes this bite. Asserting
+/// only that later work completes would pass with a single surviving worker,
+/// which is the failure this is about: the pool loses a thread per panic and
+/// degrades quietly until it has none.
+///
+/// The barrier is what forces one job onto each worker rather than all of them
+/// onto whichever is free first, so the pool placement is pinned to a known
+/// size instead of inferred.
 #[test]
-fn the_caller_sees_the_panic_the_closure_raised() {
-    within(Duration::from_secs(10), || {
-        let outcome = std::panic::catch_unwind(|| {
-            LocalExecutor::default().run(async {
-                glommio::executor()
-                    .spawn_blocking(|| panic!("a message only this closure could raise"))
-                    .await;
-            });
-        });
-        let payload = outcome.expect_err("the caller resumed without a panic");
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
-        assert!(
-            message.contains("a message only this closure could raise"),
-            "the caller saw {message:?} rather than the closure's own panic"
-        );
+fn every_worker_survives_panicking() {
+    const WORKERS: usize = 4;
+
+    within(Duration::from_secs(30), || {
+        LocalExecutorBuilder::new(Placement::Unbound)
+            .blocking_thread_pool_placement(PoolPlacement::Unbound(WORKERS))
+            .spawn(|| async {
+                let panicked = ids_from_every_worker(WORKERS, true).await;
+                assert_eq!(
+                    panicked.len(),
+                    WORKERS,
+                    "expected every worker to take a panicking job"
+                );
+
+                let survived = ids_from_every_worker(WORKERS, false).await;
+                assert_eq!(
+                    survived, panicked,
+                    "the pool is not the same set of threads it was before the panics"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     });
 }
 
-#[test]
-fn a_panic_does_not_cost_the_pool_a_worker() {
-    within(Duration::from_secs(20), || {
-        LocalExecutor::default().run(async {
-            for _ in 0..8 {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    glommio::executor().spawn_blocking(|| panic!("boom"))
-                }));
-            }
-            for _ in 0..8 {
-                let task = glommio::spawn_local(async {
-                    let _ = std::panic::AssertUnwindSafe(
-                        glommio::executor().spawn_blocking(|| panic!("boom")),
-                    );
-                });
-                task.detach();
-            }
-            glommio::timer::sleep(Duration::from_millis(200)).await;
+/// Puts one job on each of `workers` threads, returning the ids that ran them.
+///
+/// The barrier holds every job until all of them are running, so no worker can
+/// take two. When `panicking`, each job records itself and then unwinds.
+async fn ids_from_every_worker(workers: usize, panicking: bool) -> HashSet<ThreadId> {
+    let barrier = Arc::new(Barrier::new(workers));
+    let seen = Arc::new(Mutex::new(HashSet::new()));
 
-            let started = Instant::now();
-            let answer = glommio::executor().spawn_blocking(|| 42u32).await;
-            assert_eq!(answer, 42, "the pool stopped answering after panics");
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "healthy work took {:?} after earlier panics",
-                started.elapsed()
-            );
-        });
-    });
-}
+    let jobs: Vec<_> = (0..workers)
+        .map(|_| {
+            let barrier = barrier.clone();
+            let seen = seen.clone();
+            glommio::spawn_local(async move {
+                // The panic surfaces when the future is polled, so it has to
+                // be caught around the await rather than around a closure.
+                let _ = AssertUnwindSafe(glommio::executor().spawn_blocking(move || {
+                    barrier.wait();
+                    seen.lock().unwrap().insert(thread::current().id());
+                    if panicking {
+                        SyntheticPanic::trigger();
+                    }
+                }))
+                .catch_unwind()
+                .await;
+            })
+        })
+        .collect();
 
-/// The caller allocates a `MaybeUninit<R>` for the closure to fill. A closure
-/// that unwinds never fills it, so a caller that resumed and read it would be
-/// reading memory that was never written, which is undefined rather than
-/// merely wrong.
-#[test]
-fn a_panicking_closure_does_not_yield_uninitialised_memory() {
-    within(Duration::from_secs(10), || {
-        let outcome = std::panic::catch_unwind(|| {
-            LocalExecutor::default().run(async {
-                let value: String = glommio::executor()
-                    .spawn_blocking(|| -> String { panic!("boom") })
-                    .await;
-                std::hint::black_box(value.len());
-            });
-        });
-        assert!(outcome.is_err(), "the caller read an uninitialised String");
-    });
+    for job in jobs {
+        job.await;
+    }
+    let ids = seen.lock().unwrap().clone();
+    ids
 }

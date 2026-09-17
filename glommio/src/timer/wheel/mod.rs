@@ -3,6 +3,10 @@
 //
 //! A hierarchical timing wheel with stable handles.
 //!
+//! The reactor keeps its timers here. The module is public only when
+//! benchmarking, the way [`crate::nop`] is, so the wheel benchmarks can reach
+//! it without widening the crate's API.
+//!
 //! Entries live in a slab; the wheel's slots hold indices into it. Cascading
 //! therefore moves four-byte indices between slots rather than whole entries,
 //! and a handle stays valid for an entry's whole life however many times it

@@ -11,10 +11,6 @@ pub(crate) use wheel::Key as TimerId;
 
 pub(crate) mod reactor_adapter;
 
-/// The timing wheel the reactor keeps its timers in.
-///
-/// Public only when benchmarking, the way [`crate::nop`] is, so the standalone
-/// wheel benchmarks can reach it without widening the crate's API.
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 pub mod wheel;

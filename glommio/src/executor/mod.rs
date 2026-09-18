@@ -54,7 +54,6 @@ use std::{
     io,
     marker::PhantomData,
     ops::Deref,
-    panic::UnwindSafe,
     pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
@@ -2882,21 +2881,20 @@ impl ExecutorProxy {
     /// a panic that was swallowed here would leave the caller to read memory
     /// that was never written.
     ///
-    /// `func` must be [`UnwindSafe`], so that the decision about whether a
-    /// panic leaves shared state worth distrusting belongs to the caller
-    /// rather than to glommio. glommio cannot make it: it receives a boxed
-    /// closure and never sees what was captured. A closure that shares state
-    /// the bound rejects, a `oneshot` sender for instance, can still be passed
-    /// by wrapping it in [`std::panic::AssertUnwindSafe`], which implements
-    /// `FnOnce` and needs no other change at the call site.
+    /// `func` is asserted unwind safe rather than required to be, which is
+    /// what `rayon` does and for its reason: the panic is resumed rather than
+    /// swallowed, so nothing inside glommio ever observes state the panic tore.
+    /// A caller that catches the resumed panic and then reads state the closure
+    /// shared is in the same position as one calling [`std::thread::spawn`],
+    /// which takes no such bound either.
     pub fn spawn_blocking<F, R>(&self, func: F) -> impl Future<Output = R>
     where
-        F: FnOnce() -> R + Send + UnwindSafe + 'static,
+        F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
         let outcome = Arc::new(Mutex::new(BlockingOutcome::Pending));
         let f_inner = enclose::enclose!((outcome) move || {
-            let produced = match std::panic::catch_unwind(func) {
+            let produced = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) {
                 Ok(value) => BlockingOutcome::Produced(value),
                 Err(payload) => BlockingOutcome::Panicked(payload),
             };

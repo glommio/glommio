@@ -13,8 +13,7 @@ use std::{
     ffi::CString,
     future::Future,
     io,
-    os::unix::{ffi::OsStrExt, prelude::*},
-    path::{Path, PathBuf},
+    os::unix::prelude::*,
     pin::Pin,
     sync::Arc,
     thread::JoinHandle,
@@ -44,25 +43,10 @@ fn to_result(res: i64) -> io::Result<usize> {
     }
 }
 
-fn cstr(path: &Path) -> io::Result<CString> {
-    Ok(CString::new(path.as_os_str().as_bytes())?)
-}
-
-macro_rules! c_str {
-    ( $path:expr ) => {
-        match cstr($path) {
-            Ok(x) => x,
-            Err(_) => {
-                return BlockingThreadResult::Syscall(-libc::EFAULT as i64);
-            }
-        }
-    };
-}
-
 pub(super) enum BlockingThreadOp {
-    Rename(PathBuf, PathBuf),
-    Remove(PathBuf),
-    CreateDir(PathBuf, libc::c_int),
+    Rename(CString, CString),
+    Remove(CString),
+    CreateDir(CString, libc::c_int),
     Truncate(RawFd, i64),
     CopyFileRange(RawFd, i64, RawFd, i64, usize),
     Fn(Box<dyn FnOnce() + Send + 'static>),
@@ -90,17 +74,13 @@ impl BlockingThreadOp {
     fn execute(self) -> BlockingThreadResult {
         match self {
             BlockingThreadOp::CreateDir(path, mode) => {
-                let p = c_str!(&path);
-                raw_syscall!(mkdir(p.as_ptr(), mode as u32))
+                raw_syscall!(mkdir(path.as_ptr(), mode as u32))
             }
             BlockingThreadOp::Rename(old, new) => {
-                let o = c_str!(&old);
-                let n = c_str!(&new);
-                raw_syscall!(rename(o.as_ptr(), n.as_ptr()))
+                raw_syscall!(rename(old.as_ptr(), new.as_ptr()))
             }
             BlockingThreadOp::Remove(path) => {
-                let p = c_str!(&path);
-                raw_syscall!(unlink(p.as_ptr()))
+                raw_syscall!(unlink(path.as_ptr()))
             }
             BlockingThreadOp::Truncate(fd, sz) => {
                 raw_syscall!(ftruncate(fd, sz))

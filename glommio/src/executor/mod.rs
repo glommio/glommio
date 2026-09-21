@@ -66,6 +66,8 @@ use tracing::trace;
 
 mod context;
 mod latch;
+#[cfg(any(not(nightly), not(feature = "native-tls")))]
+mod local_context;
 mod multitask;
 mod placement;
 pub mod stall;
@@ -88,7 +90,7 @@ use crate::Result;
 static mut LOCAL_EX: *const ExecutorContext = std::ptr::null();
 
 #[cfg(any(not(nightly), not(feature = "native-tls")))]
-scoped_tls::scoped_thread_local!(static LOCAL_EX: ExecutorContext);
+use local_context::LOCAL_EX;
 
 /// Returns a proxy struct to the [`LocalExecutor`]
 #[inline(always)]
@@ -129,11 +131,7 @@ pub fn early_init() {
 pub(crate) fn executor_id() -> Option<usize> {
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     {
-        if LOCAL_EX.is_set() {
-            Some(LOCAL_EX.with(|ex| ex.id))
-        } else {
-            None
-        }
+        LOCAL_EX.try_with(|ex| ex.id)
     }
 
     #[cfg(all(nightly, feature = "native-tls"))]
@@ -1115,11 +1113,7 @@ impl<T> PoolThreadHandles<T> {
 pub(super) fn with_executor_context<T>(f: impl FnOnce(Option<&ExecutorContext>) -> T) -> T {
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     {
-        if LOCAL_EX.is_set() {
-            LOCAL_EX.with(|context| f(Some(context)))
-        } else {
-            f(None)
-        }
+        LOCAL_EX.with_optional(f)
     }
 
     #[cfg(all(nightly, feature = "native-tls"))]
@@ -2198,8 +2192,8 @@ impl ExecutorProxy {
     pub async fn yield_if_needed(&self) {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         {
-            let need_yield = if LOCAL_EX.is_set() {
-                LOCAL_EX.with(|local_ex| {
+            let need_yield = LOCAL_EX
+                .try_with(|local_ex| {
                     if local_ex.need_preempt() {
                         local_ex.mark_me_for_yield();
                         true
@@ -2207,10 +2201,7 @@ impl ExecutorProxy {
                         false
                     }
                 })
-            } else {
-                // We are not in a glommio context
-                false
-            };
+                .unwrap_or(false);
 
             if need_yield {
                 futures_lite::future::yield_now().await;
@@ -2247,11 +2238,9 @@ impl ExecutorProxy {
     pub async fn yield_task_queue_now(&self) {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         {
-            if LOCAL_EX.is_set() {
-                LOCAL_EX.with(|local_ex| {
-                    local_ex.mark_me_for_yield();
-                })
-            }
+            LOCAL_EX.try_with(|local_ex| {
+                local_ex.mark_me_for_yield();
+            });
             futures_lite::future::yield_now().await;
         }
 

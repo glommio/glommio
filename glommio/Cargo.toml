@@ -100,6 +100,10 @@ name    = "preempt"
 
 [[bench]]
 harness = false
+name    = "socket_io"
+
+[[bench]]
+harness = false
 name    = "tcp"
 
 [[bench]]

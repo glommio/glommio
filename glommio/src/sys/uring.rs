@@ -596,7 +596,9 @@ fn record_stats<Ring: UringCommon>(
     src: &mut InnerSource,
     res: &io::Result<usize>,
 ) {
-    src.wakers.fulfilled_at = Some(Instant::now());
+    if records_latency(src) {
+        src.wakers.fulfilled_at = Some(Instant::now());
+    }
     if let Some(fulfilled) = src.stats_collection.and_then(|x| x.fulfilled) {
         fulfilled(res, ring.io_stats_mut(), 1);
         if let Some(handle) = src.task_queue {
@@ -636,13 +638,27 @@ fn peek_one_chain(queue: &VecDeque<UringDescriptor>, ring_size: usize) -> Option
     Some(0..chain + 1)
 }
 
+/// Whether this source's timestamps will ever be read.
+///
+/// `queued_at`, `submitted_at` and `fulfilled_at` exist to be subtracted from
+/// each other in `Source::consume_result`, and only when a latency collection
+/// function is installed -- which `record_io_latencies` does, off by default.
+/// Taking the three clock readings regardless costs every I/O three
+/// `clock_gettime` calls for fields nobody looks at.
+///
+/// This is why `submit_event_chain` carries its reading as an `Option`: a
+/// chain whose sources all answer `false` here never reads the clock at all.
+fn records_latency(src: &InnerSource) -> bool {
+    src.stats_collection.and_then(|x| x.latency).is_some()
+}
+
 /// Extract a chain of events from the queue.
 /// The chain be empty if the sources were cancelled
 fn extract_one_chain(
     source_map: &mut SourceMap,
     queue: &mut VecDeque<UringDescriptor>,
     chain: Range<usize>,
-    now: Instant,
+    now: &mut Option<Instant>,
 ) -> SmallVec<[UringDescriptor; 1]> {
     queue
         .drain(chain)
@@ -650,7 +666,9 @@ fn extract_one_chain(
             if op.user_data > 0 {
                 let id = from_user_data(op.user_data);
                 let status = source_map.peek_source_mut(from_user_data(op.user_data), |mut x| {
-                    x.wakers.submitted_at = Some(now);
+                    if records_latency(&x) {
+                        x.wakers.submitted_at = Some(*now.get_or_insert_with(Instant::now));
+                    }
                     let current = x.enqueued.as_mut().expect("bug");
                     match current.status {
                         EnqueuedStatus::Enqueued => {
@@ -687,7 +705,7 @@ fn submit_event_chain(
     queue: &mut VecDeque<UringDescriptor>,
     ring_size: usize,
 ) -> Option<bool> {
-    let now = Instant::now();
+    let mut now = None;
 
     while let Some(chain) = peek_one_chain(queue, ring_size) {
         let mut sq = ring.submission();
@@ -695,7 +713,7 @@ fn submit_event_chain(
             return None;
         }
 
-        let ops = extract_one_chain(source_map, queue, chain, now);
+        let ops = extract_one_chain(source_map, queue, chain, &mut now);
         if ops.is_empty() {
             continue;
         }
@@ -2190,7 +2208,11 @@ fn queue_request_into_ring(
     descriptor: UringOpDescriptor,
     source_map: &mut SourceMap,
 ) {
-    source.inner.borrow_mut().wakers.queued_at = Some(Instant::now());
+    let mut inner = source.inner.borrow_mut();
+    if records_latency(&inner) {
+        inner.wakers.queued_at = Some(Instant::now());
+    }
+    drop(inner);
     let q = ring.submission_queue();
     let id = source_map.add_source(source, Rc::clone(&q));
 

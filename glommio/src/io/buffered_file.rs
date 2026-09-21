@@ -320,8 +320,11 @@ mod test {
 
         std::assert!(path.join("testfile").exists());
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 2);
     });
 
@@ -360,10 +363,15 @@ mod test {
         writer.close().await.unwrap();
         reader.close().await.unwrap();
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_buffered_reads(), (3, 15));
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_buffered_writes(), (1, 6));
     });
 

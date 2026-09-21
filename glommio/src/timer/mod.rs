@@ -35,6 +35,11 @@ pub async fn sleep(wait: std::time::Duration) {
 /// Returns a `Result`, with `Ok` if the future ran to completion
 /// or a [`GlommioError::TimedOut`] error if the timeout was reached
 ///
+/// This one accepts only futures that already return glommio's own
+/// [`crate::Result`], and flattens the two failures into one. For a
+/// future returning anything else, or to keep the two apart, use
+/// [`future::timeout`](crate::future::timeout), which this is built on.
+///
 /// ```
 /// # use glommio::{
 /// #    timer::{timeout, Timer},
@@ -57,5 +62,5 @@ pub async fn timeout<F, T>(dur: Duration, f: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
-    timer_impl::Timeout::new(f, dur).await
+    crate::future::timeout(dur, f).await?
 }

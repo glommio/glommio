@@ -431,6 +431,7 @@ pub mod channels;
 pub mod controllers;
 mod error;
 mod executor;
+pub mod future;
 pub mod io;
 pub mod net;
 mod shares;

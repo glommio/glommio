@@ -1,3 +1,4 @@
+use crate::sys::source::NativePath;
 use crate::{
     executor::bind_to_cpu_set,
     sys::{InnerSource, SleepNotifier},
@@ -10,7 +11,6 @@ use flume::{Receiver, Sender};
 use std::{
     cell::{Cell, RefCell},
     convert::{TryFrom, TryInto},
-    ffi::CString,
     future::Future,
     io,
     os::unix::prelude::*,
@@ -44,9 +44,9 @@ fn to_result(res: i64) -> io::Result<usize> {
 }
 
 pub(super) enum BlockingThreadOp {
-    Rename(CString, CString),
-    Remove(CString),
-    CreateDir(CString, libc::c_int),
+    Rename(NativePath, NativePath),
+    Remove(NativePath),
+    CreateDir(NativePath, libc::c_int),
     Truncate(RawFd, i64),
     CopyFileRange(RawFd, i64, RawFd, i64, usize),
     Fn(Box<dyn FnOnce() + Send + 'static>),

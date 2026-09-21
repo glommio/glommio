@@ -127,3 +127,37 @@ fn truncate_shortens_a_file() {
     });
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A path holding an interior NUL cannot name a file, and answers `EFAULT` on
+/// whichever path the operation takes.
+///
+/// It is worth pinning down because these operations now build the native form
+/// of the path up front rather than inside the blocking thread, and the two
+/// used to disagree.
+#[test]
+fn an_interior_nul_is_refused_the_same_way_on_both_paths() {
+    use std::path::Path;
+
+    LocalExecutorBuilder::default()
+        .spawn(|| async {
+            let path = Path::new("/tmp/glommio-interior\0nul");
+
+            for result in [
+                glommio::io::remove(path).await.map(|_| ()),
+                glommio::io::rename(path, "/tmp/glommio-elsewhere")
+                    .await
+                    .map(|_| ()),
+                glommio::io::Directory::create(path).await.map(|_| ()),
+            ] {
+                let err = result.expect_err("a path with an interior NUL names nothing");
+                assert_eq!(
+                    std::io::Error::from(err).raw_os_error(),
+                    Some(libc::EFAULT),
+                    "the answer should be the same as it was before the path was built up front"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

@@ -3,6 +3,7 @@
 //!
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
+
 use alloc::alloc::Layout;
 use log::warn;
 use nix::{
@@ -24,10 +25,13 @@ use std::{
     ptr,
     rc::Rc,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use io_uring::{cqueue, opcode, squeue, types, CompletionStatus, IoUring};
+
+#[cfg(feature = "stats")]
+use crate::{IoStats, RingIoStats, TaskQueueHandle};
 
 use crate::{
     free_list::{FreeList, Idx},
@@ -38,12 +42,15 @@ use crate::{
         membarrier, DirectIo, EnqueuedSource, EnqueuedStatus, InnerSource, IoBuffer,
         PollableStatus, SockAddrStorage, Source, SourceType, Statx, TimeSpec64,
     },
-    GlommioError, IoRequirements, IoStats, ReactorErrorKind, RingIoStats, TaskQueueHandle,
+    GlommioError, IoRequirements, ReactorErrorKind,
 };
+#[cfg(feature = "stats")]
 use ahash::AHashMap;
 use buddy_alloc::buddy_alloc::{BuddyAlloc, BuddyAllocParam};
 use nix::sys::socket::{MsgFlags, SockFlag};
 use smallvec::SmallVec;
+#[cfg(feature = "stats")]
+use std::time::Instant;
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -591,12 +598,12 @@ fn transmute_error(res: i32) -> io::Result<usize> {
     })
 }
 
+#[cfg(feature = "stats")]
 fn record_stats<Ring: UringCommon>(
     ring: &mut Ring,
     src: &mut InnerSource,
     res: &io::Result<usize>,
 ) {
-    src.wakers.fulfilled_at = Some(Instant::now());
     if let Some(fulfilled) = src.stats_collection.and_then(|x| x.fulfilled) {
         fulfilled(res, ring.io_stats_mut(), 1);
         if let Some(handle) = src.task_queue {
@@ -642,7 +649,7 @@ fn extract_one_chain(
     source_map: &mut SourceMap,
     queue: &mut VecDeque<UringDescriptor>,
     chain: Range<usize>,
-    now: Instant,
+    #[cfg(feature = "stats")] now: &mut Option<Instant>,
 ) -> SmallVec<[UringDescriptor; 1]> {
     queue
         .drain(chain)
@@ -650,7 +657,10 @@ fn extract_one_chain(
             if op.user_data > 0 {
                 let id = from_user_data(op.user_data);
                 let status = source_map.peek_source_mut(from_user_data(op.user_data), |mut x| {
-                    x.wakers.submitted_at = Some(now);
+                    #[cfg(feature = "stats")]
+                    if x.wakers.queued_at.is_some() {
+                        x.wakers.submitted_at = Some(*now.get_or_insert_with(Instant::now));
+                    }
                     let current = x.enqueued.as_mut().expect("bug");
                     match current.status {
                         EnqueuedStatus::Enqueued => {
@@ -687,7 +697,8 @@ fn submit_event_chain(
     queue: &mut VecDeque<UringDescriptor>,
     ring_size: usize,
 ) -> Option<bool> {
-    let now = Instant::now();
+    #[cfg(feature = "stats")]
+    let mut now = None;
 
     while let Some(chain) = peek_one_chain(queue, ring_size) {
         let mut sq = ring.submission();
@@ -695,7 +706,13 @@ fn submit_event_chain(
             return None;
         }
 
-        let ops = extract_one_chain(source_map, queue, chain, now);
+        let ops = extract_one_chain(
+            source_map,
+            queue,
+            chain,
+            #[cfg(feature = "stats")]
+            &mut now,
+        );
         if ops.is_empty() {
             continue;
         }
@@ -834,7 +851,9 @@ pub(crate) trait UringCommon {
     /// up and `Some(false)` for not.
     fn consume_one_event(&mut self) -> Option<bool>;
     fn name(&self) -> &'static str;
+    #[cfg(feature = "stats")]
     fn io_stats_mut(&mut self) -> &mut RingIoStats;
+    #[cfg(feature = "stats")]
     fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats;
     fn submitter(&mut self) -> io_uring::Submitter<'_>;
     fn may_rush(&self) -> bool {
@@ -937,7 +956,9 @@ struct PollRing {
     size: usize,
     submission_queue: ReactorQueue,
     allocator: Rc<UringBufferAllocator>,
+    #[cfg(feature = "stats")]
     stats: RingIoStats,
+    #[cfg(feature = "stats")]
     task_queue_stats: AHashMap<TaskQueueHandle, RingIoStats>,
     source_map: Rc<RefCell<SourceMap>>,
     in_kernel: usize,
@@ -955,7 +976,9 @@ impl PollRing {
             ring,
             submission_queue: UringQueueState::with_capacity(size * 4),
             allocator,
+            #[cfg(feature = "stats")]
             stats: RingIoStats::default(),
+            #[cfg(feature = "stats")]
             task_queue_stats: AHashMap::new(),
             source_map,
             in_kernel: 0,
@@ -972,10 +995,12 @@ impl UringCommon for PollRing {
         "poll"
     }
 
+    #[cfg(feature = "stats")]
     fn io_stats_mut(&mut self) -> &mut RingIoStats {
         &mut self.stats
     }
 
+    #[cfg(feature = "stats")]
     fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats {
         self.task_queue_stats.entry(handle).or_default()
     }
@@ -1025,8 +1050,13 @@ impl UringCommon for PollRing {
         process_one_event(
             cqe,
             |_| None,
-            |mut src, res| {
+            |#[allow(unused_mut, unused_variables)] mut src, res| {
+                #[cfg(feature = "stats")]
                 record_stats(self, &mut src, &res);
+                #[cfg(feature = "stats")]
+                if src.wakers.queued_at.is_some() {
+                    src.wakers.fulfilled_at = Some(Instant::now());
+                }
                 res
             },
             source_map,
@@ -1053,7 +1083,9 @@ struct SleepableRing {
     submission_queue: ReactorQueue,
     name: &'static str,
     allocator: Rc<UringBufferAllocator>,
+    #[cfg(feature = "stats")]
     stats: RingIoStats,
+    #[cfg(feature = "stats")]
     task_queue_stats: AHashMap<TaskQueueHandle, RingIoStats>,
     source_map: Rc<RefCell<SourceMap>>,
     in_kernel: usize,
@@ -1073,7 +1105,9 @@ impl SleepableRing {
             submission_queue: UringQueueState::with_capacity(size * 4),
             name,
             allocator,
+            #[cfg(feature = "stats")]
             stats: RingIoStats::default(),
+            #[cfg(feature = "stats")]
             task_queue_stats: AHashMap::new(),
             source_map,
             in_kernel: 0,
@@ -1093,7 +1127,9 @@ impl SleepableRing {
             IoRequirements::default(),
             -1,
             SourceType::Timeout(TimeSpec64::try_from(d).unwrap(), 0),
+            #[cfg(feature = "stats")]
             None,
+            #[cfg(feature = "stats")]
             None,
         );
         let op = match &*source.source_type() {
@@ -1129,7 +1165,9 @@ impl SleepableRing {
             IoRequirements::default(),
             -1,
             SourceType::Timeout(TimeSpec64::MAX, min_events),
+            #[cfg(feature = "stats")]
             None,
+            #[cfg(feature = "stats")]
             None,
         );
 
@@ -1292,10 +1330,12 @@ impl UringCommon for SleepableRing {
         self.name
     }
 
+    #[cfg(feature = "stats")]
     fn io_stats_mut(&mut self) -> &mut RingIoStats {
         &mut self.stats
     }
 
+    #[cfg(feature = "stats")]
     fn io_stats_for_task_queue_mut(&mut self, handle: TaskQueueHandle) -> &mut RingIoStats {
         self.task_queue_stats.entry(handle).or_default()
     }
@@ -1352,8 +1392,13 @@ impl UringCommon for SleepableRing {
                 SourceType::LinkRings => Some(()),
                 _ => None,
             },
-            |mut src, res| {
+            |#[allow(unused_mut, unused_variables)] mut src, res| {
+                #[cfg(feature = "stats")]
                 record_stats(self, &mut src, &res);
+                #[cfg(feature = "stats")]
+                if src.wakers.queued_at.is_some() {
+                    src.wakers.fulfilled_at = Some(Instant::now());
+                }
                 if let SourceType::ForeignNotifier(_, installed) = &mut src.source_type {
                     *installed = false;
                 }
@@ -1513,7 +1558,9 @@ impl Reactor {
             IoRequirements::default(),
             notifier.eventfd_fd(),
             SourceType::ForeignNotifier(0, false),
+            #[cfg(feature = "stats")]
             None,
+            #[cfg(feature = "stats")]
             None,
         );
 
@@ -1902,7 +1949,9 @@ impl Reactor {
             IoRequirements::default(),
             self.link_fd,
             SourceType::LinkRings,
+            #[cfg(feature = "stats")]
             None,
+            #[cfg(feature = "stats")]
             None,
         );
         ring.sleep(&link_rings).or_else(Self::busy_ok).map(|_| {})
@@ -2137,6 +2186,7 @@ impl Reactor {
         }
     }
 
+    #[cfg(feature = "stats")]
     pub fn io_stats(&self) -> IoStats {
         IoStats::new(
             std::mem::take(&mut self.main_ring.borrow_mut().stats),
@@ -2145,6 +2195,7 @@ impl Reactor {
         )
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn task_queue_io_stats(&self, h: &TaskQueueHandle) -> Option<IoStats> {
         let main = self
             .main_ring
@@ -2183,7 +2234,16 @@ fn queue_request_into_ring(
     descriptor: UringOpDescriptor,
     source_map: &mut SourceMap,
 ) {
-    source.inner.borrow_mut().wakers.queued_at = Some(Instant::now());
+    #[cfg(feature = "stats")]
+    if source
+        .inner
+        .borrow()
+        .stats_collection
+        .and_then(|stats| stats.latency)
+        .is_some()
+    {
+        source.inner.borrow_mut().wakers.queued_at = Some(Instant::now());
+    }
     let q = ring.submission_queue();
     let id = source_map.add_source(source, Rc::clone(&q));
 
@@ -2293,7 +2353,9 @@ mod tests {
                     TimeSpec64::try_from(Duration::from_millis(millis)).unwrap(),
                     0,
                 ),
+                #[cfg(feature = "stats")]
                 None,
+                #[cfg(feature = "stats")]
                 None,
             );
             let op = match &*source.source_type() {

@@ -32,6 +32,9 @@
 
 #![warn(missing_docs, missing_debug_implementations)]
 
+#[cfg(feature = "stats")]
+use crate::IoStats;
+
 use crate::{
     error::BuilderErrorKind,
     executor::stall::StallDetector,
@@ -39,7 +42,7 @@ use crate::{
     parking, reactor,
     sys::{self, blocking::BlockingThreadPool},
     task::{self, waker_fn::dummy_waker},
-    GlommioError, IoRequirements, IoStats, Latency, Reactor, Shares,
+    GlommioError, IoRequirements, Latency, Reactor, Shares,
 };
 use ahash::AHashMap;
 use futures_lite::pin;
@@ -509,7 +512,10 @@ pub struct LocalExecutorBuilder {
     /// How often to yield to other task queues
     preempt_timer_duration: Duration,
     /// Whether to record the latencies of individual IO requests
+    #[cfg(feature = "stats")]
     record_io_latencies: bool,
+    #[cfg(feature = "stats")]
+    record_io_stats: bool,
     /// The placement policy of the blocking thread pool
     /// Defaults to one thread using the same placement strategy as the host
     /// executor
@@ -534,7 +540,10 @@ impl LocalExecutorBuilder {
             io_memory: DEFAULT_IO_MEMORY,
             ring_depth: DEFAULT_RING_SUBMISSION_DEPTH,
             preempt_timer_duration: DEFAULT_PREEMPT_TIMER,
+            #[cfg(feature = "stats")]
             record_io_latencies: false,
+            #[cfg(feature = "stats")]
+            record_io_stats: true,
             blocking_thread_pool_placement: PoolPlacement::from(placement),
             detect_stalls: None,
         }
@@ -600,8 +609,20 @@ impl LocalExecutorBuilder {
     /// Whether to record the latencies of individual IO requests as part of the
     /// IO stats. Recording latency can be expensive. Disabled by default.
     #[must_use = "The builder must be built to be useful"]
+    #[cfg(feature = "stats")]
     pub fn record_io_latencies(mut self, enabled: bool) -> LocalExecutorBuilder {
         self.record_io_latencies = enabled;
+        self
+    }
+
+    /// Whether to record IO operation and byte counters. Enabled by default.
+    /// NOTE: A future change may default IO stats collection to off so if you need
+    /// this, please enable it explicitly to protect against future changes to the
+    /// default.
+    #[must_use = "The builder must be built to be useful"]
+    #[cfg(feature = "stats")]
+    pub fn record_io_stats(mut self, enabled: bool) -> LocalExecutorBuilder {
+        self.record_io_stats = enabled;
         self
     }
 
@@ -658,7 +679,10 @@ impl LocalExecutorBuilder {
                 io_memory: self.io_memory,
                 ring_depth: self.ring_depth,
                 preempt_timer: self.preempt_timer_duration,
+                #[cfg(feature = "stats")]
                 record_io_latencies: self.record_io_latencies,
+                #[cfg(feature = "stats")]
+                record_io_stats: self.record_io_stats,
                 spin_before_park: self.spin_before_park,
                 thread_pool_placement: self.blocking_thread_pool_placement,
                 detect_stalls: self.detect_stalls,
@@ -726,7 +750,10 @@ impl LocalExecutorBuilder {
         let preempt_timer_duration = self.preempt_timer_duration;
         let spin_before_park = self.spin_before_park;
         let detect_stalls = self.detect_stalls;
+        #[cfg(feature = "stats")]
         let record_io_latencies = self.record_io_latencies;
+        #[cfg(feature = "stats")]
+        let record_io_stats = self.record_io_stats;
         let blocking_thread_pool_placement = self.blocking_thread_pool_placement;
 
         Builder::new()
@@ -739,7 +766,10 @@ impl LocalExecutorBuilder {
                         io_memory,
                         ring_depth,
                         preempt_timer: preempt_timer_duration,
+                        #[cfg(feature = "stats")]
                         record_io_latencies,
+                        #[cfg(feature = "stats")]
+                        record_io_stats,
                         spin_before_park,
                         thread_pool_placement: blocking_thread_pool_placement,
                         detect_stalls,
@@ -802,7 +832,10 @@ pub struct LocalExecutorPoolBuilder {
     /// Indicates a policy by which [`LocalExecutor`]s are bound to CPUs.
     placement: PoolPlacement,
     /// Whether to record the latencies of individual IO requests
+    #[cfg(feature = "stats")]
     record_io_latencies: bool,
+    #[cfg(feature = "stats")]
+    record_io_stats: bool,
     /// The placement policy of the blocking thread pools. Each executor has
     /// its own pool. Defaults to 1 thread per pool, bound using the same
     /// placement strategy as its host executor
@@ -815,13 +848,17 @@ pub struct LocalExecutorPoolBuilder {
 
 impl fmt::Debug for LocalExecutorPoolBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LocalExecutorPoolBuilder")
+        let mut debug = f.debug_struct("LocalExecutorPoolBuilder");
+        #[cfg(feature = "stats")]
+        debug.field("record_io_latencies", &self.record_io_latencies);
+        #[cfg(feature = "stats")]
+        debug.field("record_io_stats", &self.record_io_stats);
+        debug
             .field("spin_before_park", &self.spin_before_park)
             .field("name", &self.name)
             .field("io_memory", &self.io_memory)
             .field("ring_depth", &self.ring_depth)
             .field("preempt_timer_duration", &self.preempt_timer_duration)
-            .field("record_io_latencies", &self.record_io_latencies)
             .field(
                 "blocking_thread_pool_placement",
                 &self.blocking_thread_pool_placement,
@@ -844,7 +881,10 @@ impl LocalExecutorPoolBuilder {
             ring_depth: DEFAULT_RING_SUBMISSION_DEPTH,
             preempt_timer_duration: DEFAULT_PREEMPT_TIMER,
             placement: placement.clone(),
+            #[cfg(feature = "stats")]
             record_io_latencies: false,
+            #[cfg(feature = "stats")]
+            record_io_stats: true,
             blocking_thread_pool_placement: placement.shrink_to(1),
             handler_gen: None,
         }
@@ -898,8 +938,17 @@ impl LocalExecutorPoolBuilder {
     /// Whether to record the latencies of individual IO requests as part of the
     /// IO stats. Recording latency can be expensive. Disabled by default.
     #[must_use = "The builder must be built to be useful"]
+    #[cfg(feature = "stats")]
     pub fn record_io_latencies(mut self, enabled: bool) -> Self {
         self.record_io_latencies = enabled;
+        self
+    }
+
+    /// Whether to record IO operation and byte counters. Enabled by default.
+    #[must_use = "The builder must be built to be useful"]
+    #[cfg(feature = "stats")]
+    pub fn record_io_stats(mut self, enabled: bool) -> Self {
+        self.record_io_stats = enabled;
         self
     }
 
@@ -1006,7 +1055,10 @@ impl LocalExecutorPoolBuilder {
             let ring_depth = self.ring_depth;
             let preempt_timer_duration = self.preempt_timer_duration;
             let spin_before_park = self.spin_before_park;
+            #[cfg(feature = "stats")]
             let record_io_latencies = self.record_io_latencies;
+            #[cfg(feature = "stats")]
+            let record_io_stats = self.record_io_stats;
             let blocking_thread_pool_placement = self.blocking_thread_pool_placement.clone();
             let detect_stalls = self.handler_gen.as_ref().map(|x| (*x.deref())());
             let latch = Latch::clone(latch);
@@ -1022,7 +1074,10 @@ impl LocalExecutorPoolBuilder {
                             io_memory,
                             ring_depth,
                             preempt_timer: preempt_timer_duration,
+                            #[cfg(feature = "stats")]
                             record_io_latencies,
+                            #[cfg(feature = "stats")]
+                            record_io_stats,
                             spin_before_park,
                             thread_pool_placement: blocking_thread_pool_placement,
                             detect_stalls,
@@ -1172,7 +1227,10 @@ pub struct LocalExecutorConfig {
     pub io_memory: usize,
     pub ring_depth: usize,
     pub preempt_timer: Duration,
+    #[cfg(feature = "stats")]
     pub record_io_latencies: bool,
+    #[cfg(feature = "stats")]
+    pub record_io_stats: bool,
     pub spin_before_park: Option<Duration>,
     pub thread_pool_placement: PoolPlacement,
     pub detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
@@ -1275,7 +1333,10 @@ impl LocalExecutor {
                 notifier,
                 config.io_memory,
                 config.ring_depth,
+                #[cfg(feature = "stats")]
                 config.record_io_latencies,
+                #[cfg(feature = "stats")]
+                config.record_io_stats,
                 blocking_thread,
             )?),
             stall_detector: RefCell::new(
@@ -2663,6 +2724,7 @@ impl ExecutorProxy {
     /// ```
     ///
     /// [`IoStats`]: crate::IoStats
+    #[cfg(feature = "stats")]
     pub fn io_stats(&self) -> IoStats {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         return LOCAL_EX.with(|local_ex| local_ex.get_reactor().io_stats());
@@ -2703,6 +2765,7 @@ impl ExecutorProxy {
     /// ```
     ///
     /// [`IoStats`]: crate::IoStats
+    #[cfg(feature = "stats")]
     pub fn task_queue_io_stats(&self, handle: TaskQueueHandle) -> Result<IoStats> {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         return LOCAL_EX.with(|local_ex| {
@@ -4497,11 +4560,9 @@ mod test {
         LocalExecutor::default().run(async {});
 
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
-
         assert!(!LOCAL_EX.is_set());
 
         #[cfg(all(nightly, feature = "native-tls"))]
-
         assert!(unsafe { LOCAL_EX.is_null() });
     }
 
@@ -4515,11 +4576,9 @@ mod test {
         assert!(res.is_err());
 
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
-
         assert!(!LOCAL_EX.is_set());
 
         #[cfg(all(nightly, feature = "native-tls"))]
-
         assert!(unsafe { LOCAL_EX.is_null() });
     }
 }

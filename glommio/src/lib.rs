@@ -355,9 +355,10 @@ macro_rules! test_executor {
     ($( $fut:expr ),+ ) => {
     use futures::future::join_all;
 
-    let local_ex = crate::executor::LocalExecutorBuilder::new(crate::executor::Placement::Unbound)
-            .record_io_latencies(true)
-            .make()
+    let builder = crate::executor::LocalExecutorBuilder::new(crate::executor::Placement::Unbound);
+    #[cfg(feature = "stats")]
+    let builder = builder.record_io_latencies(true);
+    let local_ex = builder.make()
             .unwrap();
     local_ex.run(async move {
         let mut joins = Vec::new();
@@ -458,11 +459,13 @@ pub use crate::{
 };
 pub use enclose::enclose;
 pub use scopeguard::defer;
+#[cfg(feature = "stats")]
 use sketches_ddsketch::DDSketch;
+use std::time::Duration;
+#[cfg(feature = "stats")]
 use std::{
     fmt::{Debug, Formatter},
     iter::Sum,
-    time::Duration,
 };
 
 /// Provides common imports that almost all Glommio applications will need
@@ -470,10 +473,13 @@ pub mod prelude {
     #[doc(no_inline)]
     pub use crate::{
         error::GlommioError, executor, spawn_local, spawn_local_into, yield_if_needed,
-        ByteSliceExt, ByteSliceMutExt, ExecutorProxy, IoStats, Latency, LocalExecutor,
-        LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
-        PoolThreadHandles, RingIoStats, Shares, TaskQueueHandle,
+        ByteSliceExt, ByteSliceMutExt, ExecutorProxy, Latency, LocalExecutor, LocalExecutorBuilder,
+        LocalExecutorPoolBuilder, Placement, PoolPlacement, PoolThreadHandles, Shares,
+        TaskQueueHandle,
     };
+    #[cfg(feature = "stats")]
+    #[doc(no_inline)]
+    pub use crate::{IoStats, RingIoStats};
 }
 
 /// An attribute of a [`TaskQueue`], passed during its creation.
@@ -522,6 +528,7 @@ impl IoRequirements {
 
 /// Stores information about IO performed in a specific ring
 #[derive(Clone)]
+#[cfg(feature = "stats")]
 pub struct RingIoStats {
     // Counters
     pub(crate) files_opened: u64,
@@ -543,6 +550,7 @@ pub struct RingIoStats {
     pub(crate) post_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch,
 }
 
+#[cfg(feature = "stats")]
 impl Default for RingIoStats {
     fn default() -> Self {
         Self {
@@ -571,6 +579,7 @@ impl Default for RingIoStats {
     }
 }
 
+#[cfg(feature = "stats")]
 impl Debug for RingIoStats {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RingIoStats")
@@ -593,6 +602,7 @@ impl Debug for RingIoStats {
     }
 }
 
+#[cfg(feature = "stats")]
 impl RingIoStats {
     /// The total amount of files opened in this executor so far.
     ///
@@ -677,6 +687,7 @@ impl RingIoStats {
     }
 }
 
+#[cfg(feature = "stats")]
 impl<'a> Sum<&'a RingIoStats> for RingIoStats {
     fn sum<I: Iterator<Item = &'a RingIoStats>>(iter: I) -> Self {
         iter.fold(RingIoStats::default(), |mut a, b| {
@@ -706,6 +717,7 @@ impl<'a> Sum<&'a RingIoStats> for RingIoStats {
 
 /// Stores information about IO
 #[derive(Debug)]
+#[cfg(feature = "stats")]
 pub struct IoStats {
     /// The IO stats of the main ring
     pub main_ring: RingIoStats,
@@ -715,6 +727,7 @@ pub struct IoStats {
     pub poll_ring: RingIoStats,
 }
 
+#[cfg(feature = "stats")]
 impl IoStats {
     fn new(main_ring: RingIoStats, latency_ring: RingIoStats, poll_ring: RingIoStats) -> IoStats {
         IoStats {

@@ -5,6 +5,9 @@
 //!
 //!
 
+#[cfg(feature = "stats")]
+use crate::{sys::StatsCollection, IoStats, TaskQueueHandle};
+
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -30,10 +33,9 @@ use crate::{
     sys::SockAddrStorage,
     sys::{
         self, blocking::BlockingThreadPool, common_flags, read_flags, DirectIo, DmaBuffer,
-        DmaSource, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType, StatsCollection,
-        Statx,
+        DmaSource, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType, Statx,
     },
-    IoRequirements, IoStats, TaskQueueHandle,
+    IoRequirements,
 };
 use nix::poll::PollFlags;
 
@@ -156,7 +158,10 @@ pub(crate) struct Reactor {
     shared_channels: RefCell<SharedChannels>,
 
     io_scheduler: Rc<IoScheduler>,
+    #[cfg(feature = "stats")]
     record_io_latencies: bool,
+    #[cfg(feature = "stats")]
+    record_io_stats: bool,
 
     /// Whether the latency ring has events waiting. Taken once at startup:
     /// `need_preempt` runs constantly and must not borrow the ring to ask.
@@ -168,7 +173,8 @@ impl Reactor {
         notifier: Arc<SleepNotifier>,
         io_memory: usize,
         ring_depth: usize,
-        record_io_latencies: bool,
+        #[cfg(feature = "stats")] record_io_latencies: bool,
+        #[cfg(feature = "stats")] record_io_stats: bool,
         blocking_thread: BlockingThreadPool,
     ) -> io::Result<Reactor> {
         let sys = sys::Reactor::new(notifier, io_memory, ring_depth, blocking_thread)?;
@@ -178,15 +184,20 @@ impl Reactor {
             timers: RefCell::new(Timers::new()),
             shared_channels: RefCell::new(SharedChannels::new()),
             io_scheduler: Rc::new(IoScheduler::new()),
+            #[cfg(feature = "stats")]
             record_io_latencies,
+            #[cfg(feature = "stats")]
+            record_io_stats,
             preempt_status,
         })
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn io_stats(&self) -> IoStats {
         self.sys.io_stats()
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn task_queue_io_stats(&self, handle: &TaskQueueHandle) -> Option<IoStats> {
         self.sys.task_queue_io_stats(handle)
     }
@@ -208,13 +219,15 @@ impl Reactor {
         &self,
         raw: RawFd,
         stype: SourceType,
-        stats_collection: Option<StatsCollection>,
+        #[cfg(feature = "stats")] stats_collection: Option<StatsCollection>,
     ) -> Source {
         sys::Source::new(
             self.io_scheduler.requirements(),
             raw,
             stype,
+            #[cfg(feature = "stats")]
             stats_collection,
+            #[cfg(feature = "stats")]
             Some(crate::executor().current_task_queue()),
         )
     }
@@ -268,20 +281,29 @@ impl Reactor {
         pos: u64,
         pollable: PollableStatus,
     ) -> Source {
+        #[cfg(feature = "stats")]
         let stats = StatsCollection {
-            fulfilled: Some(|result, stats, op_count| {
-                if let Ok(result) = result {
-                    stats.file_writes += op_count;
-                    stats.file_bytes_written += *result as u64 * op_count;
-                }
-            }),
+            #[cfg(feature = "stats")]
+            fulfilled: if self.record_io_stats {
+                Some(|result, stats, op_count| {
+                    if let Ok(result) = result {
+                        stats.file_writes += op_count;
+                        stats.file_bytes_written += *result as u64 * op_count;
+                    }
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "stats")]
             reused: None,
+            #[cfg(feature = "stats")]
             latency: None,
         };
 
         let source = self.new_source(
             raw,
             SourceType::Write(pollable, IoBuffer::DmaSource(buf)),
+            #[cfg(feature = "stats")]
             Some(stats),
         );
         self.sys.write_dma(&source, pos);
@@ -296,24 +318,33 @@ impl Reactor {
         off_out: u64,
         len: usize,
     ) -> impl Future<Output = Source> {
+        #[cfg(feature = "stats")]
         let stats = StatsCollection {
-            fulfilled: Some(|result, stats, op_count| {
-                if let Ok(result) = result {
-                    let len = *result as u64 * op_count;
+            #[cfg(feature = "stats")]
+            fulfilled: if self.record_io_stats {
+                Some(|result, stats, op_count| {
+                    if let Ok(result) = result {
+                        let len = *result as u64 * op_count;
 
-                    stats.file_reads += op_count;
-                    stats.file_bytes_read += len;
-                    stats.file_writes += op_count;
-                    stats.file_bytes_written += len;
-                }
-            }),
+                        stats.file_reads += op_count;
+                        stats.file_bytes_read += len;
+                        stats.file_writes += op_count;
+                        stats.file_bytes_written += len;
+                    }
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "stats")]
             reused: None,
+            #[cfg(feature = "stats")]
             latency: None,
         };
 
         let source = self.new_source(
             fd_out,
             SourceType::CopyFileRange(fd_in, off_in, len),
+            #[cfg(feature = "stats")]
             Some(stats),
         );
         let waiter = self.sys.copy_file_range(&source, off_out);
@@ -324,14 +355,22 @@ impl Reactor {
     }
 
     pub(crate) fn write_buffered(&self, raw: RawFd, buf: Vec<u8>, pos: u64) -> Source {
+        #[cfg(feature = "stats")]
         let stats = StatsCollection {
-            fulfilled: Some(|result, stats, op_count| {
-                if let Ok(result) = result {
-                    stats.file_buffered_writes += op_count;
-                    stats.file_buffered_bytes_written += *result as u64 * op_count;
-                }
-            }),
+            #[cfg(feature = "stats")]
+            fulfilled: if self.record_io_stats {
+                Some(|result, stats, op_count| {
+                    if let Ok(result) = result {
+                        stats.file_buffered_writes += op_count;
+                        stats.file_buffered_bytes_written += *result as u64 * op_count;
+                    }
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "stats")]
             reused: None,
+            #[cfg(feature = "stats")]
             latency: None,
         };
 
@@ -341,6 +380,7 @@ impl Reactor {
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Buffered(buf),
             ),
+            #[cfg(feature = "stats")]
             Some(stats),
         );
         self.sys.write_buffered(&source, pos);
@@ -349,13 +389,23 @@ impl Reactor {
 
     pub(crate) fn connect(&self, raw: RawFd, addr: impl SockaddrLike) -> Source {
         let addr = unsafe { SockaddrStorage::from_raw(addr.as_ptr(), Some(addr.len())) }.unwrap();
-        let source = self.new_source(raw, SourceType::Connect(addr), None);
+        let source = self.new_source(
+            raw,
+            SourceType::Connect(addr),
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.connect(&source);
         source
     }
 
     pub(crate) fn connect_timeout(&self, raw: RawFd, addr: SockaddrStorage, d: Duration) -> Source {
-        let source = self.new_source(raw, SourceType::Connect(addr), None);
+        let source = self.new_source(
+            raw,
+            SourceType::Connect(addr),
+            #[cfg(feature = "stats")]
+            None,
+        );
         source.set_timeout(d);
         self.sys.connect(&source);
         source
@@ -363,19 +413,34 @@ impl Reactor {
 
     pub(crate) fn accept(&self, raw: RawFd) -> Source {
         let addr = SockAddrStorage::uninit();
-        let source = self.new_source(raw, SourceType::Accept(addr), None);
+        let source = self.new_source(
+            raw,
+            SourceType::Accept(addr),
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.accept(&source);
         source
     }
 
     pub(crate) fn poll_read_ready(&self, fd: RawFd) -> Source {
-        let source = self.new_source(fd, SourceType::PollAdd, None);
+        let source = self.new_source(
+            fd,
+            SourceType::PollAdd,
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.poll_ready(&source, common_flags() | read_flags());
         source
     }
 
     pub(crate) fn poll_write_ready(&self, fd: RawFd) -> Source {
-        let source = self.new_source(fd, SourceType::PollAdd, None);
+        let source = self.new_source(
+            fd,
+            SourceType::PollAdd,
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys
             .poll_ready(&source, common_flags() | PollFlags::POLLOUT);
         source
@@ -387,7 +452,12 @@ impl Reactor {
         buf: DmaBuffer,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
-        let source = self.new_source(fd, SourceType::SockSend(buf), None);
+        let source = self.new_source(
+            fd,
+            SourceType::SockSend(buf),
+            #[cfg(feature = "stats")]
+            None,
+        );
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
@@ -412,7 +482,12 @@ impl Reactor {
         let hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
 
         let addr = unsafe { SockaddrStorage::from_raw(addr.as_ptr(), Some(addr.len())) }.unwrap();
-        let source = self.new_source(fd, SourceType::SockSendMsg(buf, iov, hdr, addr), None);
+        let source = self.new_source(
+            fd,
+            SourceType::SockSendMsg(buf, iov, hdr, addr),
+            #[cfg(feature = "stats")]
+            None,
+        );
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
@@ -442,6 +517,7 @@ impl Reactor {
                 hdr,
                 std::mem::MaybeUninit::<nix::sys::socket::sockaddr_storage>::uninit(),
             ),
+            #[cfg(feature = "stats")]
             None,
         );
         if let Some(timeout) = timeout {
@@ -458,7 +534,12 @@ impl Reactor {
         size: usize,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
-        let source = self.new_source(fd, SourceType::SockRecv(None), None);
+        let source = self.new_source(
+            fd,
+            SourceType::SockRecv(None),
+            #[cfg(feature = "stats")]
+            None,
+        );
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
@@ -468,7 +549,12 @@ impl Reactor {
     }
 
     pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: MsgFlags) -> Source {
-        let source = self.new_source(fd, SourceType::SockRecv(None), None);
+        let source = self.new_source(
+            fd,
+            SourceType::SockRecv(None),
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.recv(&source, size, flags);
         source
     }
@@ -481,19 +567,31 @@ impl Reactor {
         pollable: PollableStatus,
         scheduler: Option<&FileScheduler>,
     ) -> ScheduledSource {
+        #[cfg(feature = "stats")]
         let stats = StatsCollection {
-            fulfilled: Some(|result, stats, op_count| {
-                if let Ok(result) = result {
-                    stats.file_reads += op_count;
-                    stats.file_bytes_read += *result as u64 * op_count;
-                }
-            }),
-            reused: Some(|result, stats, op_count| {
-                if let Ok(result) = result {
-                    stats.file_deduped_reads += op_count;
-                    stats.file_deduped_bytes_read += *result as u64 * op_count;
-                }
-            }),
+            #[cfg(feature = "stats")]
+            fulfilled: if self.record_io_stats {
+                Some(|result, stats, op_count| {
+                    if let Ok(result) = result {
+                        stats.file_reads += op_count;
+                        stats.file_bytes_read += *result as u64 * op_count;
+                    }
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "stats")]
+            reused: if self.record_io_stats {
+                Some(|result, stats, op_count| {
+                    if let Ok(result) = result {
+                        stats.file_deduped_reads += op_count;
+                        stats.file_deduped_bytes_read += *result as u64 * op_count;
+                    }
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "stats")]
             latency: if self.record_io_latencies {
                 Some(|pre_lat, io_lat, post_lat, stats| {
                     stats
@@ -509,7 +607,12 @@ impl Reactor {
             },
         };
 
-        let source = self.new_source(raw, SourceType::Read(pollable, None), Some(stats));
+        let source = self.new_source(
+            raw,
+            SourceType::Read(pollable, None),
+            #[cfg(feature = "stats")]
+            Some(stats),
+        );
 
         if let Some(scheduler) = scheduler {
             if let Some(source) =
@@ -533,14 +636,22 @@ impl Reactor {
         size: usize,
         scheduler: Option<&FileScheduler>,
     ) -> ScheduledSource {
+        #[cfg(feature = "stats")]
         let stats = StatsCollection {
-            fulfilled: Some(|result, stats, op_count| {
-                if let Ok(result) = result {
-                    stats.file_buffered_reads += op_count;
-                    stats.file_buffered_bytes_read += *result as u64 * op_count;
-                }
-            }),
+            #[cfg(feature = "stats")]
+            fulfilled: if self.record_io_stats {
+                Some(|result, stats, op_count| {
+                    if let Ok(result) = result {
+                        stats.file_buffered_reads += op_count;
+                        stats.file_buffered_bytes_read += *result as u64 * op_count;
+                    }
+                })
+            } else {
+                None
+            },
+            #[cfg(feature = "stats")]
             reused: None,
+            #[cfg(feature = "stats")]
             latency: if self.record_io_latencies {
                 Some(|pre_lat, io_lat, post_lat, stats| {
                     stats
@@ -559,6 +670,7 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
+            #[cfg(feature = "stats")]
             Some(stats),
         );
 
@@ -578,7 +690,12 @@ impl Reactor {
     }
 
     pub(crate) fn fdatasync(&self, raw: RawFd) -> Source {
-        let source = self.new_source(raw, SourceType::FdataSync, None);
+        let source = self.new_source(
+            raw,
+            SourceType::FdataSync,
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.fdatasync(&source);
         source
     }
@@ -590,13 +707,23 @@ impl Reactor {
         size: u64,
         flags: libc::c_int,
     ) -> Source {
-        let source = self.new_source(raw, SourceType::Fallocate, None);
+        let source = self.new_source(
+            raw,
+            SourceType::Fallocate,
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.fallocate(&source, position, size, flags);
         source
     }
 
     pub(crate) fn truncate(&self, raw: RawFd, size: u64) -> impl Future<Output = Source> {
-        let source = self.new_source(raw, SourceType::Truncate, None);
+        let source = self.new_source(
+            raw,
+            SourceType::Truncate,
+            #[cfg(feature = "stats")]
+            None,
+        );
         let waiter = self.sys.truncate(&source, size);
 
         async move {
@@ -613,6 +740,7 @@ impl Reactor {
         let source = self.new_source(
             -1,
             SourceType::Rename(old_path.as_ref().to_owned(), new_path.as_ref().to_owned()),
+            #[cfg(feature = "stats")]
             None,
         );
         let waiter = self.sys.rename(&source);
@@ -624,7 +752,12 @@ impl Reactor {
     }
 
     pub(crate) fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = Source> {
-        let source = self.new_source(-1, SourceType::Remove(path.as_ref().to_owned()), None);
+        let source = self.new_source(
+            -1,
+            SourceType::Remove(path.as_ref().to_owned()),
+            #[cfg(feature = "stats")]
+            None,
+        );
         let waiter = self.sys.remove_file(&source);
 
         async move {
@@ -638,7 +771,12 @@ impl Reactor {
         path: P,
         mode: libc::c_int,
     ) -> impl Future<Output = Source> {
-        let source = self.new_source(-1, SourceType::CreateDir(path.as_ref().to_owned()), None);
+        let source = self.new_source(
+            -1,
+            SourceType::CreateDir(path.as_ref().to_owned()),
+            #[cfg(feature = "stats")]
+            None,
+        );
         let waiter = self.sys.create_dir(&source, mode);
 
         async move {
@@ -651,7 +789,12 @@ impl Reactor {
         &self,
         func: Box<dyn FnOnce() + Send + 'static>,
     ) -> impl Future<Output = Source> {
-        let source = self.new_source(-1, SourceType::BlockingFn, None);
+        let source = self.new_source(
+            -1,
+            SourceType::BlockingFn,
+            #[cfg(feature = "stats")]
+            None,
+        );
         let waiter = self.sys.run_blocking(&source, func);
 
         async move {
@@ -664,13 +807,21 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Close,
+            #[cfg(feature = "stats")]
             Some(StatsCollection {
-                fulfilled: Some(|result, stats, op_count| {
-                    if result.is_ok() {
-                        stats.files_closed += op_count
-                    }
-                }),
+                #[cfg(feature = "stats")]
+                fulfilled: if self.record_io_stats {
+                    Some(|result, stats, op_count| {
+                        if result.is_ok() {
+                            stats.files_closed += op_count
+                        }
+                    })
+                } else {
+                    None
+                },
+                #[cfg(feature = "stats")]
                 reused: None,
+                #[cfg(feature = "stats")]
                 latency: None,
             }),
         );
@@ -687,6 +838,7 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Statx(Box::new(RefCell::new(statx_buf))),
+            #[cfg(feature = "stats")]
             None,
         );
         self.sys.statx_fd(&source);
@@ -705,13 +857,21 @@ impl Reactor {
         let source = self.new_source(
             dir,
             SourceType::Open(path),
+            #[cfg(feature = "stats")]
             Some(StatsCollection {
-                fulfilled: Some(|result, stats, op_count| {
-                    if result.is_ok() {
-                        stats.files_opened += op_count
-                    }
-                }),
+                #[cfg(feature = "stats")]
+                fulfilled: if self.record_io_stats {
+                    Some(|result, stats, op_count| {
+                        if result.is_ok() {
+                            stats.files_opened += op_count
+                        }
+                    })
+                } else {
+                    None
+                },
+                #[cfg(feature = "stats")]
                 reused: None,
+                #[cfg(feature = "stats")]
                 latency: None,
             }),
         );
@@ -721,7 +881,12 @@ impl Reactor {
 
     #[cfg(feature = "bench")]
     pub(crate) fn nop(&self) -> Source {
-        let source = self.new_source(-1, SourceType::Noop, None);
+        let source = self.new_source(
+            -1,
+            SourceType::Noop,
+            #[cfg(feature = "stats")]
+            None,
+        );
         self.sys.nop(&source);
         source
     }

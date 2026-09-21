@@ -112,7 +112,7 @@ impl FileScheduler {
     pub(crate) fn consume_scheduled(
         &self,
         data_range: Range<u64>,
-        sys: Option<&Reactor>,
+        #[allow(unused_variables)] sys: Option<&Reactor>,
     ) -> Option<ScheduledSource> {
         let sources = self.inner.sources.borrow();
         let mut candidates = sources.range(
@@ -123,6 +123,7 @@ impl FileScheduler {
         if let Some(sched_source) = candidates.find(|&x| {
             x.data_range.contains(&data_range.start) && x.data_range.contains(&(data_range.end - 1))
         }) {
+            #[cfg(feature = "stats")]
             if let (Some(sys), Some(result)) = (sys, sched_source.source.result()) {
                 if let Some(reused) = sched_source
                     .source
@@ -309,7 +310,15 @@ pub(crate) mod test {
 
         assert!(file.consume_scheduled(0..512, None).is_none());
         let sched_source1 = file.schedule(
-            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            Source::new(
+                Default::default(),
+                0,
+                SourceType::Invalid,
+                #[cfg(feature = "stats")]
+                None,
+                #[cfg(feature = "stats")]
+                None,
+            ),
             0..512,
         );
         let sched_source2 = file.consume_scheduled(0..512, None).unwrap();
@@ -331,7 +340,15 @@ pub(crate) mod test {
             let sched = Rc::new(IoScheduler::new());
             let file = sched.get_file_scheduler((0, 1));
             let _ = file.schedule(
-                Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+                Source::new(
+                    Default::default(),
+                    0,
+                    SourceType::Invalid,
+                    #[cfg(feature = "stats")]
+                    None,
+                    #[cfg(feature = "stats")]
+                    None,
+                ),
                 0..512,
             );
             drop(sched);
@@ -341,7 +358,15 @@ pub(crate) mod test {
             let sched = Rc::new(IoScheduler::new());
             let file = sched.get_file_scheduler((0, 1));
             let _ = file.schedule(
-                Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+                Source::new(
+                    Default::default(),
+                    0,
+                    SourceType::Invalid,
+                    #[cfg(feature = "stats")]
+                    None,
+                    #[cfg(feature = "stats")]
+                    None,
+                ),
                 0..512,
             );
             drop(file);
@@ -351,7 +376,15 @@ pub(crate) mod test {
             let sched = Rc::new(IoScheduler::new());
             let file = sched.get_file_scheduler((0, 1));
             let _ = file.schedule(
-                Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+                Source::new(
+                    Default::default(),
+                    0,
+                    SourceType::Invalid,
+                    #[cfg(feature = "stats")]
+                    None,
+                    #[cfg(feature = "stats")]
+                    None,
+                ),
                 0..512,
             );
             drop(sched);
@@ -387,6 +420,7 @@ pub(crate) mod test {
         }
         let res = new_file.write_at(buf, 0).await.expect("failed to write");
         assert_eq!(res, 512 << 10);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         new_file = Rc::new(
@@ -399,42 +433,54 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let read_buf1 = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             1,
             "we expect one IO to have been performed at this point"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 0);
 
         let read_buf2 = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             0,
             "should feed from the first buffer"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 1);
 
         drop(read_buf1);
         let read_buf3 = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             0,
             "initial buffer lifetime should have been extended"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 1);
 
         drop(read_buf2);
         drop(read_buf3);
         let _ = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             1,
             "all buffers are dead so this last read should trigger an IO request"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 0);
 
         new_file.close_rc().await.expect("failed to close file");
@@ -456,6 +502,7 @@ pub(crate) mod test {
         }
         let res = new_file.write_at(buf, 0).await.expect("failed to write");
         assert_eq!(res, 512 << 10);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         new_file = Rc::new(
@@ -469,16 +516,20 @@ pub(crate) mod test {
 
         let read_buf1 = read_some(new_file.clone(), 0..4096);
         let read_buf2 = read_some(new_file.clone(), 0..4096);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         join!(read_buf1, read_buf2);
 
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             1,
             "should feed from the first buffer"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -499,6 +550,7 @@ pub(crate) mod test {
         }
         let res = new_file.write_at(buf, 0).await.expect("failed to write");
         assert_eq!(res, 512 << 10);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         new_file = Rc::new(
@@ -511,21 +563,27 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let _first = read_some(new_file.clone(), 0..16384).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             1,
             "we expect one IO to have been performed at this point"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 0);
 
         let _second = read_some(new_file.clone(), 67..578).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             0,
             "should feed from the first buffer"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -546,6 +604,7 @@ pub(crate) mod test {
         }
         let res = new_file.write_at(buf, 0).await.expect("failed to write");
         assert_eq!(res, 512 << 10);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         new_file = Rc::new(
@@ -557,11 +616,15 @@ pub(crate) mod test {
         );
 
         let _first = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 1);
 
         let _second = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_reads().0, 1);
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 0);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -594,6 +657,7 @@ pub(crate) mod test {
         }
         let res = new_file.write_at(buf, 0).await.expect("failed to write");
         assert_eq!(res, 512 << 10);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         new_file = Rc::new(
@@ -606,6 +670,7 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let _first = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         assert_eq!(
             crate::executor().io_stats().all_rings().file_reads().0,
             1,
@@ -613,12 +678,15 @@ pub(crate) mod test {
         );
 
         let _second = read_some(linked_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             0,
             "should feed from the first buffer"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
         linked_file.close_rc().await.expect("failed to close file");
@@ -652,6 +720,7 @@ pub(crate) mod test {
         }
         let res = new_file.write_at(buf, 0).await.expect("failed to write");
         assert_eq!(res, 512 << 10);
+        #[cfg(feature = "stats")]
         assert_eq!(crate::executor().io_stats().all_rings().file_reads().0, 0);
 
         new_file = Rc::new(
@@ -664,6 +733,7 @@ pub(crate) mod test {
         new_file.attach_scheduler();
 
         let _first = read_some(new_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         assert_eq!(
             crate::executor().io_stats().all_rings().file_reads().0,
             1,
@@ -671,12 +741,15 @@ pub(crate) mod test {
         );
 
         let _second = read_some(linked_file.clone(), 0..4096).await;
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.file_reads().0,
             0,
             "should feed from the first buffer"
         );
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_deduped_reads().0, 1);
         new_file.close_rc().await.expect("failed to close file");
         linked_file.close_rc().await.expect("failed to close file");

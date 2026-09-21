@@ -2,10 +2,12 @@
 set -euo pipefail
 
 target="${1:-}"
+features="${2-stats}"
 
 sudo -E \
     PATH="${PATH}:/usr/share/rust/.cargo/bin" \
     TEST_TARGET="${target}" \
+    TEST_FEATURES="${features}" \
     bash -c '
         set -euo pipefail
 
@@ -18,6 +20,8 @@ sudo -E \
         args=(
             nextest
             run
+            --no-default-features
+            --features "${TEST_FEATURES}"
             --locked
             --profile
             ci

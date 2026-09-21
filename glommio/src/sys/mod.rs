@@ -587,6 +587,7 @@ impl TimeSpec64 {
     };
 }
 
+#[cfg(feature = "stats")]
 pub(super) struct Latencies {
     /// The timestamp at which the source was added to the IO queue of the
     /// reactor
@@ -607,12 +608,15 @@ pub(super) struct Wakers {
 
     /// The timestamp at which the source was added to the IO queue of the
     /// reactor
+    #[cfg(feature = "stats")]
     pub(super) queued_at: Option<std::time::Instant>,
 
     /// The timestamp at which the source was submitted to the kernel
+    #[cfg(feature = "stats")]
     pub(super) submitted_at: Option<std::time::Instant>,
 
     /// The timestamp at which the reactor fulfilled the source
+    #[cfg(feature = "stats")]
     pub(super) fulfilled_at: Option<std::time::Instant>,
 
     /// Tasks waiting for the next event.
@@ -623,8 +627,11 @@ impl Wakers {
     pub(super) fn new() -> Self {
         Wakers {
             result: None,
+            #[cfg(feature = "stats")]
             queued_at: None,
+            #[cfg(feature = "stats")]
             submitted_at: None,
+            #[cfg(feature = "stats")]
             fulfilled_at: None,
             waiters: Default::default(),
         }
@@ -641,6 +648,7 @@ impl Wakers {
         }
     }
 
+    #[cfg(feature = "stats")]
     fn timestamps(&mut self) -> Option<Latencies> {
         if self.queued_at.is_none() || self.submitted_at.is_none() || self.fulfilled_at.is_none() {
             None

@@ -499,23 +499,20 @@ pub enum Latency {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct IoRequirements {
     latency_req: Latency,
-    _io_handle: usize,
 }
 
 impl Default for IoRequirements {
     fn default() -> Self {
         Self {
             latency_req: Latency::NotImportant,
-            _io_handle: 0,
         }
     }
 }
 
 impl IoRequirements {
-    fn new(latency: Latency, handle: usize) -> Self {
+    fn new(latency: Latency, _handle: usize) -> Self {
         Self {
             latency_req: latency,
-            _io_handle: handle,
         }
     }
 }

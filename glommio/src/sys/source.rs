@@ -124,7 +124,8 @@ pub(crate) struct InnerSource {
 
     pub(crate) source_type: SourceType,
 
-    pub(crate) io_requirements: IoRequirements,
+    /// Whether blocking I/O completion should wake a latency-sensitive executor.
+    pub(crate) latency_sensitive: bool,
 
     pub(crate) timeout: Option<TimeSpec64>,
 
@@ -147,7 +148,7 @@ impl fmt::Debug for InnerSource {
             .field("raw", &self.raw)
             .field("wakers", &self.wakers)
             .field("source_type", &self.source_type)
-            .field("io_requirements", &self.io_requirements)
+            .field("latency_sensitive", &self.latency_sensitive)
             .finish()
     }
 }
@@ -171,7 +172,7 @@ impl Source {
                 raw,
                 wakers: Wakers::new(),
                 source_type,
-                io_requirements: ioreq,
+                latency_sensitive: matches!(ioreq.latency_req, crate::Latency::Matters(_)),
                 enqueued: None,
                 timeout: None,
                 stats_collection,

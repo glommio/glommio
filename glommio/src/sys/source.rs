@@ -130,7 +130,7 @@ pub(crate) struct InnerSource {
 
     pub(crate) enqueued: Option<EnqueuedSource>,
 
-    pub(crate) stats_collection: Option<StatsCollection>,
+    pub(crate) stats_collection: Option<&'static StatsCollection>,
 
     pub(crate) task_queue: Option<TaskQueueHandle>,
 }
@@ -163,7 +163,7 @@ impl Source {
         ioreq: IoRequirements,
         raw: RawFd,
         source_type: SourceType,
-        stats_collection: Option<StatsCollection>,
+        stats_collection: Option<&'static StatsCollection>,
         task_queue: Option<TaskQueueHandle>,
     ) -> Source {
         Source {
@@ -301,7 +301,7 @@ impl Source {
         self.inner.borrow().raw
     }
 
-    pub(crate) fn stats_collection(&self) -> Option<StatsCollection> {
+    pub(crate) fn stats_collection(&self) -> Option<&'static StatsCollection> {
         self.inner.borrow().stats_collection
     }
 

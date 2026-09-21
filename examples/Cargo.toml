@@ -5,13 +5,17 @@ name    = "examples"
 publish = false
 version = "0.0.0"
 
+[features]
+default      = ["stats"]
+stats        = ["glommio/stats"]
+
 [dev-dependencies]
 byte-unit      = "5.1.4"
 clap           = "4.5.3"
 fastrand       = "2"
 futures        = "~0.3.5"
 futures-lite   = "2.6.0"
-glommio        = { path = "../glommio" }
+glommio        = { path = "../glommio", default-features = false }
 http-body-util = "0.1.0"
 
 # hyper and tokio for the hyper example. We just need the traits from Tokio

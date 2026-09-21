@@ -54,6 +54,7 @@ use std::{
     io,
     marker::PhantomData,
     mem::MaybeUninit,
+    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     pin::Pin,
     rc::Rc,
@@ -139,18 +140,39 @@ pub(crate) fn executor_id() -> Option<usize> {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
 /// An opaque handle indicating in which queue a group of tasks will execute.
 /// Tasks in the same group will execute in FIFO order but no guarantee is made
 /// about ordering on different task queues.
 pub struct TaskQueueHandle {
-    index: usize,
+    /// Store the public index plus one so optional handles fit in one word.
+    index: NonZeroUsize,
 }
 
 impl TaskQueueHandle {
+    fn new(index: usize) -> Self {
+        Self {
+            index: index.checked_add(1).and_then(NonZeroUsize::new).unwrap(),
+        }
+    }
+
     /// Returns a numeric ID that uniquely identifies this Task queue
     pub fn index(&self) -> usize {
-        self.index
+        self.index.get() - 1
+    }
+}
+
+impl Default for TaskQueueHandle {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl fmt::Debug for TaskQueueHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskQueueHandle")
+            .field("index", &self.index())
+            .finish()
     }
 }
 
@@ -1112,9 +1134,7 @@ impl<T> PoolThreadHandles<T> {
 /// matches the previous behaviour, where the closure held a `Weak` to the queue
 /// and did nothing when it failed to upgrade.
 pub(crate) fn schedule_runnable(runnable: multitask::Runnable) {
-    let handle = TaskQueueHandle {
-        index: runnable.task_queue_index(),
-    };
+    let handle = TaskQueueHandle::new(runnable.task_queue_index());
 
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     {
@@ -1333,13 +1353,13 @@ impl LocalExecutor {
         };
 
         let io_requirements = IoRequirements::new(latency, index);
-        let tq = TaskQueue::new(TaskQueueHandle { index }, name, shares, io_requirements);
+        let tq = TaskQueue::new(TaskQueueHandle::new(index), name, shares, io_requirements);
 
         self.queues
             .borrow_mut()
             .available_executors
             .insert(index, tq);
-        TaskQueueHandle { index }
+        TaskQueueHandle::new(index)
     }
 
     /// Removes a task queue.
@@ -1348,24 +1368,24 @@ impl LocalExecutor {
     pub fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
         let mut queues = self.queues.borrow_mut();
 
-        let queue_entry = queues.available_executors.entry(handle.index);
+        let queue_entry = queues.available_executors.entry(handle.index());
         if let Entry::Occupied(entry) = queue_entry {
             let tq = entry.get();
             if tq.borrow().is_active() {
-                return Err(GlommioError::queue_still_active(handle.index));
+                return Err(GlommioError::queue_still_active(handle.index()));
             }
 
             entry.remove();
             return Ok(());
         }
-        Err(GlommioError::queue_not_found(handle.index))
+        Err(GlommioError::queue_not_found(handle.index()))
     }
 
     fn get_queue(&self, handle: &TaskQueueHandle) -> Option<Rc<RefCell<TaskQueue>>> {
         self.queues
             .borrow()
             .available_executors
-            .get(&handle.index)
+            .get(&handle.index())
             .cloned()
     }
 
@@ -1392,7 +1412,7 @@ impl LocalExecutor {
             .borrow()
             .active_executing
             .clone() // this clone is cheap because we clone an `Option<Rc<_>>`
-            .or_else(|| self.get_queue(&TaskQueueHandle { index: 0 }))
+            .or_else(|| self.get_queue(&TaskQueueHandle::default()))
             .unwrap();
 
         let id = self.id;
@@ -1436,7 +1456,7 @@ impl LocalExecutor {
     {
         let tq = self
             .get_queue(&handle)
-            .ok_or_else(|| GlommioError::queue_not_found(handle.index))?;
+            .ok_or_else(|| GlommioError::queue_not_found(handle.index()))?;
         let ex = tq.borrow().ex.clone();
         let id = self.id;
 
@@ -2532,7 +2552,7 @@ impl ExecutorProxy {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         return LOCAL_EX.with(|local_ex| match local_ex.get_queue(&handle) {
             Some(x) => Ok(x.borrow_mut().stats.take()),
-            None => Err(GlommioError::queue_not_found(handle.index)),
+            None => Err(GlommioError::queue_not_found(handle.index())),
         });
 
         #[cfg(all(nightly, feature = "native-tls"))]
@@ -2543,7 +2563,7 @@ impl ExecutorProxy {
                 .get_queue(&handle)
         } {
             Some(x) => Ok(x.borrow_mut().stats.take()),
-            None => Err(GlommioError::queue_not_found(handle.index)),
+            None => Err(GlommioError::queue_not_found(handle.index())),
         };
     }
 
@@ -2708,7 +2728,7 @@ impl ExecutorProxy {
         return LOCAL_EX.with(|local_ex| {
             match local_ex.get_reactor().task_queue_io_stats(&handle) {
                 Some(x) => Ok(x),
-                None => Err(GlommioError::queue_not_found(handle.index)),
+                None => Err(GlommioError::queue_not_found(handle.index())),
             }
         });
 
@@ -2721,7 +2741,7 @@ impl ExecutorProxy {
                 .task_queue_io_stats(&handle)
         } {
             Some(x) => Ok(x),
-            None => Err(GlommioError::queue_not_found(handle.index)),
+            None => Err(GlommioError::queue_not_found(handle.index())),
         };
     }
 
@@ -3009,6 +3029,30 @@ mod test {
 
     use super::*;
 
+    #[test]
+    fn task_queue_handle_preserves_public_ids() {
+        assert_eq!(TaskQueueHandle::default().index(), 0);
+        assert_eq!(
+            format!("{:?}", TaskQueueHandle::default()),
+            "TaskQueueHandle { index: 0 }"
+        );
+        for index in [0, 1, 42, usize::MAX - 1] {
+            let handle = TaskQueueHandle::new(index);
+            assert_eq!(handle.index(), index);
+            assert_eq!(Some(handle).map(|handle| handle.index()), Some(index));
+        }
+        assert_eq!(
+            std::mem::size_of::<Option<TaskQueueHandle>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn task_queue_handle_rejects_overflow() {
+        TaskQueueHandle::new(usize::MAX);
+    }
+
     fn eventfd_count() -> usize {
         fs::read_dir("/proc/self/fd")
             .expect("failed to enumerate this process's file descriptors")
@@ -3145,7 +3189,7 @@ mod test {
                 async move {
                     unreachable!("Should not have executed this");
                 },
-                TaskQueueHandle { index: 1 },
+                TaskQueueHandle::new(1),
             );
 
             if task.is_ok() {
@@ -3264,21 +3308,21 @@ mod test {
                 "test2",
             );
 
-            let id1 = tq1.index;
-            let id2 = tq2.index;
+            let id1 = tq1.index();
+            let id2 = tq2.index();
             let j0 = crate::spawn_local(async {
-                assert_eq!(crate::executor().current_task_queue().index, 0);
+                assert_eq!(crate::executor().current_task_queue().index(), 0);
             });
             let j1 = crate::spawn_local_into(
                 async move {
-                    assert_eq!(crate::executor().current_task_queue().index, id1);
+                    assert_eq!(crate::executor().current_task_queue().index(), id1);
                 },
                 tq1,
             )
             .unwrap();
             let j2 = crate::spawn_local_into(
                 async move {
-                    assert_eq!(crate::executor().current_task_queue().index, id2);
+                    assert_eq!(crate::executor().current_task_queue().index(), id2);
                 },
                 tq2,
             )

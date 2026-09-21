@@ -18,8 +18,10 @@ version = "0.10.0"
 rust-version = "1.92"
 
 [features]
-bench     = []
-debugging = []
+default      = ["stats"]
+bench        = []
+debugging    = []
+stats        = ["dep:sketches-ddsketch"]
 
 # Unstable features based on nightly
 native-tls = []
@@ -44,7 +46,7 @@ rlimit                = "0.10"
 scoped-tls            = "1.0"
 scopeguard            = "1.2"
 signal-hook           = { version = "0.4" }
-sketches-ddsketch     = "0.3"
+sketches-ddsketch     = { version = "0.3", optional = true }
 smallvec              = { version = "1.15", features = ["union"] }
 socket2               = { version = "0.6", features = ["all"] }
 tracing               = "0.1"

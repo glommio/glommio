@@ -146,10 +146,17 @@ jobs:
           - name: glibc
             target: ""
             musl: false
+            features: stats
 
           - name: musl
             target: x86_64-unknown-linux-musl
             musl: true
+            features: stats
+
+          - name: glibc-no-stats
+            target: ""
+            musl: false
+            features: ""
 
     steps:
       - name: Checkout
@@ -166,6 +173,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          FEATURES: ${{ matrix.features }}
         run: |
           set -euo pipefail
 
@@ -173,6 +181,8 @@ jobs:
             build
             --workspace
             --all-targets
+            --no-default-features
+            --features "${FEATURES}"
             --locked
           )
 
@@ -191,4 +201,5 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: .github/scripts/run-tests.sh "${TARGET}"
+          FEATURES: ${{ matrix.features }}
+        run: .github/scripts/run-tests.sh "${TARGET}" "${FEATURES}"

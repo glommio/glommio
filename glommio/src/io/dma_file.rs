@@ -1205,6 +1205,68 @@ pub(crate) mod test {
         };
     }
 
+    #[cfg(feature = "stats")]
+    #[test]
+    fn independent_stats_switches() {
+        for dir in make_test_directories("independent-stats-switches") {
+            for counters in [false, true] {
+                for latencies in [false, true] {
+                    let builder = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+                        .record_io_stats(counters)
+                        .record_io_latencies(latencies);
+                    builder.make().unwrap().run(async {
+                        let file = OpenOptions::new()
+                            .create(true)
+                            .truncate(true)
+                            .read(true)
+                            .write(true)
+                            .dma_open(dir.path.join("stats"))
+                            .await
+                            .unwrap();
+                        let mut buffer = file.alloc_dma_buffer(4096);
+                        buffer.memset(42);
+                        file.write_at(buffer, 0).await.unwrap();
+                        file.attach_scheduler();
+                        let (first, concurrent) =
+                            join!(file.read_at_aligned(0, 4096), file.read_at_aligned(0, 4096),);
+                        let first = first.unwrap();
+                        let concurrent = concurrent.unwrap();
+                        let reused = file.read_at_aligned(0, 4096).await.unwrap();
+                        assert_eq!(&*first, &[42; 4096]);
+                        assert_eq!(&*concurrent, &*first);
+                        assert_eq!(&*reused, &*first);
+                        drop((first, concurrent, reused));
+                        file.close().await.unwrap();
+                        let stats = crate::executor().io_stats().all_rings();
+                        assert_eq!(stats.files_opened(), u64::from(counters));
+                        assert_eq!(stats.files_closed(), u64::from(counters));
+                        assert_eq!(
+                            stats.file_reads(),
+                            (u64::from(counters), 4096 * u64::from(counters))
+                        );
+                        assert_eq!(
+                            stats.file_deduped_reads(),
+                            (2 * u64::from(counters), 8192 * u64::from(counters))
+                        );
+                        assert_eq!(
+                            stats.file_writes(),
+                            (u64::from(counters), 4096 * u64::from(counters))
+                        );
+                        assert_eq!(stats.io_latency_us().count(), usize::from(latencies));
+                        assert_eq!(
+                            stats.pre_reactor_io_scheduler_latency_us().count(),
+                            usize::from(latencies)
+                        );
+                        assert_eq!(
+                            stats.post_reactor_io_scheduler_latency_us().count(),
+                            usize::from(latencies)
+                        );
+                    });
+                }
+            }
+        }
+    }
+
     dma_file_test!(file_create_close, path, _k, {
         let new_file = DmaFile::create(path.join("testfile"))
             .await
@@ -1365,6 +1427,7 @@ pub(crate) mod test {
             .expect("failed to create file");
         let read_buf = new_file.read_at(0, 500).await.expect("failed to read");
         std::assert_eq!(read_buf.len(), 500);
+        #[cfg(feature = "stats")]
         let min_read_size = new_file.align_up(500);
         for i in 0..read_buf.len() {
             std::assert_eq!(read_buf[i], 42);
@@ -1381,10 +1444,15 @@ pub(crate) mod test {
 
         new_file.close().await.expect("failed to close file");
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_reads(), (2, 4096 + min_read_size));
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_writes(), (1, 4096));
     });
 
@@ -1412,6 +1480,7 @@ pub(crate) mod test {
             .await
             .expect_err("pre allocating read-only files should fail");
         new_file.close().await.expect("failed to close file");
+        #[cfg(feature = "stats")]
         assert_eq!(
             crate::executor().io_stats().all_rings().file_writes(),
             (0, 0)
@@ -1428,9 +1497,13 @@ pub(crate) mod test {
         std::assert_eq!(buf.len(), 0);
         new_file.close().await.expect("failed to close file");
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_reads(), (1, 0));
     });
 
@@ -1455,10 +1528,15 @@ pub(crate) mod test {
         drop(all);
         file.close().await.unwrap();
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_reads(), (0, 0));
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_writes(), (0, 0));
     });
 
@@ -1561,28 +1639,45 @@ pub(crate) mod test {
 
         join!(task1, task2);
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_reads().0, 4);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_writes().0, 2);
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor()
             .task_queue_io_stats(q1)
             .expect("failed to retrieve task queue io stats");
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_reads().0, 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_writes().0, 1);
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor()
             .task_queue_io_stats(q2)
             .expect("failed to retrieve task queue io stats");
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.main_ring.files_opened(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.main_ring.files_closed(), 1);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_reads().0, 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_writes().0, 1);
     });
 
@@ -1617,7 +1712,9 @@ pub(crate) mod test {
             .await;
         assert_eq!(*total_reads.borrow(), 512);
 
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert!(io_stats.file_reads().0 >= 1 && io_stats.file_reads().0 <= 512);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -1650,7 +1747,9 @@ pub(crate) mod test {
             }})
             .await;
         assert_eq!(*total_reads.borrow(), 511);
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert!(io_stats.file_reads().0 >= 1 && io_stats.file_reads().0 <= 512);
         new_file.close_rc().await.expect("failed to close file");
     });
@@ -1683,12 +1782,16 @@ pub(crate) mod test {
             .await;
 
         assert_eq!(*total_reads.borrow(), 511);
+        #[cfg(feature = "stats")]
         let io_stats = crate::executor().io_stats().all_rings();
+        #[cfg(feature = "stats")]
         assert_eq!(io_stats.file_reads().0, 4096 / new_file.o_direct_alignment);
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.post_reactor_io_scheduler_latency_us().count() as u64,
             4096 / new_file.o_direct_alignment
         );
+        #[cfg(feature = "stats")]
         assert_eq!(
             io_stats.io_latency_us().count() as u64,
             4096 / new_file.o_direct_alignment
@@ -1718,15 +1821,15 @@ pub(crate) mod test {
         assert_eq!(r, 512);
 
         let stat = reader.stat().await.unwrap();
-        assert_eq!(stat.file_size, (cluster_size * 2 + 512).into());
-        assert_eq!(stat.allocated_file_size, (cluster_size).into());
+        assert_eq!(stat.file_size, u64::from(cluster_size * 2 + 512));
+        assert_eq!(stat.allocated_file_size, u64::from(cluster_size));
         assert_eq!(stat.fs_cluster_size, cluster_size);
 
         let rb = reader
             .read_at_aligned(0, (cluster_size * 2).try_into().unwrap())
             .await
             .unwrap();
-        assert_eq!(rb.len(), (cluster_size * 2).try_into().unwrap());
+        assert_eq!(rb.len(), usize::try_from(cluster_size * 2).unwrap());
         for i in rb.iter() {
             assert_eq!(*i, 0);
         }
@@ -1748,8 +1851,8 @@ pub(crate) mod test {
         assert_eq!(r, 512);
 
         let stat = reader.stat().await.unwrap();
-        assert_eq!(stat.file_size, (cluster_size * 2 + 512).into());
-        assert_eq!(stat.allocated_file_size, (cluster_size * 2).into());
+        assert_eq!(stat.file_size, u64::from(cluster_size * 2 + 512));
+        assert_eq!(stat.allocated_file_size, u64::from(cluster_size * 2));
         assert_eq!(stat.fs_cluster_size, cluster_size);
 
         let rb = reader.read_at_aligned(0, 512).await.unwrap();
@@ -1768,7 +1871,7 @@ pub(crate) mod test {
             .read_at_aligned(1024, (cluster_size * 2 - 1024).try_into().unwrap())
             .await
             .unwrap();
-        assert_eq!(rb.len(), (cluster_size * 2 - 1024).try_into().unwrap());
+        assert_eq!(rb.len(), usize::try_from(cluster_size * 2 - 1024).unwrap());
         for i in rb.iter() {
             assert_eq!(*i, 0);
         }
@@ -1780,12 +1883,12 @@ pub(crate) mod test {
         let stat = reader.stat().await.unwrap();
         assert_eq!(
             stat.file_size,
-            (cluster_size * 2 + 512).into(),
+            u64::from(cluster_size * 2 + 512),
             "file size remains unchanged; deallocating past the end of file doesn't matter"
         );
         assert_eq!(
             stat.allocated_file_size,
-            cluster_size.into(),
+            u64::from(cluster_size),
             "only one allocated cluster remains"
         );
 
@@ -2217,7 +2320,6 @@ pub(crate) mod test {
                         let local_ex = crate::executor::LocalExecutorBuilder::new(
                             crate::executor::Placement::Unbound,
                         )
-                        .record_io_latencies(true)
                         .make()
                         .unwrap();
                         local_ex.run(async move {
@@ -2273,7 +2375,6 @@ pub(crate) mod test {
             .spawn_blocking(move || {
                 let local_ex =
                     crate::executor::LocalExecutorBuilder::new(crate::executor::Placement::Unbound)
-                        .record_io_latencies(true)
                         .make()
                         .unwrap();
                 local_ex.run(async move {
@@ -2373,7 +2474,6 @@ pub(crate) mod test {
             .spawn_blocking(move || {
                 let local_ex =
                     crate::executor::LocalExecutorBuilder::new(crate::executor::Placement::Unbound)
-                        .record_io_latencies(true)
                         .make()
                         .unwrap();
                 local_ex.run(async move {

@@ -78,3 +78,18 @@ Licensed under either of
 * MIT license ([](/LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
+
+### I/O statistics
+
+The default `stats` feature enables support for I/O operation and byte counters
+and latency distributions. Disable default features to compile out I/O stats
+storage and collection code. At some point in the future "stats" will be removed
+from the defaults so if you need it set the feature explicitly to improve forward-compat
+with the crate.
+
+With `stats`, both single-executor and pool builders expose independent
+`record_io_stats(bool)` and `record_io_latencies(bool)` runtime switches.
+I/O counters are enabled by default for now but that may change in the future
+so it's recommended to explicitly set that to true if you actually use it to
+reduce forward-compat friction;
+latency recording remains disabled by default as before.

@@ -320,8 +320,11 @@ mod test {
 
         std::assert!(path.join("testfile").exists());
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 2);
     });
 
@@ -360,10 +363,15 @@ mod test {
         writer.close().await.unwrap();
         reader.close().await.unwrap();
 
+        #[cfg(feature = "stats")]
         let stats = crate::executor().io_stats();
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_opened(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().files_closed(), 2);
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_buffered_reads(), (3, 15));
+        #[cfg(feature = "stats")]
         assert_eq!(stats.all_rings().file_buffered_writes(), (1, 6));
     });
 
@@ -382,18 +390,18 @@ mod test {
             .write_at(vec![7, 8, 9, 10, 11, 12, 13], (cluster_size * 2).into())
             .await
             .unwrap();
-        assert_eq!(r, 7.try_into().unwrap());
+        assert_eq!(r, 7);
 
         let stat = reader.stat().await.unwrap();
-        assert_eq!(stat.file_size, (cluster_size * 2 + 7).into());
-        assert_eq!(stat.allocated_file_size, cluster_size.into());
+        assert_eq!(stat.file_size, u64::from(cluster_size * 2 + 7));
+        assert_eq!(stat.allocated_file_size, u64::from(cluster_size));
         assert_eq!(stat.fs_cluster_size, cluster_size);
 
         let rb = reader
             .read_at(0, cluster_size.try_into().unwrap())
             .await
             .unwrap();
-        assert_eq!(rb.len(), cluster_size.try_into().unwrap());
+        assert_eq!(rb.len(), usize::try_from(cluster_size).unwrap());
         for i in rb.iter() {
             assert_eq!(*i, 0);
         }
@@ -410,12 +418,12 @@ mod test {
         let stat = reader.stat().await.unwrap();
         assert_eq!(
             stat.file_size,
-            (cluster_size * 2 + 7).into(),
+            u64::from(cluster_size * 2 + 7),
             "file size is unchanged"
         );
         assert_eq!(
             stat.allocated_file_size,
-            (cluster_size * 2).into(),
+            u64::from(cluster_size * 2),
             "allocated size should double because the sparse region should be dirtied sufficiently to need another full filesystem cluster"
         );
 
@@ -438,7 +446,7 @@ mod test {
             .unwrap();
         assert_eq!(
             rb.len(),
-            ((cluster_size - 900) + cluster_size).try_into().unwrap()
+            usize::try_from((cluster_size - 900) + cluster_size).unwrap()
         );
         for i in rb.iter() {
             assert_eq!(*i, 0);
@@ -448,12 +456,12 @@ mod test {
         let stat = writer.stat().await.unwrap();
         assert_eq!(
             stat.file_size,
-            (cluster_size * 2 + 7).into(),
+            u64::from(cluster_size * 2 + 7),
             "file size is unchanged"
         );
         assert_eq!(
             stat.allocated_file_size,
-            cluster_size.into(),
+            u64::from(cluster_size),
             "allocated size should go back to 0 because there's still one allocated cluster"
         );
 
@@ -461,7 +469,7 @@ mod test {
             .read_at(0, (cluster_size).try_into().unwrap())
             .await
             .unwrap();
-        assert_eq!(rb.len(), (cluster_size).try_into().unwrap());
+        assert_eq!(rb.len(), usize::try_from(cluster_size).unwrap());
         for i in rb.iter() {
             assert_eq!(*i, 0);
         }

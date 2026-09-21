@@ -3,13 +3,17 @@
 //!
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2021 Datadog, Inc.
 //!
+
+#[cfg(feature = "stats")]
+use crate::{RingIoStats, TaskQueueHandle};
+
 use crate::{
     sys::SockAddrStorage,
     sys::{
         DmaBuffer, IoBuffer, OsResult, PollableStatus, ReactorQueue, SourceId, Statx, TimeSpec64,
         Wakers,
     },
-    GlommioError, IoRequirements, ReactorErrorKind, RingIoStats, TaskQueueHandle,
+    GlommioError, IoRequirements, ReactorErrorKind,
 };
 use futures_lite::{future, io};
 use std::{
@@ -96,10 +100,13 @@ pub struct EnqueuedSource {
     pub(crate) status: EnqueuedStatus,
 }
 
+#[cfg(feature = "stats")]
 pub(crate) type StatsCollectionFn = fn(&io::Result<usize>, &mut RingIoStats, waiters: u64) -> ();
+#[cfg(feature = "stats")]
 pub(crate) type LatencyCollectionFn =
     fn(std::time::Duration, std::time::Duration, std::time::Duration, &mut RingIoStats) -> ();
 
+#[cfg(feature = "stats")]
 #[derive(Copy, Clone)]
 pub(crate) struct StatsCollection {
     /// fulfilled runs when the source exits the reactor
@@ -130,8 +137,10 @@ pub(crate) struct InnerSource {
 
     pub(crate) enqueued: Option<EnqueuedSource>,
 
+    #[cfg(feature = "stats")]
     pub(crate) stats_collection: Option<StatsCollection>,
 
+    #[cfg(feature = "stats")]
     pub(crate) task_queue: Option<TaskQueueHandle>,
 }
 
@@ -163,8 +172,8 @@ impl Source {
         ioreq: IoRequirements,
         raw: RawFd,
         source_type: SourceType,
-        stats_collection: Option<StatsCollection>,
-        task_queue: Option<TaskQueueHandle>,
+        #[cfg(feature = "stats")] stats_collection: Option<StatsCollection>,
+        #[cfg(feature = "stats")] task_queue: Option<TaskQueueHandle>,
     ) -> Source {
         Source {
             inner: Rc::pin(RefCell::new(InnerSource {
@@ -174,7 +183,9 @@ impl Source {
                 io_requirements: ioreq,
                 enqueued: None,
                 timeout: None,
+                #[cfg(feature = "stats")]
                 stats_collection,
+                #[cfg(feature = "stats")]
                 task_queue,
             })),
         }
@@ -229,6 +240,7 @@ impl Source {
     ///
     /// If a scheduler latency collection function is present, invoke it once.
     pub(crate) fn result(&self) -> Option<io::Result<usize>> {
+        #[allow(unused_mut)]
         let mut inner = self.inner.borrow_mut();
         let ret = inner
             .wakers
@@ -239,6 +251,7 @@ impl Source {
             return ret;
         }
 
+        #[cfg(feature = "stats")]
         if let Some(Some(stat_fn)) = inner.stats_collection.as_ref().map(|x| x.latency) {
             if let Some(lat) = inner.wakers.timestamps() {
                 drop(inner);
@@ -301,6 +314,7 @@ impl Source {
         self.inner.borrow().raw
     }
 
+    #[cfg(feature = "stats")]
     pub(crate) fn stats_collection(&self) -> Option<StatsCollection> {
         self.inner.borrow().stats_collection
     }

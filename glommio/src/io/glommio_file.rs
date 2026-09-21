@@ -549,7 +549,12 @@ impl GlommioFile {
 
     pub(crate) async fn remove(&self) -> Result<()> {
         let path = self.path_required("remove")?.to_owned();
-        let source = self.reactor.upgrade().unwrap().remove_file(&*path).await;
+        let source = self
+            .reactor
+            .upgrade()
+            .unwrap()
+            .remove_file(crate::sys::source::NativePath::try_from(&*path)?)
+            .await;
 
         source.collect_rw().await.map_err(|source| {
             GlommioError::create_enhanced(

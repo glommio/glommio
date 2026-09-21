@@ -69,6 +69,10 @@ enum UringOpDescriptor {
     SockSendMsg(*mut libc::msghdr, i32),
     SockRecv(usize, i32),
     SockRecvMsg(usize, i32),
+    Rename(*const u8, *const u8),
+    Remove(*const u8),
+    CreateDir(*const u8, u32),
+    Truncate(u64),
     Nop,
 }
 
@@ -293,6 +297,72 @@ fn io_uring_disabled() -> Option<u8> {
         .ok()
 }
 
+/// Opcodes glommio uses when the kernel has them and works around when it does
+/// not.
+///
+/// Separate from [`GLOMMIO_URING_OPS`] because a missing one of these is not a
+/// reason to refuse to run: the operation goes to the blocking pool instead,
+/// which is where all of them went before. Keeping them out of the required
+/// list is what lets the documented 5.8 floor stay where it is while kernels
+/// that have these skip a thread boundary.
+static GLOMMIO_OPTIONAL_URING_OPS: &[(&str, u8)] = &[
+    ("RENAMEAT", io_uring::opcode::RenameAt::CODE),
+    ("UNLINKAT", io_uring::opcode::UnlinkAt::CODE),
+    ("MKDIRAT", io_uring::opcode::MkDirAt::CODE),
+    ("FTRUNCATE", io_uring::opcode::Ftruncate::CODE),
+];
+
+lazy_static! {
+    /// Which of [`GLOMMIO_OPTIONAL_URING_OPS`] this kernel has.
+    ///
+    /// Probed once. The answer is a property of the kernel rather than of a
+    /// ring, so every executor in the process shares it.
+    static ref OPTIONAL_OPS: Vec<u8> = probe_optional_operations();
+}
+
+/// Names the optional opcodes an operator has told us not to use.
+///
+/// `GLOMMIO_DISABLE_URING_OPS=UNLINKAT,MKDIRAT` sends those two back to the
+/// blocking pool on a kernel that supports them. It exists so the fallback is
+/// reachable on a machine where everything probes clean, which is every
+/// machine the fallback most needs testing on, and so an operator who finds a
+/// kernel where one of these misbehaves can back it out without a new build.
+fn disabled_by_environment() -> Vec<String> {
+    std::env::var("GLOMMIO_DISABLE_URING_OPS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(|name| name.trim().to_ascii_uppercase())
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn probe_optional_operations() -> Vec<u8> {
+    let Ok(ring) = io_uring::IoUring::new(1) else {
+        return Vec::new();
+    };
+    let mut probe = io_uring::Probe::new();
+    if ring.submitter().register_probe(&mut probe).is_err() {
+        return Vec::new();
+    }
+
+    let disabled = disabled_by_environment();
+    GLOMMIO_OPTIONAL_URING_OPS
+        .iter()
+        .filter(|(name, opcode)| {
+            probe.is_supported(*opcode) && !disabled.iter().any(|off| off == name)
+        })
+        .map(|(_, opcode)| *opcode)
+        .collect()
+}
+
+/// Whether an optional opcode can be submitted on this kernel.
+pub(crate) fn supports_optional_op(opcode: u8) -> bool {
+    OPTIONAL_OPS.contains(&opcode)
+}
+
 /// Checks the kernel implements every opcode glommio submits.
 fn check_supported_operations(ops: &[(&'static str, u8)]) -> Result<(), UringUnsupported> {
     let ring = io_uring::IoUring::new(1).map_err(UringUnsupported::SetupFailed)?;
@@ -434,6 +504,23 @@ where
             UringOpDescriptor::Open(path, flags, mode) => {
                 opcode::OpenAt::new(fd, path as *const libc::c_char)
                     .flags(flags)
+                    .mode(mode)
+                    .build()
+            }
+            UringOpDescriptor::Rename(old, new) => opcode::RenameAt::new(
+                types::Fd(libc::AT_FDCWD),
+                old as *const libc::c_char,
+                types::Fd(libc::AT_FDCWD),
+                new as *const libc::c_char,
+            )
+            .build(),
+            UringOpDescriptor::Remove(path) => {
+                opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), path as *const libc::c_char)
+                    .build()
+            }
+            UringOpDescriptor::Truncate(len) => opcode::Ftruncate::new(fd, len).build(),
+            UringOpDescriptor::CreateDir(path, mode) => {
+                opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), path as *const libc::c_char)
                     .mode(mode)
                     .build()
             }
@@ -1738,19 +1825,68 @@ impl Reactor {
         self.blocking_thread.push(op, source)
     }
 
+    /// Truncates on the ring where the kernel has `FTRUNCATE`.
+    ///
+    /// That opcode arrived in 6.9, so the blocking path is the one most
+    /// kernels in service still take.
     pub(crate) fn truncate(&self, source: &Source, size: u64) -> impl Future<Output = ()> {
-        let op = BlockingThreadOp::Truncate(source.raw(), size as _);
-        self.enqueue_blocking_request(source.inner.clone(), op)
-    }
-
-    pub(crate) fn rename(&self, source: &Source) -> impl Future<Output = ()> {
-        let (old_path, new_path) = match &*source.source_type() {
-            SourceType::Rename(o, n) => (o.clone(), n.clone()),
-            _ => panic!("Unexpected source for rename operation"),
+        let blocking = if supports_optional_op(opcode::Ftruncate::CODE) {
+            queue_request_into_ring(
+                &mut *self.ring_for_source(source),
+                source,
+                UringOpDescriptor::Truncate(size),
+                &mut self.source_map.borrow_mut(),
+            );
+            None
+        } else {
+            Some(self.enqueue_blocking_request(
+                source.inner.clone(),
+                BlockingThreadOp::Truncate(source.raw(), size as _),
+            ))
         };
 
-        let op = BlockingThreadOp::Rename(old_path, new_path);
-        self.enqueue_blocking_request(source.inner.clone(), op)
+        async move {
+            if let Some(waiter) = blocking {
+                waiter.await;
+            }
+        }
+    }
+
+    /// Renames on the ring where the kernel has `RENAMEAT`, and on the
+    /// blocking pool where it does not.
+    ///
+    /// The source owns both paths for as long as the operation is in flight,
+    /// which is what makes handing their pointers to the kernel sound.
+    pub(crate) fn rename(&self, source: &Source) -> impl Future<Output = ()> {
+        let blocking = if supports_optional_op(opcode::RenameAt::CODE) {
+            let (old_path, new_path) = match &*source.source_type() {
+                SourceType::Rename(o, n) => (o.as_ptr(), n.as_ptr()),
+                _ => panic!("Unexpected source for rename operation"),
+            };
+            let op = UringOpDescriptor::Rename(old_path as _, new_path as _);
+            queue_request_into_ring(
+                &mut *self.ring_for_source(source),
+                source,
+                op,
+                &mut self.source_map.borrow_mut(),
+            );
+            None
+        } else {
+            let (old_path, new_path) = match &*source.source_type() {
+                SourceType::Rename(o, n) => (o.clone(), n.clone()),
+                _ => panic!("Unexpected source for rename operation"),
+            };
+            Some(self.enqueue_blocking_request(
+                source.inner.clone(),
+                BlockingThreadOp::Rename(old_path, new_path),
+            ))
+        };
+
+        async move {
+            if let Some(waiter) = blocking {
+                waiter.await;
+            }
+        }
     }
 
     pub(crate) fn copy_file_range(&self, source: &Source, pos: u64) -> impl Future<Output = ()> {
@@ -1769,28 +1905,73 @@ impl Reactor {
         self.enqueue_blocking_request(source.inner.clone(), op)
     }
 
+    /// Creates a directory on the ring where the kernel has `MKDIRAT`.
     pub(crate) fn create_dir(
         &self,
         source: &Source,
         mode: libc::c_int,
     ) -> impl Future<Output = ()> {
-        let path = match &*source.source_type() {
-            SourceType::CreateDir(p) => p.clone(),
-            _ => panic!("Unexpected source for rename operation"),
+        let blocking = if supports_optional_op(opcode::MkDirAt::CODE) {
+            let path = match &*source.source_type() {
+                SourceType::CreateDir(p) => p.as_ptr(),
+                _ => panic!("Unexpected source for create_dir operation"),
+            };
+            let op = UringOpDescriptor::CreateDir(path as _, mode as u32);
+            queue_request_into_ring(
+                &mut *self.ring_for_source(source),
+                source,
+                op,
+                &mut self.source_map.borrow_mut(),
+            );
+            None
+        } else {
+            let path = match &*source.source_type() {
+                SourceType::CreateDir(p) => p.clone(),
+                _ => panic!("Unexpected source for create_dir operation"),
+            };
+            Some(self.enqueue_blocking_request(
+                source.inner.clone(),
+                BlockingThreadOp::CreateDir(path, mode),
+            ))
         };
 
-        let op = BlockingThreadOp::CreateDir(path, mode);
-        self.enqueue_blocking_request(source.inner.clone(), op)
+        async move {
+            if let Some(waiter) = blocking {
+                waiter.await;
+            }
+        }
     }
 
+    /// Unlinks on the ring where the kernel has `UNLINKAT`.
     pub(crate) fn remove_file(&self, source: &Source) -> impl Future<Output = ()> {
-        let path = match &*source.source_type() {
-            SourceType::Remove(path) => path.clone(),
-            _ => panic!("Unexpected source for remove operation"),
+        let blocking = if supports_optional_op(opcode::UnlinkAt::CODE) {
+            let path = match &*source.source_type() {
+                SourceType::Remove(p) => p.as_ptr(),
+                _ => panic!("Unexpected source for remove operation"),
+            };
+            let op = UringOpDescriptor::Remove(path as _);
+            queue_request_into_ring(
+                &mut *self.ring_for_source(source),
+                source,
+                op,
+                &mut self.source_map.borrow_mut(),
+            );
+            None
+        } else {
+            let path = match &*source.source_type() {
+                SourceType::Remove(p) => p.clone(),
+                _ => panic!("Unexpected source for remove operation"),
+            };
+            Some(
+                self.enqueue_blocking_request(source.inner.clone(), BlockingThreadOp::Remove(path)),
+            )
         };
 
-        let op = BlockingThreadOp::Remove(path);
-        self.enqueue_blocking_request(source.inner.clone(), op)
+        async move {
+            if let Some(waiter) = blocking {
+                waiter.await;
+            }
+        }
     }
 
     pub(crate) fn run_blocking(
@@ -2255,6 +2436,35 @@ mod tests {
             assert!(
                 GLOMMIO_URING_OPS.iter().any(|(_, probed)| *probed == code),
                 "opcode {code} is submitted but never probed"
+            );
+        }
+    }
+
+    /// Optional opcodes are probed too, and are not quietly required.
+    ///
+    /// An opcode in the required list refuses to start on a kernel without it.
+    /// These three have a blocking fallback precisely so they do not, and the
+    /// documented floor stays where it is. Moving one across would raise the
+    /// floor to that opcode's kernel without anybody noticing.
+    #[test]
+    fn optional_opcodes_are_probed_and_stay_optional() {
+        let optional = [
+            opcode::RenameAt::CODE,
+            opcode::UnlinkAt::CODE,
+            opcode::MkDirAt::CODE,
+            opcode::Ftruncate::CODE,
+        ];
+
+        for code in optional {
+            assert!(
+                GLOMMIO_OPTIONAL_URING_OPS
+                    .iter()
+                    .any(|(_, probed)| *probed == code),
+                "optional opcode {code} is submitted but never probed"
+            );
+            assert!(
+                !GLOMMIO_URING_OPS.iter().any(|(_, probed)| *probed == code),
+                "optional opcode {code} is in the required list, which raises the kernel floor"
             );
         }
     }

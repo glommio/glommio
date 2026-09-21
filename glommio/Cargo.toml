@@ -138,3 +138,11 @@ name    = "echo"
 [[bench]]
 harness = false
 name    = "competing_io"
+
+[[bench]]
+harness = false
+name    = "blocking_pool_isolation"
+
+[[bench]]
+harness = false
+name    = "filesystem_ops"

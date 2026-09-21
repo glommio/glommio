@@ -19,10 +19,11 @@ rust-version.workspace = true
 [features]
 bench                 = []
 debugging             = []
-default               = ["macros"]
+default               = []
 macros                = ["dep:glommio-macros"]
 native-tls            = []
 nightly               = ["native-tls"]
+stats                 = ["dep:sketches-ddsketch"]
 version-compatibility = []
 
 [dependencies]
@@ -44,7 +45,7 @@ pin-project-lite      = "0.2"
 rlimit                = "0.10"
 scopeguard            = "1.2"
 signal-hook           = { version = "0.4" }
-sketches-ddsketch     = "0.3"
+sketches-ddsketch     = { version = "0.3", optional = true }
 smallvec              = { version = "1.15", features = ["union"] }
 socket2               = { version = "0.6", features = ["all"] }
 tracing               = "0.1"
@@ -56,6 +57,7 @@ rustc_version = "0.4.1"
 criterion = { version = "0.8.2", default-features = false, features = ["async", "cargo_bench_support"] }
 fastrand = "2.3"
 futures = "0.3"
+glommio = { path = ".", default-features = false, features = ["macros"] }
 hdrhistogram = "7.5"
 pretty_env_logger = "0.5"
 public-api       = "0.51.0"
@@ -108,6 +110,7 @@ name    = "preempt"
 [[bench]]
 harness = false
 name    = "socket_io"
+required-features = ["stats"]
 
 [[bench]]
 harness = false

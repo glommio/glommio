@@ -2917,10 +2917,16 @@ impl ExecutorProxy {
         async move {
             let source = waiter.await;
             assert!(source.collect_rw().await.is_ok());
+            // The pool dropped its handle before answering `collect_rw`, so this
+            // is the last one. Not an `unwrap`: the error arm hands back the
+            // `Arc`, which is only `Debug` if `R` is.
             let Ok(cell) = Arc::try_unwrap(outcome) else {
                 unreachable!("the blocking pool still holds the outcome")
             };
-            match cell.into_inner().expect("the outcome mutex was poisoned") {
+            // The lock is only ever held to store the outcome, and storing it
+            // replaces a `Pending` that has nothing to drop, so nothing can
+            // unwind while holding it and the mutex cannot be poisoned.
+            match cell.into_inner().unwrap() {
                 BlockingOutcome::Produced(value) => value,
                 BlockingOutcome::Panicked(payload) => std::panic::resume_unwind(payload),
                 BlockingOutcome::Pending => {

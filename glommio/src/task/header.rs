@@ -4,9 +4,12 @@
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
 use core::{fmt, task::Waker};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(feature = "debugging")]
 use std::sync::Arc;
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+};
 
 use crate::task::{raw::TaskVTable, state::*, utils::abort_on_panic};
 
@@ -58,7 +61,7 @@ pub(crate) struct Header {
     /// The task that is blocked on the `JoinHandle`.
     ///
     /// This waker needs to be woken up once the task completes or is closed.
-    pub(crate) awaiter: Option<Waker>,
+    pub(crate) awaiter: Cell<Option<Waker>>,
 
     /// The virtual table.
     ///
@@ -80,9 +83,9 @@ impl Header {
     /// If the awaiter is the same as the current waker, it will not be
     /// notified.
     #[inline]
-    pub(crate) unsafe fn notify(header: *mut Self, current: Option<&Waker>) {
+    pub(crate) fn notify(awaiter: &Cell<Option<Waker>>, current: Option<&Waker>) {
         // Take the waker out.
-        let waker = (*header).awaiter.take();
+        let waker = awaiter.take();
 
         if let Some(w) = waker {
             // We need a safeguard against panics because waking can panic.
@@ -99,11 +102,11 @@ impl Header {
     /// This method is called when `JoinHandle` is polled and the task has not
     /// completed.
     #[inline]
-    pub(crate) unsafe fn register(header: *mut Self, waker: &Waker) {
+    pub(crate) fn register(awaiter: &Cell<Option<Waker>>, waker: &Waker) {
         // Do not hold a mutable borrow across a user-provided waker callback.
         abort_on_panic(|| {
             let waker = waker.clone();
-            let previous = (*header).awaiter.replace(waker);
+            let previous = awaiter.replace(Some(waker));
             drop(previous);
         });
     }

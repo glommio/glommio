@@ -140,6 +140,45 @@ mod test {
         })
     }
 
+    /// Registering a task's own waker clones it; cancellation wakes it inline.
+    /// Both callbacks access the same header. Under Miri's Stacked Borrows,
+    /// holding an exclusive header reference across either callback is UB,
+    /// even though the notification never polls the future synchronously.
+    #[test]
+    fn self_waker_can_be_registered_and_notified_on_cancellation() {
+        let _owned = own_tasks();
+        let sink: Collected = Default::default();
+        let saved_waker = Rc::new(RefCell::new(None));
+        let saved = saved_waker.clone();
+        let polls = Rc::new(std::cell::Cell::new(0));
+        let poll_count = polls.clone();
+        let (runnable, mut handle) = spawn_capturing(
+            std::future::poll_fn(move |cx| {
+                poll_count.set(poll_count.get() + 1);
+                *saved.borrow_mut() = Some(cx.waker().clone());
+                Poll::<()>::Pending
+            }),
+            sink.clone(),
+        );
+        runnable.run();
+        let waker = saved_waker
+            .borrow_mut()
+            .take()
+            .expect("task was not polled");
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(Pin::new(&mut handle).poll(&mut cx), Poll::Pending);
+        handle.cancel();
+        assert_eq!(polls.get(), 1, "notification must not poll the future");
+        assert_eq!(sink.borrow().len(), 1, "cancellation must queue cleanup");
+
+        let cleanup = sink.borrow_mut().pop().expect("missing cleanup runnable");
+        cleanup.run();
+        assert_eq!(poll_once(&mut handle), Poll::Ready(None));
+        assert_eq!(polls.get(), 1, "cleanup must not poll the cancelled future");
+        assert!(sink.borrow().is_empty());
+    }
+
     #[test]
     fn run_to_completion_yields_output() {
         let _owned = own_tasks();

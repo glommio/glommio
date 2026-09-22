@@ -152,7 +152,7 @@ where
                 prev_link: core::ptr::null_mut(),
                 next: core::ptr::null_mut(),
                 scheduling: false,
-                awaiter: None,
+                awaiter: Default::default(),
                 vtable: &TaskVTable {
                     schedule: Self::schedule_owned,
                     get_output: Self::get_output,
@@ -477,7 +477,7 @@ where
         (*header).active.store(false, Ordering::Release);
         (*header).state |= SCHEDULE_DROPPED;
         abort_on_panic(|| (raw.schedule as *mut S).drop_in_place());
-        Header::notify(header, None);
+        Header::notify(&(*header).awaiter, None);
 
         #[cfg(feature = "debugging")]
         TaskDebugger::detach(ptr);
@@ -497,7 +497,7 @@ where
             (*header).state = ((*header).state & !SCHEDULED) | RUNNING;
             Self::drop_future(ptr);
             (*header).state &= !RUNNING;
-            Header::notify(header, None);
+            Header::notify(&(*header).awaiter, None);
         }
     }
 
@@ -513,7 +513,7 @@ where
             (*header).state |= SCHEDULED;
             Self::schedule(ptr);
         }
-        Header::notify(header, None);
+        Header::notify(&(*header).awaiter, None);
     }
 
     /// Drops outputs locally and routes abandoned futures through owner cleanup.
@@ -566,7 +566,7 @@ where
             FUTURE_DROPPED | SCHEDULE_DROPPED,
         );
         debug_assert!((*header).prev_link.is_null());
-        debug_assert!((*header).awaiter.is_none());
+        debug_assert!((*header).awaiter.get_mut().is_none());
         #[cfg(feature = "debugging")]
         (*header).debugger_count.fetch_sub(1, Ordering::Relaxed);
         abort_on_panic(|| header.drop_in_place());
@@ -601,13 +601,13 @@ where
                     drop(Self::take_output(ptr));
                 }
                 (*header).state &= !RUNNING;
-                Header::notify(header, None);
+                Header::notify(&(*header).awaiter, None);
             }
             Poll::Pending => {
                 if (*header).state & CLOSED != 0 {
                     Self::drop_future(ptr);
                     (*header).state &= !(RUNNING | SCHEDULED);
-                    Header::notify(header, None);
+                    Header::notify(&(*header).awaiter, None);
                 } else {
                     (*header).state &= !RUNNING;
                     if (*header).state & SCHEDULED != 0 {
@@ -653,7 +653,7 @@ where
             (*header).active.store(false, Ordering::Release);
             RawTask::<F, R, S>::drop_future(header as *const ());
             (*header).state &= !(RUNNING | SCHEDULED);
-            Header::notify(header, None);
+            Header::notify(&(*header).awaiter, None);
             RawTask::<F, R, S>::finish(header as *const ());
             RawTask::<F, R, S>::release(header as *const ());
         }

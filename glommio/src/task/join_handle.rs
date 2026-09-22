@@ -79,20 +79,20 @@ impl<R> Future for JoinHandle<R> {
                 // future itself to be dropped.
                 if state & FUTURE_DROPPED == 0 || state & RUNNING != 0 {
                     // Replace the waker with one associated with the current task.
-                    Header::register(header, cx.waker());
+                    Header::register(&(*header).awaiter, cx.waker());
                     return Poll::Pending;
                 }
 
                 // Even though the awaiter is most likely the current task, it could also be
                 // another task.
-                Header::notify(header, Some(cx.waker()));
+                Header::notify(&{ &*header }.awaiter, Some(cx.waker()));
                 return Poll::Ready(None);
             }
 
             // If the task is not completed, register the current task.
             if state & COMPLETED == 0 {
                 // Replace the waker with one associated with the current task.
-                Header::register(header, cx.waker());
+                Header::register(&(*header).awaiter, cx.waker());
 
                 return Poll::Pending;
             }
@@ -101,7 +101,7 @@ impl<R> Future for JoinHandle<R> {
 
             // Notify the awaiter. Even though the awaiter is most likely the current
             // task, it could also be another task.
-            Header::notify(header, Some(cx.waker()));
+            Header::notify(&(*header).awaiter, Some(cx.waker()));
 
             // Take the output from the task.
             let output = ((*header).vtable.get_output)(ptr) as *mut R;

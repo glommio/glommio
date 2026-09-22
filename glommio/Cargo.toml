@@ -41,7 +41,6 @@ log                   = "0.4"
 nix                   = { version = "0.30", features = ["event", "fs", "ioctl", "mman", "net", "poll", "sched", "time"] }
 pin-project-lite      = "0.2"
 rlimit                = "0.10"
-scoped-tls            = "1.0"
 scopeguard            = "1.2"
 signal-hook           = { version = "0.4" }
 sketches-ddsketch     = "0.3"

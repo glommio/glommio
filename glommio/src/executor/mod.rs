@@ -65,6 +65,8 @@ use std::{
 use tracing::trace;
 
 mod latch;
+#[cfg(any(not(nightly), not(feature = "native-tls")))]
+mod local_context;
 mod multitask;
 mod placement;
 pub mod stall;
@@ -85,7 +87,7 @@ use crate::Result;
 static mut LOCAL_EX: *const LocalExecutor = std::ptr::null();
 
 #[cfg(any(not(nightly), not(feature = "native-tls")))]
-scoped_tls::scoped_thread_local!(static LOCAL_EX: LocalExecutor);
+use local_context::LOCAL_EX;
 
 /// Returns a proxy struct to the [`LocalExecutor`]
 #[inline(always)]
@@ -126,11 +128,7 @@ pub fn early_init() {
 pub(crate) fn executor_id() -> Option<usize> {
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     {
-        if LOCAL_EX.is_set() {
-            Some(LOCAL_EX.with(|ex| ex.id))
-        } else {
-            None
-        }
+        LOCAL_EX.try_with(|ex| ex.id)
     }
 
     #[cfg(all(nightly, feature = "native-tls"))]
@@ -1126,14 +1124,12 @@ pub(crate) fn schedule_runnable(runnable: multitask::Runnable) {
 
     #[cfg(any(not(nightly), not(feature = "native-tls")))]
     {
-        if LOCAL_EX.is_set() {
-            LOCAL_EX.with(|local_ex| {
-                if let Some(tq) = local_ex.get_queue(&handle) {
-                    tq.borrow().ex.push_task(runnable);
-                    maybe_activate(tq);
-                }
-            });
-        }
+        LOCAL_EX.try_with(|local_ex| {
+            if let Some(tq) = local_ex.get_queue(&handle) {
+                tq.borrow().ex.push_task(runnable);
+                maybe_activate(tq);
+            }
+        });
     }
 
     #[cfg(all(nightly, feature = "native-tls"))]
@@ -1157,12 +1153,10 @@ pub(crate) fn maybe_activate(tq: Rc<RefCell<TaskQueue>>) {
         // Reaching for it unconditionally panics a second time, and a panic
         // during a panic aborts the process. There is nothing to activate at
         // that point anyway, so skipping is both safe and correct.
-        if LOCAL_EX.is_set() {
-            LOCAL_EX.with(|local_ex| {
-                let mut queues = local_ex.queues.borrow_mut();
-                queues.maybe_activate(tq);
-            });
-        }
+        LOCAL_EX.try_with(|local_ex| {
+            let mut queues = local_ex.queues.borrow_mut();
+            queues.maybe_activate(tq);
+        });
     }
 
     #[cfg(all(nightly, feature = "native-tls"))]
@@ -2294,8 +2288,8 @@ impl ExecutorProxy {
     pub async fn yield_if_needed(&self) {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         {
-            let need_yield = if LOCAL_EX.is_set() {
-                LOCAL_EX.with(|local_ex| {
+            let need_yield = LOCAL_EX
+                .try_with(|local_ex| {
                     if local_ex.need_preempt() {
                         local_ex.mark_me_for_yield();
                         true
@@ -2303,10 +2297,7 @@ impl ExecutorProxy {
                         false
                     }
                 })
-            } else {
-                // We are not in a glommio context
-                false
-            };
+                .unwrap_or(false);
 
             if need_yield {
                 futures_lite::future::yield_now().await;
@@ -2343,11 +2334,9 @@ impl ExecutorProxy {
     pub async fn yield_task_queue_now(&self) {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
         {
-            if LOCAL_EX.is_set() {
-                LOCAL_EX.with(|local_ex| {
-                    local_ex.mark_me_for_yield();
-                })
-            }
+            LOCAL_EX.try_with(|local_ex| {
+                local_ex.mark_me_for_yield();
+            });
             futures_lite::future::yield_now().await;
         }
 

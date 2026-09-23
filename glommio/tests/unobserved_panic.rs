@@ -1,10 +1,11 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! Choosing what happens to a blocking panic nobody is waiting for.
 
 use glommio::{LocalExecutorBuilder, UnobservedPanic};
 use std::{
+    os::unix::process::ExitStatusExt,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -84,5 +85,34 @@ fn a_collected_panic_is_not_reported_as_unobserved() {
         seen.load(Ordering::SeqCst),
         0,
         "a collected panic must not reach the unobserved handler"
+    );
+}
+
+/// `Abort` ends the process, so it cannot be asserted from inside the process
+/// it ends. The child re-runs this same test with the marker set and takes the
+/// abort; the parent checks how it died rather than what it printed.
+#[test]
+fn abort_ends_the_process() {
+    const MARKER: &str = "GLOMMIO_TEST_UNOBSERVED_ABORT_CHILD";
+
+    if std::env::var_os(MARKER).is_some() {
+        abandon_a_panicking_job(UnobservedPanic::Abort);
+        unreachable!("Abort should have ended this process");
+    }
+
+    let child = std::process::Command::new(
+        std::env::current_exe().expect("the test binary has to be re-runnable"),
+    )
+    .args(["abort_ends_the_process", "--exact", "--test-threads=1"])
+    .env(MARKER, "1")
+    .output()
+    .expect("failed to re-run the test binary");
+
+    assert_eq!(
+        child.status.signal(),
+        Some(libc::SIGABRT),
+        "expected the child to abort, it exited {:?}\nstderr:\n{}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
     );
 }

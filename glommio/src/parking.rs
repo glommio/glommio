@@ -51,7 +51,7 @@ impl Parker {
 
     /// Blocks until notified and then goes back into sleeping state.
     pub(crate) fn park(&self) -> io::Result<bool> {
-        self.inner.park(|| None)
+        self.inner.park(|| None, true)
     }
 
     /// Performs non-sleepable poll and installs a preemption timeout into the
@@ -60,7 +60,7 @@ impl Parker {
     /// this will be able to check if the timer has elapsed and yield the
     /// CPU if that is the case.
     pub(crate) fn poll_io(&self, timeout: impl Fn() -> Option<Duration>) -> io::Result<bool> {
-        self.inner.park(timeout)
+        self.inner.park(timeout, false)
     }
 }
 
@@ -82,7 +82,7 @@ impl fmt::Debug for Parker {
 struct Inner {}
 
 impl Inner {
-    fn park(&self, timeout: impl Fn() -> Option<Duration>) -> io::Result<bool> {
-        crate::executor().reactor().react(timeout)
+    fn park(&self, timeout: impl Fn() -> Option<Duration>, may_sleep: bool) -> io::Result<bool> {
+        crate::executor().reactor().react(timeout, may_sleep)
     }
 }

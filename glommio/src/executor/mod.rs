@@ -1408,15 +1408,34 @@ impl LocalExecutor {
         ex.spawn_and_run(id, tq, future)
     }
 
-    /// Spawns a task directly onto this executor instance.
+    /// Spawns a task onto this executor.
     ///
-    /// Unlike [`spawn_local`], this uses the executor you already have a
-    /// reference to rather than a thread-local, so it **never panics** and can
-    /// be called from any context — including before [`run`] has been called,
-    /// which is useful for setting work up in advance.
+    /// Unlike [`spawn_local`], this does not look the executor up through a
+    /// thread-local, so it can be called before [`run`].
     ///
-    /// This is only reachable from the thread that owns the executor, since
-    /// [`LocalExecutor`] is not [`Send`].
+    /// The future is polled once inside this call. If that happens before
+    /// [`run`], no executor is installed on the thread during the poll.
+    ///
+    /// The future must be `'static`, as with [`spawn_local`]. A future that
+    /// borrows a local does not compile:
+    ///
+    /// ```compile_fail,E0597
+    /// use glommio::LocalExecutor;
+    ///
+    /// let executor = LocalExecutor::default();
+    /// let task;
+    /// {
+    ///     let local = String::from("dropped before the task runs");
+    ///     task = executor.spawn(async { local.clone() });
+    /// }
+    /// executor.run(task);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Before [`run`], this function will panic if the first poll of the
+    /// future uses a glommio API such as a timer, a channel or
+    /// [`spawn_local`]. If you need that, spawn from inside [`run`] instead.
     ///
     /// # Examples
     ///
@@ -1434,7 +1453,10 @@ impl LocalExecutor {
     ///
     /// [`spawn_local`]: crate::spawn_local
     /// [`run`]: LocalExecutor::run
-    pub fn spawn<T>(&self, future: impl Future<Output = T>) -> Task<T> {
+    pub fn spawn<T>(&self, future: impl Future<Output = T> + 'static) -> Task<T>
+    where
+        T: 'static,
+    {
         Task(self.spawn_internal(future))
     }
 

@@ -177,6 +177,10 @@ name    = "blocking_pool_isolation"
 harness = false
 name    = "filesystem_ops"
 
+[[bench]]
+harness = false
+name    = "timer_burst"
+
 [[example]]
 name = "pingpong_ladder"
 path = "examples/pingpong_ladder.rs"

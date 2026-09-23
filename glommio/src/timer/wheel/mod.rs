@@ -22,6 +22,10 @@
 //! rounded, and how much work answering "what is due next" is worth.
 
 #![warn(missing_docs, missing_debug_implementations)]
+// The module is `pub` only under the `bench` feature. A default build reaches
+// it from the reactor alone, which wants a fraction of the surface, so the rest
+// is unused there by construction rather than by neglect.
+#![cfg_attr(not(feature = "bench"), allow(dead_code, unused_imports))]
 
 #[cfg(test)]
 mod contract_tests;

@@ -2080,12 +2080,36 @@ impl Reactor {
         preempt_timer: Preempt,
         user_timer: Option<Duration>,
         may_sleep: bool,
-        mut woke: usize,
+        woke: usize,
         process_remote_channels: F,
     ) -> io::Result<bool>
     where
         Preempt: Fn() -> Option<Duration>,
         F: Fn() -> usize,
+    {
+        self.wait_with_after_drain(
+            preempt_timer,
+            user_timer,
+            may_sleep,
+            woke,
+            process_remote_channels,
+            |_| {},
+        )
+    }
+
+    fn wait_with_after_drain<Preempt, F, AfterDrain>(
+        &self,
+        preempt_timer: Preempt,
+        user_timer: Option<Duration>,
+        may_sleep: bool,
+        mut woke: usize,
+        process_remote_channels: F,
+        after_drain: AfterDrain,
+    ) -> io::Result<bool>
+    where
+        Preempt: Fn() -> Option<Duration>,
+        F: Fn() -> usize,
+        AfterDrain: FnOnce(&Self),
     {
         woke += self.flush_syscall_thread();
 
@@ -2120,6 +2144,27 @@ impl Reactor {
         flush_cancellations!(into &mut woke; lat_ring, poll_ring, main_ring);
         flush_rings!(lat_ring, poll_ring, main_ring)?;
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
+        after_drain(self);
+
+        // Both halves of the keep decision are re-read here, because the drain
+        // above can invalidate either one and the first look happened before
+        // it. The retained timer's own completion can be consumed there, which
+        // leaves it looking armed while nothing is; and a completion can wake a
+        // latency-sensitive queue, which shortens what the timer should be.
+        let wanted = preempt_timer();
+        let still_pending = match self.latency_preemption_timeout_src.take() {
+            Some(src) if src.result().is_none() => {
+                self.latency_preemption_timeout_src.set(Some(src));
+                true
+            }
+            other => {
+                drop(other);
+                self.latency_preemption_armed_for.set(None);
+                false
+            }
+        };
+        let armed_is_usable =
+            armed_is_usable && still_pending && self.latency_preemption_armed_for.get() == wanted;
 
         let should_sleep = may_sleep
             && (woke == 0)
@@ -2159,6 +2204,10 @@ impl Reactor {
             self.latency_preemption_armed_for.set(Some(preempt));
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
+            // The line above can drop a timer that had not fired, which happens
+            // when the drain shortened `wanted`. Its cancellation is submitted
+            // here rather than left for the next pass to flush.
+            flush_cancellations!(into &mut 0; lat_ring);
             flush_rings!(lat_ring, main_ring)?;
         }
 
@@ -2446,6 +2495,70 @@ mod tests {
         reactor.wait(|| None, None, true, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
         assert!((300..350).contains(&elapsed_ms));
+    }
+
+    /// Injects the state produced by a timer completion after the keep decision.
+    #[test]
+    fn review_rearms_timer_completed_during_drain() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let duration = Duration::from_millis(100);
+        let source = Source::new(
+            IoRequirements::default(),
+            -1,
+            SourceType::Timeout(TimeSpec64::try_from(duration).unwrap(), 0),
+            None,
+            None,
+        );
+        let original = source.inner.clone();
+        reactor.latency_preemption_timeout_src.set(Some(source));
+        reactor.latency_preemption_armed_for.set(Some(duration));
+        reactor
+            .wait_with_after_drain(
+                || Some(duration),
+                None,
+                false,
+                0,
+                || 0,
+                |_| {
+                    original.borrow_mut().wakers.result =
+                        Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
+                },
+            )
+            .unwrap();
+        let current = reactor.latency_preemption_timeout_src.take().unwrap();
+        assert!(
+            current.result().is_none(),
+            "completed timer was retained instead of rearmed"
+        );
+        assert!(
+            !std::ptr::eq(&*original, &*current.inner),
+            "timer source was not replaced"
+        );
+        reactor.latency_preemption_timeout_src.set(Some(current));
+    }
+
+    /// Injects the timeout change produced by waking a latency-sensitive queue.
+    #[test]
+    fn review_refreshes_timeout_after_drain() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let long = Duration::from_millis(100);
+        let short = Duration::from_millis(1);
+        let requested = Cell::new(long);
+        reactor
+            .wait_with_after_drain(
+                || Some(requested.get()),
+                None,
+                false,
+                0,
+                || 0,
+                |_| requested.set(short),
+            )
+            .unwrap();
+        assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));
     }
 
     #[test]

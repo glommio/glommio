@@ -253,12 +253,14 @@ impl<S: AsRawFd> NonBufferedStream<S> {
         Ok(sz)
     }
 
-    /// Starts an early poll if the buffer is not fully filled, so when the
-    /// next time `poll_read` is called, it will be known immediately whether
-    /// the underlying stream is ready for reading.
+    /// Speculates with a plain `recv`, and registers for readiness only when
+    /// that comes back empty.
     ///
-    /// The `rush_dispatch` calls that used to live here and after could be
-    /// removed to improve performance if #458 is handled appropriately.
+    /// Nothing is registered after a read that succeeded. Doing so used to be
+    /// a bet that the next read would have to wait, so arming now would save
+    /// arming then. It does not pay: the saving is one `recv` returning
+    /// `EAGAIN`, and the price is an SQE, a kernel enter and a completion on
+    /// every short read. The syscall is the cheaper of the two.
     pub(crate) fn poll_read(
         &mut self,
         cx: &Context<'_>,
@@ -278,9 +280,6 @@ impl<S: AsRawFd> NonBufferedStream<S> {
                 self.source_rx.take();
                 self.read_timeout.cancel_timer(reactor);
                 let result = poll_err!(result);
-                if result > 0 && result < buf.len() {
-                    self.source_rx = Some(reactor.poll_read_ready(self.stream.as_raw_fd()));
-                }
                 return Poll::Ready(Ok(result));
             }
         }

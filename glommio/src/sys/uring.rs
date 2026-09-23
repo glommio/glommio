@@ -1483,6 +1483,58 @@ fn align_up(v: usize, align: usize) -> usize {
     (v + align - 1) & !(align - 1)
 }
 
+/// Evidence that the rings have just been drained, and that nothing has run
+/// since which could change what the preempt timer should be.
+///
+/// Not `Copy` or `Clone` on purpose. Anything that invalidates it takes it by
+/// value, so the reading that depends on it cannot be moved above them without
+/// failing to compile. That is the whole point: every bug this decision has
+/// had was a read placed one step too early, and a comment saying "read this
+/// after the drain" is the kind of instruction that quietly stops being true.
+#[must_use]
+struct Settled(());
+
+/// What the keep-or-rearm decision reads about the latency preemption timer.
+///
+/// Gathered at one point on purpose. The two fields can each be invalidated by
+/// a ring drain, by work arriving from another executor, or by a park, and
+/// every bug this decision has had was one of them being read a step earlier
+/// than the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreemptObservation {
+    /// What the held timer is armed for.
+    ///
+    /// `None` covers holding nothing and holding one that has already fired,
+    /// which the decision treats alike: a fired timer has had its completion
+    /// consumed and will never wake anyone again.
+    armed_for: Option<Duration>,
+    /// What the executor asks for now.
+    wanted: Option<Duration>,
+}
+
+/// What to do with the latency preemption timer at the end of a `wait`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreemptAction {
+    /// Leave what is held alone.
+    Leave,
+    /// Replace what is held with a fresh timer for this duration.
+    Rearm(Duration),
+}
+
+impl PreemptObservation {
+    fn decide(self) -> PreemptAction {
+        match self.wanted {
+            // Nothing asks to be preempted. Anything still held fires once and
+            // is given up on the next pass, which costs one wasted wakeup and
+            // no correctness.
+            None => PreemptAction::Leave,
+            // Held for exactly what is wanted, and it has not fired.
+            Some(wanted) if self.armed_for == Some(wanted) => PreemptAction::Leave,
+            Some(wanted) => PreemptAction::Rearm(wanted),
+        }
+    }
+}
+
 impl Reactor {
     /// Creates a new reactor.
     ///
@@ -2119,20 +2171,11 @@ impl Reactor {
 
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        let wanted = preempt_timer();
-        let armed_is_usable = match self.latency_preemption_timeout_src.take() {
-            Some(src)
-                if src.result().is_none() && self.latency_preemption_armed_for.get() == wanted =>
-            {
-                self.latency_preemption_timeout_src.set(Some(src));
-                true
-            }
-            other => {
-                drop(other);
-                self.latency_preemption_armed_for.set(None);
-                false
-            }
-        };
+        // Give up a timer that has fired, or one armed for a duration nobody
+        // wants any more, while its cancellation can still leave with the
+        // flush below. This is not the keep decision, which is taken once at
+        // the end from a single reading.
+        self.discard_unusable_preempt_timer(preempt_timer());
 
         self.throughput_preemption_timeout_src.replace(Some(
             main_ring.prepare_throughput_preemption_timer(
@@ -2145,26 +2188,7 @@ impl Reactor {
         flush_rings!(lat_ring, poll_ring, main_ring)?;
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
         after_drain(self);
-
-        // Both halves of the keep decision are re-read here, because the drain
-        // above can invalidate either one and the first look happened before
-        // it. The retained timer's own completion can be consumed there, which
-        // leaves it looking armed while nothing is; and a completion can wake a
-        // latency-sensitive queue, which shortens what the timer should be.
-        let wanted = preempt_timer();
-        let still_pending = match self.latency_preemption_timeout_src.take() {
-            Some(src) if src.result().is_none() => {
-                self.latency_preemption_timeout_src.set(Some(src));
-                true
-            }
-            other => {
-                drop(other);
-                self.latency_preemption_armed_for.set(None);
-                false
-            }
-        };
-        let armed_is_usable =
-            armed_is_usable && still_pending && self.latency_preemption_armed_for.get() == wanted;
+        let settled = Settled(());
 
         let should_sleep = may_sleep
             && (woke == 0)
@@ -2172,7 +2196,11 @@ impl Reactor {
             && main_ring.can_sleep()
             && lat_ring.can_sleep();
 
-        if should_sleep {
+        let settled = if should_sleep {
+            // Parking, and the remote channels drained on the way into it, can
+            // both change what the timer should be, so evidence gathered before
+            // them does not carry across.
+            drop(settled);
             drop(self.latency_preemption_timeout_src.take());
             self.latency_preemption_armed_for.set(None);
 
@@ -2198,30 +2226,76 @@ impl Reactor {
                 }
                 self.notifier.wake_up();
             }
-        }
-
-        // Only the parking path can have invalidated the reading above:
-        // `process_remote_channels` runs there, and so does the drain after the
-        // park, and either can wake a latency-sensitive queue and shorten what
-        // the timer should be. Nothing else runs between the two points.
-        let wanted = if should_sleep {
-            preempt_timer()
+            Settled(())
         } else {
-            wanted
+            settled
         };
 
-        if let Some(preempt) = wanted.filter(|_| !armed_is_usable || should_sleep) {
+        if let PreemptAction::Rearm(preempt) =
+            self.observe_preempt_timer(&preempt_timer, settled).decide()
+        {
             self.latency_preemption_armed_for.set(Some(preempt));
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
             // The line above can drop a timer that had not fired, which happens
-            // when the drain shortened `wanted`. Its cancellation is submitted
-            // here rather than left for the next pass to flush.
+            // when what is wanted changed. Its cancellation is submitted here
+            // rather than left for the next pass to flush.
             flush_cancellations!(into &mut 0; lat_ring);
             flush_rings!(lat_ring, main_ring)?;
         }
 
         Ok(should_sleep)
+    }
+
+    /// Gives up the held timer unless it is exactly the one still wanted.
+    ///
+    /// Called before the flush so a discarded timer's cancellation leaves with
+    /// it. Deliberately not a decision: it only ever gives up, never installs.
+    fn discard_unusable_preempt_timer(&self, wanted: Option<Duration>) {
+        match self.latency_preemption_timeout_src.take() {
+            Some(src)
+                if src.result().is_none() && self.latency_preemption_armed_for.get() == wanted =>
+            {
+                self.latency_preemption_timeout_src.set(Some(src));
+            }
+            unusable => {
+                drop(unusable);
+                self.latency_preemption_armed_for.set(None);
+            }
+        }
+    }
+
+    /// Reads the held timer and what is wanted into one [`PreemptObservation`].
+    ///
+    /// Takes [`Settled`] by value, and calls `preempt_timer` itself rather than
+    /// being handed an answer, so neither half can have been read before the
+    /// last drain.
+    ///
+    /// A timer that has fired is given up here rather than reported, so
+    /// `armed_for` means "armed and still able to fire" and the decision needs
+    /// no second field to say which.
+    fn observe_preempt_timer<Preempt>(
+        &self,
+        preempt_timer: Preempt,
+        _settled: Settled,
+    ) -> PreemptObservation
+    where
+        Preempt: Fn() -> Option<Duration>,
+    {
+        let wanted = preempt_timer();
+        let armed_for = match self.latency_preemption_timeout_src.take() {
+            Some(src) if src.result().is_none() => {
+                let armed_for = self.latency_preemption_armed_for.get();
+                self.latency_preemption_timeout_src.set(Some(src));
+                armed_for
+            }
+            fired => {
+                drop(fired);
+                self.latency_preemption_armed_for.set(None);
+                None
+            }
+        };
+        PreemptObservation { armed_for, wanted }
     }
 
     pub(crate) fn flush_syscall_thread(&self) -> usize {
@@ -2571,7 +2645,7 @@ mod tests {
         assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));
     }
 
-    /// `process_remote_channels` runs after the reading above, and work
+    /// `process_remote_channels` runs after `wanted` was read, and work
     /// arriving there can activate a latency-sensitive queue.
     #[test]
     fn refreshes_timeout_after_remote_channels() {
@@ -2594,6 +2668,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));
+    }
+
+    /// Every input the decision can be given, and the property that has to
+    /// hold for all of them: a `wait` never ends wanting preemption with the
+    /// wrong thing armed, or nothing.
+    ///
+    /// Nine cases, so this is the whole function rather than a sample of it.
+    #[test]
+    fn every_preempt_observation_leaves_the_right_thing_armed() {
+        const A: Duration = Duration::from_millis(1);
+        const B: Duration = Duration::from_millis(100);
+        let durations = [None, Some(A), Some(B)];
+
+        let mut table = Vec::new();
+        for armed_for in durations {
+            for wanted in durations {
+                let observation = PreemptObservation { armed_for, wanted };
+                let action = observation.decide();
+                let held = match action {
+                    PreemptAction::Leave => armed_for,
+                    PreemptAction::Rearm(duration) => Some(duration),
+                };
+                if let Some(wanted) = wanted {
+                    assert_eq!(
+                        held,
+                        Some(wanted),
+                        "{observation:?} finished with the wrong timer armed"
+                    );
+                }
+                table.push(format!("{armed_for:?} {wanted:?} {action:?}"));
+            }
+        }
+
+        assert_eq!(
+            table,
+            [
+                "None None Leave",
+                "None Some(1ms) Rearm(1ms)",
+                "None Some(100ms) Rearm(100ms)",
+                "Some(1ms) None Leave",
+                "Some(1ms) Some(1ms) Leave",
+                "Some(1ms) Some(100ms) Rearm(100ms)",
+                "Some(100ms) None Leave",
+                "Some(100ms) Some(1ms) Rearm(1ms)",
+                "Some(100ms) Some(100ms) Leave",
+            ]
+        );
+    }
+
+    /// The table is only worth having if a wrong decision fails it, so here is
+    /// one: the mistake this had twice, treating a timer that is not there as
+    /// good enough to keep.
+    #[test]
+    fn the_property_rejects_a_decision_that_keeps_nothing() {
+        fn keeps_nothing(_: PreemptObservation) -> PreemptAction {
+            PreemptAction::Leave
+        }
+
+        const A: Duration = Duration::from_millis(1);
+        let observation = PreemptObservation {
+            armed_for: None,
+            wanted: Some(A),
+        };
+        let held = match keeps_nothing(observation) {
+            PreemptAction::Leave => observation.armed_for,
+            PreemptAction::Rearm(duration) => Some(duration),
+        };
+        assert_ne!(
+            held, observation.wanted,
+            "the property passed a decision that arms nothing at all"
+        );
     }
 
     #[test]

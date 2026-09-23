@@ -451,7 +451,7 @@ pub use crate::{
         stall::{DefaultStallDetectionHandler, StallDetection, StallDetectionHandler},
         yield_if_needed, CpuSet, ExecutorJoinHandle, ExecutorProxy, ExecutorStats, LocalExecutor,
         LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
-        PoolThreadHandles, ScopedTask, Task, TaskQueueHandle, TaskQueueStats,
+        PoolThreadHandles, ScopedTask, Task, TaskQueueHandle, TaskQueueStats, UnobservedPanic,
     },
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,

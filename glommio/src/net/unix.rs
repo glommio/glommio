@@ -17,7 +17,7 @@ use nix::sys::socket::UnixAddr;
 use pin_project_lite::pin_project;
 use socket2::{Domain, Socket, Type};
 use std::{
-    io,
+    io::{self, IoSlice},
     net::Shutdown,
     os::unix::{
         io::{AsRawFd, FromRawFd, RawFd},
@@ -439,6 +439,14 @@ impl<B: RxBuf + Unpin> AsyncWrite for UnixStream<B> {
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_flush(cx)
     }
@@ -730,6 +738,44 @@ mod tests {
             }
         };
     }
+
+    unix_socket_test!(write_vectored_writes_every_slice, dir, {
+        let mut file = dir.clone();
+        file.push("name");
+
+        let listener = UnixListener::bind(&file).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let addr = addr.as_pathname().unwrap().to_owned();
+
+        let server = crate::spawn_local(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buf = [0u8; 64];
+            loop {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buf[..read]);
+            }
+            received
+        })
+        .detach();
+
+        let first = &b"one"[..];
+        let second = &b"two"[..];
+        let whole: Vec<u8> = [first, second].concat();
+
+        let mut client = UnixStream::connect(&addr).await.unwrap();
+        let written = client
+            .write_vectored(&[IoSlice::new(first), IoSlice::new(second)])
+            .await
+            .unwrap();
+
+        assert_eq!(written, whole.len());
+        client.close().await.unwrap();
+        assert_eq!(server.await.unwrap(), whole);
+    });
 
     unix_socket_test!(connect_local_server, dir, {
         let mut file = dir.clone();

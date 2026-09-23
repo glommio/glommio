@@ -11,7 +11,7 @@ use futures_lite::ready;
 use nix::sys::socket::MsgFlags;
 use std::{
     cell::Cell,
-    io,
+    io::{self, IoSlice},
     net::Shutdown,
     os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     rc::{Rc, Weak},
@@ -297,18 +297,31 @@ impl<S: AsRawFd> NonBufferedStream<S> {
         Poll::Pending
     }
 
-    /// On the write path, we always start with calling `yolo_send`, because
-    /// it is very likely to succeed. It could be a waste if it already timed
-    /// out since the last `poll_write`, but it would not cost much more to
-    /// give it one last chance in this case.
-    pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        if let Some(result) = super::yolo_send(self.stream.as_raw_fd(), buf) {
+    /// Writes several buffers in one syscall.
+    ///
+    /// Same shape as [`poll_write`](Self::poll_write) -- speculate first, fall
+    /// back to a readiness registration -- with `sendmsg` in place of `send`.
+    /// The point is the caller: an HTTP response is a status line, headers and
+    /// a body, and without this it costs three syscalls and, with
+    /// `TCP_NODELAY` set, up to three segments on the wire.
+    pub(crate) fn poll_write_vectored(
+        &mut self,
+        cx: &Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        if let Some(result) = super::yolo_sendv(self.stream.as_raw_fd(), bufs) {
             let reactor = self.reactor.upgrade().unwrap();
             self.write_timeout.cancel_timer(reactor.as_ref());
             self.source_tx.take();
             return Poll::Ready(result);
         }
 
+        self.poll_write_ready(cx)
+    }
+
+    /// Registers interest in the socket becoming writable, shared by the
+    /// scalar and vectored paths.
+    fn poll_write_ready(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
         let reactor = self.reactor.upgrade().unwrap();
         let reactor = reactor.as_ref();
         poll_err!(self.write_timeout.check(reactor));
@@ -327,6 +340,22 @@ impl<S: AsRawFd> NonBufferedStream<S> {
         source.add_waiter_single(cx.waker());
         self.write_timeout.maybe_set_timer(reactor, cx.waker());
         Poll::Pending
+    }
+
+    /// Writes one buffer.
+    ///
+    /// Starts with `yolo_send`, because it is very likely to succeed. That
+    /// could be a waste if the write already timed out since the last call,
+    /// but giving it one last chance costs little.
+    pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        if let Some(result) = super::yolo_send(self.stream.as_raw_fd(), buf) {
+            let reactor = self.reactor.upgrade().unwrap();
+            self.write_timeout.cancel_timer(reactor.as_ref());
+            self.source_tx.take();
+            return Poll::Ready(result);
+        }
+
+        self.poll_write_ready(cx)
     }
 
     pub(crate) fn poll_close(&mut self, _: &Context<'_>) -> Poll<io::Result<()>> {
@@ -458,6 +487,14 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
 
     pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         self.stream.poll_write(cx, buf)
+    }
+
+    pub(crate) fn poll_write_vectored(
+        &mut self,
+        cx: &Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.stream.poll_write_vectored(cx, bufs)
     }
 
     pub(crate) fn poll_flush(&self, _cx: &Context<'_>) -> Poll<io::Result<()>> {

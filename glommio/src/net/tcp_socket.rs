@@ -24,7 +24,7 @@ use pin_project_lite::pin_project;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     cell::RefCell,
-    io,
+    io::{self, IoSlice},
     net::{self, Shutdown, SocketAddr, ToSocketAddrs},
     os::{
         fd::AsFd,
@@ -791,6 +791,14 @@ impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
         Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.stream).poll_flush(cx)
     }
@@ -866,6 +874,57 @@ mod tests {
             }
             let stream = TcpStream::connect(addr).await.unwrap();
             assert_eq!(listener_handle.await.unwrap(), stream.local_addr().unwrap());
+        });
+    }
+
+    #[test]
+    fn write_vectored_writes_every_slice() {
+        // An HTTP response is a status line, headers and a body: three
+        // buffers the caller does not want to concatenate. Without a
+        // `poll_write_vectored` of our own, the futures-io default writes the
+        // first slice and returns, and the caller pays a syscall per piece.
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = crate::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                let mut buf = [0u8; 64];
+                loop {
+                    let read = stream.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&buf[..read]);
+                }
+                received
+            })
+            .detach();
+
+            let status = &b"HTTP/1.1 200 OK\r\n"[..];
+            let headers = &b"content-length: 2\r\n\r\n"[..];
+            let body = &b"hi"[..];
+            let whole: Vec<u8> = [status, headers, body].concat();
+
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let written = client
+                .write_vectored(&[
+                    IoSlice::new(status),
+                    IoSlice::new(headers),
+                    IoSlice::new(body),
+                ])
+                .await
+                .unwrap();
+
+            assert_eq!(
+                written,
+                whole.len(),
+                "one vectored write should have taken every slice, not just the first"
+            );
+
+            client.close().await.unwrap();
+            assert_eq!(server.await.unwrap(), whole);
         });
     }
 

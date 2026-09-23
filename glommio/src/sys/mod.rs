@@ -88,6 +88,25 @@ pub(crate) fn send_syscall(fd: RawFd, buf: *const u8, len: usize, flags: i32) ->
     syscall!(send(fd, buf as _, len, flags)).map(|x| x as usize)
 }
 
+/// `sendmsg` over an iovec array, i.e. `writev` with room for socket flags.
+///
+/// `writev` itself would do, except that it takes none, and the socket may be
+/// in blocking mode -- the whole readiness path depends on passing
+/// `MSG_DONTWAIT` per call.
+pub(crate) fn sendmsg_iov_syscall(
+    fd: RawFd,
+    iov: *const libc::iovec,
+    iovlen: usize,
+    flags: i32,
+) -> io::Result<usize> {
+    let mut hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    hdr.msg_iov = iov as *mut libc::iovec;
+    // `msg_iovlen` is a `size_t` on glibc and an `int` on musl.
+    hdr.msg_iovlen = iovlen as _;
+
+    syscall!(sendmsg(fd, &hdr as *const libc::msghdr, flags)).map(|x| x as usize)
+}
+
 pub(crate) fn recv_syscall(fd: RawFd, buf: *mut u8, len: usize, flags: i32) -> io::Result<usize> {
     syscall!(recv(fd, buf as _, len, flags)).map(|x| x as usize)
 }

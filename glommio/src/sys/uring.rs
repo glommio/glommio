@@ -2200,6 +2200,16 @@ impl Reactor {
             }
         }
 
+        // Only the parking path can have invalidated the reading above:
+        // `process_remote_channels` runs there, and so does the drain after the
+        // park, and either can wake a latency-sensitive queue and shorten what
+        // the timer should be. Nothing else runs between the two points.
+        let wanted = if should_sleep {
+            preempt_timer()
+        } else {
+            wanted
+        };
+
         if let Some(preempt) = wanted.filter(|_| !armed_is_usable || should_sleep) {
             self.latency_preemption_armed_for.set(Some(preempt));
             self.latency_preemption_timeout_src
@@ -2556,6 +2566,31 @@ mod tests {
                 0,
                 || 0,
                 |_| requested.set(short),
+            )
+            .unwrap();
+        assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));
+    }
+
+    /// `process_remote_channels` runs after the reading above, and work
+    /// arriving there can activate a latency-sensitive queue.
+    #[test]
+    fn refreshes_timeout_after_remote_channels() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let long = Duration::from_millis(100);
+        let short = Duration::from_millis(1);
+        let requested = Cell::new(long);
+        reactor
+            .wait(
+                || Some(requested.get()),
+                None,
+                true,
+                0,
+                || {
+                    requested.set(short);
+                    1
+                },
             )
             .unwrap();
         assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));

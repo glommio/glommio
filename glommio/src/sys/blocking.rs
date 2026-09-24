@@ -244,10 +244,7 @@ impl BlockingThreadPool {
         let req = BlockingThreadReq {
             op,
             id,
-            latency_sensitive: matches!(
-                source.borrow().io_requirements.latency_req,
-                crate::Latency::Matters(_)
-            ),
+            latency_sensitive: source.borrow().latency_sensitive,
         };
         let mut waiters = self.sources.borrow_mut();
         assert!(waiters.insert(id, source).is_none());

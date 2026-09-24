@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     thread::JoinHandle,
 };
+use tracing::warn;
 
 use super::membarrier;
 
@@ -158,6 +159,15 @@ pub(super) struct BlockingThreadResp {
 struct BlockingThread(JoinHandle<()>);
 
 impl BlockingThread {
+    /// Starts a pool worker.
+    ///
+    /// The worker leaves its loop when it cannot hand an answer back. The
+    /// response channel's receiver lives in the pool, so a failed send means
+    /// the executor has gone while this job was still running, which is how a
+    /// worker's life ends rather than a failure: `flume` fails a send only
+    /// once every receiver has dropped, and a full bounded channel blocks
+    /// instead of failing. Panicking there used to take the process with it
+    /// under `panic = "abort"`.
     pub(super) fn new(
         reactor_sleep_notifier: Arc<SleepNotifier>,
         rx: Arc<Receiver<BlockingThreadReq>>,
@@ -174,7 +184,8 @@ impl BlockingThread {
                 let resp = BlockingThreadResp { id, res };
 
                 if tx.send(resp).is_err() {
-                    panic!("failed to send response");
+                    warn!("blocking job {id} finished after its executor went away");
+                    break;
                 }
                 reactor_sleep_notifier.notify(el.latency_sensitive);
             }

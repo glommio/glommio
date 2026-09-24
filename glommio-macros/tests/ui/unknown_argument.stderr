@@ -1,0 +1,5 @@
+error: unknown argument `flavour`; expected `placement` or `crate`
+ --> tests/ui/unknown_argument.rs:1:24
+  |
+1 | #[glommio_macros::main(flavour = "current_thread")]
+  |                        ^^^^^^^

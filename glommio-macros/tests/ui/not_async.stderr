@@ -1,0 +1,5 @@
+error: expected an `async fn`; this attribute builds an executor to run one on
+ --> tests/ui/not_async.rs:2:1
+  |
+2 | fn not_async() {}
+  | ^^

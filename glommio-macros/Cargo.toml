@@ -1,0 +1,24 @@
+[package]
+authors = ["Henrik Ma Johansson <dahankzter@gmail.com>"]
+categories = ["asynchronous", "concurrency"]
+description = "Attribute macros for glommio: #[glommio::main] and #[glommio::test]."
+edition = "2021"
+homepage = "https://github.com/glommio/glommio"
+keywords = ["async", "iouring", "linux", "macros", "thread-per-core"]
+license = "Apache-2.0 OR MIT"
+name = "glommio-macros"
+repository = "https://github.com/glommio/glommio"
+rust-version = "1.92"
+version.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote       = "1"
+syn         = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+futures-lite = "2.6"
+trybuild     = "1"

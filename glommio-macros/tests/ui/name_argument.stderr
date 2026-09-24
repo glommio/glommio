@@ -1,0 +1,5 @@
+error: `name` cannot be honoured here: this attribute builds the executor on the calling thread with `make()`, which has no thread of its own to name. Use `LocalExecutorBuilder::new(placement).name(..).spawn(..)` if you want a named executor thread
+ --> tests/ui/name_argument.rs:3:31
+  |
+3 | #[glommio_macros::main(name = "server")]
+  |                               ^^^^^^^^

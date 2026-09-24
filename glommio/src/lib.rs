@@ -278,6 +278,13 @@ extern crate lazy_static;
 #[macro_use(defer)]
 extern crate scopeguard;
 
+// `#[glommio::test]` expands to `::glommio::…`, which does not resolve inside
+// the crate that defines it. Aliasing the crate to its own name makes the one
+// expansion work everywhere, rather than the macro having to guess where it is
+// being used: nothing in the environment distinguishes a doc test from the
+// library, both report `glommio` for `CARGO_PKG_NAME` and `CARGO_CRATE_NAME`.
+extern crate self as glommio;
+
 /// Call [`Waker::wake()`] and log to `error` if panicked.
 macro_rules! wake {
     ($waker:expr $(,)?) => {
@@ -456,6 +463,72 @@ pub use crate::{
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,
 };
+/// Runs an async `main` on a `LocalExecutor`.
+///
+/// Unbound by default, so a binary that wants a core pinned asks for one.
+/// Pinning by default would tie every thread the program later starts to that
+/// one core.
+///
+/// ```
+/// #[glommio::main(placement = Fixed(0))]
+/// async fn main() {
+///     glommio::timer::sleep(std::time::Duration::from_millis(1)).await;
+/// }
+/// ```
+///
+/// The tokens after `placement =` are emitted with `::glommio::Placement::`
+/// prepended, so the variant is fixed here and its argument is not. Choosing
+/// exact cores therefore works without this attribute knowing anything about
+/// [`CpuSet`], and selection runs on a `CpuLocation`, so NUMA node and package
+/// read the same way the cpu index does.
+///
+/// ```
+/// use glommio::CpuSet;
+///
+/// #[glommio::main(placement = Fenced(CpuSet::online().unwrap().filter(|l| l.numa_node == 0)))]
+/// async fn main() {
+///     glommio::timer::sleep(std::time::Duration::from_millis(1)).await;
+/// }
+/// ```
+///
+/// A computed placement, `placement = pick()` for instance, is not accepted:
+/// the prefix is prepended blind, so the value has to start with a variant.
+/// Build the executor with [`LocalExecutorBuilder`] for that.
+#[cfg(feature = "macros")]
+pub use glommio_macros::main;
+/// Runs an async test body on a `LocalExecutor`, the way [`main`] runs a
+/// program, and takes the same arguments.
+///
+/// ```
+/// #[glommio::test]
+/// async fn reads_something() {
+///     let value = glommio::spawn_local(async { 21u32 * 2 }).await;
+///     assert_eq!(value, 42);
+/// }
+/// ```
+///
+/// The expansion emits a plain `#[test]`, so the harness attributes compose in
+/// either order and this macro does not need to know about them.
+///
+/// ```
+/// #[glommio::test]
+/// #[should_panic(expected = "deliberate")]
+/// async fn fails_on_purpose() {
+///     panic!("deliberate");
+/// }
+/// ```
+///
+/// A `Result` return works the same way, so `?` is available in the body.
+///
+/// ```
+/// #[glommio::test(placement = Fixed(0))]
+/// async fn on_a_chosen_core() -> Result<(), std::io::Error> {
+///     Ok(())
+/// }
+/// ```
+#[cfg(feature = "macros")]
+pub use glommio_macros::test;
+
 pub use enclose::enclose;
 pub use scopeguard::defer;
 use sketches_ddsketch::DDSketch;
@@ -819,7 +892,10 @@ pub(crate) mod test_utils {
         TestDirectory { path: dir, kind }
     }
 
-    #[test]
+    // `glommio::test` is re-exported at the crate root, and `use super::*`
+    // brings it into scope here, so the attribute has to say which `test` it
+    // means. Callers outside the crate never see this: they get the macro.
+    #[::core::prelude::v1::test]
     #[allow(unused_must_use)]
     fn test_tracing_init() {
         tracing_subscriber::fmt::fmt()
@@ -831,5 +907,21 @@ pub(crate) mod test_utils {
         warn!("Started tracing..");
         trace!("Started tracing..");
         error!("Started tracing..");
+    }
+}
+
+#[cfg(all(test, feature = "macros"))]
+mod attribute_inside_the_crate {
+    //! The attributes name the runtime as `::glommio`, so this is where that
+    //! path would stop resolving if the self-alias above were dropped.
+
+    #[glommio::test]
+    async fn the_test_attribute_resolves_inside_glommio() {
+        crate::timer::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    #[glommio::test(placement = Fixed(0))]
+    async fn a_placement_argument_resolves_too() {
+        assert!(crate::executor().id() > 0);
     }
 }

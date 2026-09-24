@@ -198,7 +198,7 @@ impl Reactor {
         &self,
         raw: RawFd,
         stype: SourceType,
-        stats_collection: Option<StatsCollection>,
+        stats_collection: Option<&'static StatsCollection>,
     ) -> Source {
         sys::Source::new(
             self.io_scheduler.requirements(),
@@ -263,7 +263,7 @@ impl Reactor {
         pos: u64,
         pollable: PollableStatus,
     ) -> Source {
-        let stats = StatsCollection {
+        const STATS: StatsCollection = StatsCollection {
             fulfilled: Some(|result, stats, op_count| {
                 if let Ok(result) = result {
                     stats.file_writes += op_count;
@@ -277,7 +277,7 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Write(pollable, IoBuffer::DmaSource(buf)),
-            Some(stats),
+            Some(&STATS),
         );
         self.sys.write_dma(&source, pos);
         source
@@ -291,7 +291,7 @@ impl Reactor {
         off_out: u64,
         len: usize,
     ) -> impl Future<Output = Source> {
-        let stats = StatsCollection {
+        const STATS: StatsCollection = StatsCollection {
             fulfilled: Some(|result, stats, op_count| {
                 if let Ok(result) = result {
                     let len = *result as u64 * op_count;
@@ -309,7 +309,7 @@ impl Reactor {
         let source = self.new_source(
             fd_out,
             SourceType::CopyFileRange(fd_in, off_in, len),
-            Some(stats),
+            Some(&STATS),
         );
         let waiter = self.sys.copy_file_range(&source, off_out);
         async move {
@@ -319,7 +319,7 @@ impl Reactor {
     }
 
     pub(crate) fn write_buffered(&self, raw: RawFd, buf: Vec<u8>, pos: u64) -> Source {
-        let stats = StatsCollection {
+        const STATS: StatsCollection = StatsCollection {
             fulfilled: Some(|result, stats, op_count| {
                 if let Ok(result) = result {
                     stats.file_buffered_writes += op_count;
@@ -336,7 +336,7 @@ impl Reactor {
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::Buffered(buf),
             ),
-            Some(stats),
+            Some(&STATS),
         );
         self.sys.write_buffered(&source, pos);
         source
@@ -476,7 +476,7 @@ impl Reactor {
         pollable: PollableStatus,
         scheduler: Option<&FileScheduler>,
     ) -> ScheduledSource {
-        let stats = StatsCollection {
+        const STATS: StatsCollection = StatsCollection {
             fulfilled: Some(|result, stats, op_count| {
                 if let Ok(result) = result {
                     stats.file_reads += op_count;
@@ -489,19 +489,24 @@ impl Reactor {
                     stats.file_deduped_bytes_read += *result as u64 * op_count;
                 }
             }),
-            latency: if self.record_io_latencies {
-                Some(|pre_lat, io_lat, post_lat, stats| {
-                    stats
-                        .pre_reactor_io_scheduler_latency_us
-                        .add(pre_lat.as_micros() as f64);
-                    stats.io_latency_us.add(io_lat.as_micros() as f64);
-                    stats
-                        .post_reactor_io_scheduler_latency_us
-                        .add(post_lat.as_micros() as f64)
-                })
-            } else {
-                None
-            },
+            latency: Some(|pre_lat, io_lat, post_lat, stats| {
+                stats
+                    .pre_reactor_io_scheduler_latency_us
+                    .add(pre_lat.as_micros() as f64);
+                stats.io_latency_us.add(io_lat.as_micros() as f64);
+                stats
+                    .post_reactor_io_scheduler_latency_us
+                    .add(post_lat.as_micros() as f64)
+            }),
+        };
+        const STATS_WITHOUT_LATENCY: StatsCollection = StatsCollection {
+            latency: None,
+            ..STATS
+        };
+        let stats = if self.record_io_latencies {
+            &STATS
+        } else {
+            &STATS_WITHOUT_LATENCY
         };
 
         let source = self.new_source(raw, SourceType::Read(pollable, None), Some(stats));
@@ -528,7 +533,7 @@ impl Reactor {
         size: usize,
         scheduler: Option<&FileScheduler>,
     ) -> ScheduledSource {
-        let stats = StatsCollection {
+        const STATS: StatsCollection = StatsCollection {
             fulfilled: Some(|result, stats, op_count| {
                 if let Ok(result) = result {
                     stats.file_buffered_reads += op_count;
@@ -536,19 +541,24 @@ impl Reactor {
                 }
             }),
             reused: None,
-            latency: if self.record_io_latencies {
-                Some(|pre_lat, io_lat, post_lat, stats| {
-                    stats
-                        .pre_reactor_io_scheduler_latency_us
-                        .add(pre_lat.as_micros() as f64);
-                    stats.io_latency_us.add(io_lat.as_micros() as f64);
-                    stats
-                        .post_reactor_io_scheduler_latency_us
-                        .add(post_lat.as_micros() as f64)
-                })
-            } else {
-                None
-            },
+            latency: Some(|pre_lat, io_lat, post_lat, stats| {
+                stats
+                    .pre_reactor_io_scheduler_latency_us
+                    .add(pre_lat.as_micros() as f64);
+                stats.io_latency_us.add(io_lat.as_micros() as f64);
+                stats
+                    .post_reactor_io_scheduler_latency_us
+                    .add(post_lat.as_micros() as f64)
+            }),
+        };
+        const STATS_WITHOUT_LATENCY: StatsCollection = StatsCollection {
+            latency: None,
+            ..STATS
+        };
+        let stats = if self.record_io_latencies {
+            &STATS
+        } else {
+            &STATS_WITHOUT_LATENCY
         };
 
         let source = self.new_source(
@@ -659,7 +669,7 @@ impl Reactor {
         let source = self.new_source(
             raw,
             SourceType::Close,
-            Some(StatsCollection {
+            Some(&StatsCollection {
                 fulfilled: Some(|result, stats, op_count| {
                     if result.is_ok() {
                         stats.files_closed += op_count
@@ -700,7 +710,7 @@ impl Reactor {
         let source = self.new_source(
             dir,
             SourceType::Open(path),
-            Some(StatsCollection {
+            Some(&StatsCollection {
                 fulfilled: Some(|result, stats, op_count| {
                     if result.is_ok() {
                         stats.files_opened += op_count

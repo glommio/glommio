@@ -60,7 +60,7 @@ pub(crate) mod test_executor_id {
 #[cfg(test)]
 mod test {
     use super::test_executor_id;
-    use crate::task::{task_impl, task_impl::Task, JoinHandle};
+    use crate::task::{registry::TaskRegistry, task_impl, task_impl::Task, JoinHandle};
     use std::{
         cell::RefCell,
         future::Future,
@@ -94,32 +94,89 @@ mod test {
     /// Collects rescheduled runnables so a test can run them by hand.
     type Collected = Rc<RefCell<Vec<Task>>>;
 
+    thread_local! {
+        static REGISTRY: TaskRegistry = TaskRegistry::new(crate::executor::WeakExecutorContext::default());
+    }
+
+    struct OwnerGuard {
+        _identity: test_executor_id::Guard,
+    }
+
+    impl Drop for OwnerGuard {
+        fn drop(&mut self) {
+            REGISTRY.with(|registry| {
+                registry.request_shutdown();
+                registry.cleanup_active.set(true);
+                while registry.shutdown_next() {}
+                registry.cleanup_active.set(false);
+            });
+        }
+    }
+
     /// Claims `EXECUTOR_ID` for this thread so the task's drop and wake paths
     /// take the owning-thread branch. Must be held for as long as any task from
     /// `spawn_capturing` is alive.
-    fn own_tasks() -> test_executor_id::Guard {
-        test_executor_id::scoped(EXECUTOR_ID)
+    fn own_tasks() -> OwnerGuard {
+        OwnerGuard {
+            _identity: test_executor_id::scoped(EXECUTOR_ID),
+        }
     }
 
-    /// Spawn with a schedule closure that captures, so `RawTask::schedule`
-    /// takes its non-zero-sized path and clones a waker as a lifetime guard.
-    ///
-    /// The returned `Task` carries no reference yet: `run_right_away` and
-    /// `schedule` are the two entry points that give it one, exactly as
-    /// `spawn_and_run` and `spawn_and_schedule` do in the executor. Calling
-    /// `run` or dropping it directly would underflow the count.
+    /// Spawns a counted runnable in the reactor-free test registry.
     fn spawn_capturing<F, R>(future: F, sink: Collected) -> (Task, JoinHandle<R>)
     where
         F: Future<Output = R>,
         R: 'static,
     {
-        task_impl::spawn_local(
-            EXECUTOR_ID,
-            QUEUE_INDEX,
-            future,
-            move |runnable: Task| sink.borrow_mut().push(runnable),
-            false,
-        )
+        REGISTRY.with(|registry| {
+            task_impl::spawn_local(
+                EXECUTOR_ID,
+                QUEUE_INDEX,
+                registry,
+                future,
+                move |runnable: Task| sink.borrow_mut().push(runnable),
+                false,
+            )
+        })
+    }
+
+    /// Registering a task's own waker clones it; cancellation wakes it inline.
+    /// Both callbacks access the same header. Under Miri's Stacked Borrows,
+    /// holding an exclusive header reference across either callback is UB,
+    /// even though the notification never polls the future synchronously.
+    #[test]
+    fn self_waker_can_be_registered_and_notified_on_cancellation() {
+        let _owned = own_tasks();
+        let sink: Collected = Default::default();
+        let saved_waker = Rc::new(RefCell::new(None));
+        let saved = saved_waker.clone();
+        let polls = Rc::new(std::cell::Cell::new(0));
+        let poll_count = polls.clone();
+        let (runnable, mut handle) = spawn_capturing(
+            std::future::poll_fn(move |cx| {
+                poll_count.set(poll_count.get() + 1);
+                *saved.borrow_mut() = Some(cx.waker().clone());
+                Poll::<()>::Pending
+            }),
+            sink.clone(),
+        );
+        runnable.run();
+        let waker = saved_waker
+            .borrow_mut()
+            .take()
+            .expect("task was not polled");
+        let mut cx = Context::from_waker(&waker);
+
+        assert_eq!(Pin::new(&mut handle).poll(&mut cx), Poll::Pending);
+        handle.cancel();
+        assert_eq!(polls.get(), 1, "notification must not poll the future");
+        assert_eq!(sink.borrow().len(), 1, "cancellation must queue cleanup");
+
+        let cleanup = sink.borrow_mut().pop().expect("missing cleanup runnable");
+        cleanup.run();
+        assert_eq!(poll_once(&mut handle), Poll::Ready(None));
+        assert_eq!(polls.get(), 1, "cleanup must not poll the cancelled future");
+        assert!(sink.borrow().is_empty());
     }
 
     #[test]
@@ -128,7 +185,7 @@ mod test {
         let sink: Collected = Default::default();
         let (runnable, mut handle) = spawn_capturing(async { 42u32 }, sink.clone());
 
-        runnable.run_right_away();
+        runnable.run();
         assert!(
             sink.borrow().is_empty(),
             "a ready task should not reschedule"
@@ -159,7 +216,7 @@ mod test {
         // Detaching: the task must still be safe to run and must tear itself
         // down afterwards, with no handle left to collect the output.
         drop(handle);
-        runnable.run_right_away();
+        runnable.run();
         assert!(sink.borrow().is_empty());
     }
 
@@ -214,7 +271,7 @@ mod test {
         // The first run leaves the task pending. Waking from inside the poll
         // marks it scheduled, and `run` hands it back through the schedule
         // function on the way out.
-        runnable.run_right_away();
+        runnable.run();
         let rescheduled = sink.borrow_mut().pop().expect("task should reschedule");
         rescheduled.run();
         assert_eq!(poll_once(&mut handle), Poll::Ready(Some(5)));
@@ -231,7 +288,7 @@ mod test {
         assert!(std::mem::size_of_val(&big) >= 2048);
 
         let (runnable, mut handle) = spawn_capturing(big, sink.clone());
-        runnable.run_right_away();
+        runnable.run();
         assert_eq!(poll_once(&mut handle), Poll::Ready(Some(7)));
     }
 
@@ -252,7 +309,7 @@ mod test {
         let flag = dropped.clone();
         let (runnable, handle) = spawn_capturing(async move { NotifyOnDrop(flag) }, sink.clone());
 
-        runnable.run_right_away();
+        runnable.run();
         assert!(!*dropped.borrow(), "output held by the handle");
         drop(handle);
         assert!(*dropped.borrow(), "output dropped with the handle");
@@ -266,7 +323,7 @@ mod test {
         let sink: Collected = Default::default();
         for i in 0..64u32 {
             let (runnable, mut handle) = spawn_capturing(async move { i }, sink.clone());
-            runnable.run_right_away();
+            runnable.run();
             assert_eq!(poll_once(&mut handle), Poll::Ready(Some(i)));
         }
         assert!(sink.borrow().is_empty());

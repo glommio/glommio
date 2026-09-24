@@ -291,7 +291,6 @@ macro_rules! wake {
 
 mod free_list;
 
-mod parking;
 mod reactor;
 mod sys;
 pub mod task;

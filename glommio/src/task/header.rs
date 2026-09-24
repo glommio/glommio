@@ -5,8 +5,11 @@
 //!
 use core::{fmt, task::Waker};
 #[cfg(feature = "debugging")]
-use std::cell::Cell;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
+};
 
 use crate::task::{raw::TaskVTable, state::*, utils::abort_on_panic};
 
@@ -28,16 +31,7 @@ pub(crate) struct Header {
     /// is rare. See `RawTask::notifier`.
     pub(crate) executor_id: usize,
 
-    /// Index of the task queue this task belongs to.
-    ///
-    /// As with `executor_id`, this is an index rather than an
-    /// `Rc<RefCell<TaskQueue>>` or a `Weak` to one. Capturing the queue in the
-    /// schedule closure made that closure non-zero-sized, which in turn forced
-    /// `RawTask::schedule` to clone and drop a waker as a lifetime guard on
-    /// every single wake -- two atomic read-modify-writes per task switch, for
-    /// eight bytes of capture. Resolving the queue from this index on the
-    /// owning thread keeps the closure zero-sized and skips the guard entirely.
-    ///
+    /// Index used to find the task queue in its owning executor context.
     pub(crate) task_queue_index: usize,
 
     /// Current state of the task.
@@ -46,13 +40,28 @@ pub(crate) struct Header {
     /// Latency matters or not
     pub(crate) latency_matters: bool,
 
-    /// Current reference count of the task.
+    /// Counts the registry, handle, runnable, wakers, and temporary callback
+    /// guards. Only the last release may destroy the allocation.
     pub(crate) references: AtomicRefCount,
+
+    /// Whether a waker may still request execution. Foreign threads only access
+    /// this flag, the reference count, and immutable header fields.
+    pub(crate) active: AtomicBool,
+
+    /// Points to the registry head or the preceding task's `next` field. A null
+    /// link means unregistered. The registry reference remains counted until
+    /// owner cleanup finishes, including after unlinking during shutdown.
+    pub(crate) prev_link: *mut *mut Header,
+    pub(crate) next: *mut Header,
+
+    /// Protects the schedule closure from destruction during its invocation or
+    /// reentrant owner cleanup.
+    pub(crate) scheduling: bool,
 
     /// The task that is blocked on the `JoinHandle`.
     ///
     /// This waker needs to be woken up once the task completes or is closed.
-    pub(crate) awaiter: Option<Waker>,
+    pub(crate) awaiter: Cell<Option<Waker>>,
 
     /// The virtual table.
     ///
@@ -62,32 +71,21 @@ pub(crate) struct Header {
     pub(crate) vtable: &'static TaskVTable,
 
     #[cfg(feature = "debugging")]
-    pub(crate) debugging: Cell<bool>,
+    pub(crate) owner_thread: std::thread::ThreadId,
+
+    #[cfg(feature = "debugging")]
+    pub(crate) debugger_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Header {
-    /// Cancels the task.
-    ///
-    /// This method will mark the task as closed, but it won't reschedule the
-    /// task or drop its future.
-    pub(crate) fn cancel(&mut self) {
-        // If the task has been completed or closed, it can't be canceled.
-        if self.state & (COMPLETED | CLOSED) != 0 {
-            return;
-        }
-
-        // Mark the task as closed.
-        self.state |= CLOSED;
-    }
-
     /// Notifies the awaiter blocked on this task.
     ///
     /// If the awaiter is the same as the current waker, it will not be
     /// notified.
     #[inline]
-    pub(crate) fn notify(&mut self, current: Option<&Waker>) {
+    pub(crate) fn notify(awaiter: &Cell<Option<Waker>>, current: Option<&Waker>) {
         // Take the waker out.
-        let waker = self.awaiter.take();
+        let waker = awaiter.take();
 
         if let Some(w) = waker {
             // We need a safeguard against panics because waking can panic.
@@ -104,9 +102,13 @@ impl Header {
     /// This method is called when `JoinHandle` is polled and the task has not
     /// completed.
     #[inline]
-    pub(crate) fn register(&mut self, waker: &Waker) {
-        // Put the waker into the awaiter field.
-        abort_on_panic(|| self.awaiter = Some(waker.clone()));
+    pub(crate) fn register(awaiter: &Cell<Option<Waker>>, waker: &Waker) {
+        // Do not hold a mutable borrow across a user-provided waker callback.
+        abort_on_panic(|| {
+            let waker = waker.clone();
+            let previous = awaiter.replace(Some(waker));
+            drop(previous);
+        });
     }
 
     #[cfg(feature = "debugging")]

@@ -23,7 +23,6 @@ fn drop_after_shutdown<const N: usize>(foreign: bool) {
             .join()
             .expect("foreign waker drop panicked");
     } else {
-        // The owner is still this OS thread, although no executor is installed.
         drop(waker);
     }
 
@@ -44,7 +43,6 @@ fn drop_while_idle<const N: usize>() {
     let executor = executor();
     let (waker, allocation, future_drop) = completed_waker::<N>(&executor);
     drop(waker);
-    // A completed task must not need another run() to reclaim its allocation.
     allocation.assert_freed();
     future_drop.assert_dropped_once();
     drop(executor);
@@ -56,7 +54,6 @@ fn drop_while_another_executor_runs<const N: usize>() {
     let other = executor();
     assert_ne!(owner.id(), other.id());
     other.run(async move { drop(waker) });
-    // Running a different executor on this thread must not redirect cleanup to it.
     allocation.assert_freed();
     future_drop.assert_dropped_once();
     drop(other);
@@ -120,7 +117,6 @@ fn late_wakes<const N: usize>(foreign: bool, shutdown: bool) {
         exercise_late_waker(waker);
     }
 
-    // In the live-executor case, process notifications queued by the foreign worker.
     if let Some(executor) = &executor {
         executor.run(async {});
     }

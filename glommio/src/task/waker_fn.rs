@@ -8,10 +8,10 @@ use core::task::{RawWaker, RawWakerVTable, Waker};
 /// Creates a waker that does nothing.
 ///
 /// This [`Waker`] is useful for polling a `Future` to check whether it is
-/// `Ready`, without doing any additional work.
+/// `Ready`, without doing any additional work. The pointer is never
+/// dereferenced, so null is ok.
 pub(crate) fn dummy_waker() -> Waker {
     fn raw_waker() -> RawWaker {
-        // the pointer is never dereferenced, so null is ok
         RawWaker::new(std::ptr::null::<()>(), vtable())
     }
 

@@ -110,6 +110,8 @@ impl Latch {
     /// `update` method returns an `Ok` of the previous counter value if the
     /// closure returned `Some(new)` or an `Err` of the unchanged value
     /// otherwise.
+    ///
+    /// The mutex synchronizes, so using `Ordering::Relaxed` here is enough.
     fn update<F>(&self, state_if_zero: LatchState, mut f: F) -> Result<usize, usize>
     where
         F: FnMut(usize) -> Option<usize>,
@@ -120,7 +122,6 @@ impl Latch {
             new
         };
 
-        // the Mutex synchronizes, so using `Ordering::Relaxed` here
         let res = self
             .inner
             .count

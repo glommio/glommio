@@ -391,6 +391,8 @@ impl Reactor {
         Ok(source)
     }
 
+    /// The iov and addresses built below are stack addresses: the header is
+    /// left blank and the `io_uring` callee will fill that up.
     pub(crate) fn rushed_sendmsg(
         &self,
         fd: RawFd,
@@ -402,8 +404,6 @@ impl Reactor {
             iov_base: buf.as_ptr() as *mut libc::c_void,
             iov_len: 1,
         };
-        // Note that the iov and addresses we have above are stack addresses. We will
-        // leave it blank and the `io_uring` callee will fill that up
         let hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
 
         let addr = unsafe { SockaddrStorage::from_raw(addr.as_ptr(), Some(addr.len())) }.unwrap();
@@ -808,15 +808,12 @@ impl Reactor {
 
     /// Processes new events, blocking until the first event or the timeout.
     pub(crate) fn react(&self, timeout: impl Fn() -> Option<Duration>) -> io::Result<bool> {
-        // Process ready timers.
         let (next_timer, woke) = self.process_external_events();
 
-        // Block on I/O events.
         match self
             .sys
             .wait(timeout, next_timer, woke, || self.process_shared_channels())
         {
-            // Don't wait for the next loop to process timers or shared channels
             Ok(true) => {
                 self.process_external_events();
                 Ok(true)
@@ -824,7 +821,6 @@ impl Reactor {
 
             Ok(false) => Ok(false),
 
-            // An actual error occurred.
             Err(err) => Err(err),
         }
     }

@@ -28,18 +28,17 @@ struct Inner {
 }
 
 impl Inner {
+    /// Deregisters the timer from the reactor, updates the timeout, and
+    /// re-registers the timer with the new timeout.
     fn reset(&mut self, dur: Duration) {
         let mut waker = None;
         if self.is_charged {
-            // Deregister the timer from the reactor.
             waker = self.reactor.upgrade().unwrap().remove_timer(self.id);
         }
 
-        // Update the timeout.
         self.when = Instant::now() + dur;
 
         if let Some(waker) = waker {
-            // Re-register the timer with the new timeout.
             self.reactor
                 .upgrade()
                 .unwrap()
@@ -112,8 +111,8 @@ impl Timer {
         }
     }
 
-    // Useful in generating repeat timers that have a constant
-    // id. Not for external usage.
+    /// Useful in generating repeat timers that have a constant id. Not for
+    /// external usage.
     fn from_id(id: u64, dur: Duration) -> Timer {
         Timer {
             inner: Rc::new(RefCell::new(Inner {
@@ -151,12 +150,11 @@ impl Timer {
 }
 
 impl Drop for Timer {
+    /// The reactor can be dropped already; if that is the case, the reactor
+    /// already removed the timer and we do not need to do anything.
     fn drop(&mut self) {
         let inner = self.inner.borrow_mut();
         if inner.is_charged {
-            // Deregister the timer from the reactor. Reactor can be dropped already
-            // if that is the case then reactor already removed the timer, and we do not
-            // need to do anything
             if let Some(reactor) = inner.reactor.upgrade() {
                 reactor.remove_timer(inner.id);
             }
@@ -171,11 +169,9 @@ impl Future for Timer {
         let mut inner = self.inner.borrow_mut();
 
         if Instant::now() >= inner.when {
-            // Deregister the timer from the reactor if needed
             inner.reactor.upgrade().unwrap().remove_timer(inner.id);
             Poll::Ready(inner.when)
         } else {
-            // Register the timer in the reactor.
             inner
                 .reactor
                 .upgrade()
@@ -967,6 +963,7 @@ mod test {
     }
 
     #[test]
+    /// Force this to go into the task queue to make the test more realistic.
     fn basic_timer_action_cancel_works() {
         make_shared_var_mut!(0, exec1, exec2);
 
@@ -974,8 +971,6 @@ mod test {
             let action = TimerActionOnce::do_in(Duration::from_millis(50), async move {
                 *(exec1.borrow_mut()) = 1;
             });
-            // Force this to go into the task queue to make the test more
-            // realistic
             crate::executor().yield_task_queue_now().await;
             action.cancel().await;
 
@@ -996,20 +991,19 @@ mod test {
 
             Timer::new(Duration::from_millis(100)).await;
             assert_eq!(*(exec2.borrow()), 0);
-            // joining doesn't lead to infinite blocking or anything, and eventually
-            // completes.
             action.join().await;
         });
     }
 
     #[test]
+    /// Tests that if we had already started the action, it will run to
+    /// completion: it did start, but should not have finished.
     fn basic_timer_action_destroy_cancel_initiated_action() {
         make_shared_var_mut!(0, exec1, exec2);
 
         test_executor!(async move {
             let action = TimerActionOnce::do_in(Duration::from_millis(10), async move {
                 *(exec1.borrow_mut()) = 1;
-                // Test that if we had already started the action, it will run to completion.
                 for _ in 0..10 {
                     Timer::new(Duration::from_millis(10)).await;
                     *(exec1.borrow_mut()) += 1;
@@ -1019,13 +1013,18 @@ mod test {
             action.destroy();
 
             action.join().await;
-            // it did start, but should not have finished
             assert!(*(exec2.borrow()) > 1);
             assert_ne!(*(exec2.borrow()), 11);
         });
     }
 
     #[test]
+    /// Tests that a detached spawn inside the action survives `destroy()`.
+    /// If we had already started the action, it will run to completion.
+    ///
+    /// TODO(issue#540): waiting 200ms instead of the ideal 60ms
+    /// (10 + 10*10 - 50) because the shorter wait does not pass in an ARM
+    /// VM; it might be worth looking into the root cause and a fix.
     fn basic_timer_action_destroy_detached_spawn_survives() {
         make_shared_var_mut!(0, exec1, exec2);
 
@@ -1033,7 +1032,6 @@ mod test {
             let action = TimerActionOnce::do_in(Duration::from_millis(10), async move {
                 crate::spawn_local(async move {
                     *(exec1.borrow_mut()) = 1;
-                    // Test that if we had already started the action, it will run to completion.
                     for _ in 0..10 {
                         Timer::new(Duration::from_millis(10)).await;
                         *(exec1.borrow_mut()) += 1;
@@ -1045,21 +1043,25 @@ mod test {
             Timer::new(Duration::from_millis(50)).await;
             action.destroy();
             action.join().await;
-            // When action completes we are halfway through the count
-            assert_ne!(*(exec2.borrow()), 11);
+            assert_ne!(
+                *(exec2.borrow()),
+                11,
+                "when action completes we are halfway through the count"
+            );
 
-            // TODO(issue#540): Ideally waiting 60ms (10 + 10*10 - 50) should
-            // be enough, but we need as large as 200ms for this test to pass
-            // in an ARM VM. It might be worth looking into the root cause and
-            // a fix.
             Timer::new(Duration::from_millis(200)).await;
 
-            // But because it is detached then it completes the count
-            assert_eq!(*(exec2.borrow()), 11);
+            assert_eq!(
+                *(exec2.borrow()),
+                11,
+                "because it is detached it completes the count"
+            );
         });
     }
 
     #[test]
+    /// Force this to go into the task queue to make the test more realistic;
+    /// the action firing is then "too late" to cancel.
     fn basic_timer_action_cancel_fails_if_fired() {
         make_shared_var_mut!(0, exec1, exec2);
 
@@ -1067,13 +1069,10 @@ mod test {
             let action = TimerActionOnce::do_in(Duration::from_millis(1), async move {
                 *(exec1.borrow_mut()) = 1;
             });
-            // Force this to go into the task queue to make the test more
-            // realistic
             Timer::new(Duration::from_millis(10)).await;
             action.cancel().await;
 
             Timer::new(Duration::from_millis(90)).await;
-            // too late, fired
             assert_eq!(*(exec2.borrow()), 1);
         });
     }
@@ -1135,16 +1134,17 @@ mod test {
     }
 
     #[test]
+    /// There are two targets of this test:
+    ///
+    /// 1. To detect absence of memory leaks in case of unfinished timers.
+    ///    Right now we need to run tests with ASAN. There is a crate
+    ///    <https://github.com/lynnux/leak-detect-allocator> which provides
+    ///    allocator with memory leak detection but it can not be used
+    ///    because it works only with nightly builds.
+    /// 2. Ensure correct clean up of resources in case of presence of
+    ///    unfinished tasks. Previous versions of timer and executor caused
+    ///    abort of the program at some cases.
     fn test_memory_leak_unfinished_timer() {
-        //There are two targets of this test
-        // 1. To detect absence of memory leaks in case of unfinished
-        // timers. Right now we need to run tests with ASAN. There is a  crate https://github.com/lynnux/leak-detect-allocator
-        // which provides allocator with memory leak detection but it can not be used
-        // because it works only with nightly builds
-        // 2. Ensure correct clean up of resources in case of presence of unfinished
-        // tasks. Previous versions of timer and executor caused abort of the
-        // program at some cases.
-
         let handle = LocalExecutorBuilder::default()
             .spawn(|| async move {
                 let action = TimerActionOnce::do_in(Duration::from_millis(100), async move {

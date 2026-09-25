@@ -83,7 +83,6 @@ fn synchronous_schedule<const N: usize>(run: bool, panic: bool) {
                 } else {
                     drop(task);
                 }
-                // Completing the task cannot destroy the closure while it is borrowed.
                 callback_drops.assert_not_dropped();
                 assert!(!panic, "intentional scheduling test panic");
             },
@@ -277,7 +276,6 @@ fn nested_synchronous_schedule<const N: usize>(panic: bool) {
                 callback_depth.set(current_depth);
                 callback_max_depth.set(callback_max_depth.get().max(current_depth));
                 task.run();
-                // Inner completion must preserve the closure for both callbacks.
                 callback_drops.assert_not_dropped();
                 assert_eq!(callback_depth.get(), current_depth);
                 callback_depth.set(current_depth - 1);
@@ -331,7 +329,6 @@ fn abandoned_future<const N: usize>(foreign: bool) {
             thread::spawn(move || drop(waker))
                 .join()
                 .expect("foreign waker drop panicked");
-            // Deterministically process the foreign release while the owner is active.
             crate::sys::get_sleep_notifier_for(ex.id())
                 .unwrap()
                 .process_foreign_wakes();
@@ -1254,7 +1251,6 @@ fn runnable_and_waker_release_race<const N: usize>() {
                 task_impl::spawn_local(ex.id(), 0, ex.task_registry(), future, drop, false);
             let allocation = AllocationProbe::track_handle(&handle);
             drop(handle);
-            // The foreign waker release races the runnable release after Pending.
             task.run();
             worker.join().expect("foreign waker drop panicked");
             crate::sys::get_sleep_notifier_for(ex.id())

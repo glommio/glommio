@@ -158,6 +158,14 @@ pub(super) struct BlockingThreadResp {
 struct BlockingThread(JoinHandle<()>);
 
 impl BlockingThread {
+    /// Starts a pool worker.
+    ///
+    /// The loop does not guard against an unwinding operation, because none
+    /// can reach it. [`crate::executor::ExecutorProxy::spawn_blocking`]
+    /// catches where the closure is built, and the syscall operations answer
+    /// `EFAULT` rather than panicking. A guard here would have to assert
+    /// unwind safety over the caller's closure a second time, to protect
+    /// against something that cannot happen.
     pub(super) fn new(
         reactor_sleep_notifier: Arc<SleepNotifier>,
         rx: Arc<Receiver<BlockingThreadReq>>,
@@ -169,14 +177,17 @@ impl BlockingThread {
                 bind_to_cpu_set(bindings).expect("failed to bind blocking thread");
             }
             while let Ok(el) = rx.recv() {
-                let res = el.op.execute();
                 let id = el.id;
+                let latency_sensitive = el.latency_sensitive;
+
+                let res = el.op.execute();
+
                 let resp = BlockingThreadResp { id, res };
 
                 if tx.send(resp).is_err() {
                     panic!("failed to send response");
                 }
-                reactor_sleep_notifier.notify(el.latency_sensitive);
+                reactor_sleep_notifier.notify(latency_sensitive);
             }
         }))
     }

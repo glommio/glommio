@@ -22,7 +22,8 @@
 //!    can be closed.
 
 mod gate;
+mod once_cell;
 mod rwlock;
 mod semaphore;
 
-pub use self::{gate::*, rwlock::*, semaphore::*};
+pub use self::{gate::*, once_cell::*, rwlock::*, semaphore::*};

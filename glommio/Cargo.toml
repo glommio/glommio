@@ -84,6 +84,10 @@ name    = "executor"
 
 [[bench]]
 harness = false
+name    = "once_cell"
+
+[[bench]]
+harness = false
 name    = "semaphore"
 
 [[bench]]

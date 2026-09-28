@@ -1,0 +1,5 @@
+error: expected a function taking no arguments; the executor has nothing to pass one
+ --> tests/ui/takes_arguments.rs:2:26
+  |
+2 | async fn takes_arguments(_x: u32) {}
+  |                          ^^^^^^^

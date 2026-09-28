@@ -1,6 +1,9 @@
 [workspace]
-members  = ["examples", "glommio"]
+members  = ["examples", "glommio", "glommio-macros"]
 resolver = "2"
+
+[workspace.package]
+version = "0.10.0"
 
 [workspace.metadata.dylint]
   libraries = [

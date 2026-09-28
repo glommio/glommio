@@ -1,0 +1,5 @@
+error: expected a non-generic `async fn`; `main`/`test` entry points cannot be generic because nothing instantiates the parameters. Build the executor with `LocalExecutorBuilder` inside a non-generic wrapper if you need one
+ --> tests/ui/generic.rs:2:17
+  |
+2 | async fn generic<T: Default>() -> T {
+  |                 ^^^^^^^^^^^^

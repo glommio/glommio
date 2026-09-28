@@ -20,7 +20,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ahash::AHashMap;
 use io_uring::CompletionStatus;
 use nix::sys::socket::{MsgFlags, SockaddrLike, SockaddrStorage};
 use smallvec::SmallVec;
@@ -38,6 +37,8 @@ use crate::{
 use nix::poll::PollFlags;
 
 type SharedChannelWakerChecker = (SmallVec<[Waker; 1]>, Option<Box<dyn Fn() -> usize>>);
+
+use crate::timer::TimerId;
 
 struct SharedChannels {
     id: u64,
@@ -70,62 +71,40 @@ impl SharedChannels {
     }
 }
 
+/// The reactor's timers.
+///
+/// A thin wrapper so the reactor does not name the wheel directly.
 struct Timers {
-    timer_id: u64,
-    timers_by_id: AHashMap<u64, Instant>,
-
-    /// An ordered map of registered timers.
-    ///
-    /// Timers are in the order in which they fire. The `u64` in this type is
-    /// a timer ID used to distinguish timers that fire at the same time.
-    /// The [`Waker`] represents the task awaiting the timer.
-    timers: BTreeMap<(Instant, u64), Waker>,
+    wheel: crate::timer::reactor_adapter::ReactorTimers,
 }
 
 impl Timers {
     fn new() -> Timers {
         Timers {
-            timer_id: 0,
-            timers_by_id: AHashMap::new(),
-            timers: BTreeMap::new(),
+            wheel: crate::timer::reactor_adapter::ReactorTimers::new(),
         }
     }
 
-    fn new_id(&mut self) -> u64 {
-        self.timer_id += 1;
-        self.timer_id
+    fn insert(&mut self, when: Instant, waker: Waker) -> TimerId {
+        self.wheel.insert(when, waker)
     }
 
-    fn remove(&mut self, id: u64) -> Option<Waker> {
-        if let Some(when) = self.timers_by_id.remove(&id) {
-            return self.timers.remove(&(when, id));
-        }
-
-        None
+    fn remove(&mut self, id: TimerId) -> Option<Waker> {
+        self.wheel.remove(id)
     }
 
-    /// Returns the replaced waker so it can be dropped outside the registry borrow.
-    fn insert(&mut self, id: u64, when: Instant, waker: Waker) -> Option<Waker> {
-        let previous = self
-            .timers_by_id
-            .insert(id, when)
-            .and_then(|previous| self.timers.remove(&(previous, id)));
-        self.timers.insert((when, id), waker);
-        previous
+    fn exists(&self, id: TimerId) -> bool {
+        self.wheel.contains(id)
     }
 
-    /// Detaches expired timers before invoking their wakers outside the borrow.
-    fn take_ready(&mut self) -> BTreeMap<(Instant, u64), Waker> {
-        let pending = self.timers.split_off(&(Instant::now(), 0));
-        mem::replace(&mut self.timers, pending)
+    /// Appends the wakers of everything that has come due.
+    fn process_timers(&mut self, wakers: &mut Vec<Waker>) {
+        self.wheel.process_timers(wakers)
     }
 
-    /// Computes the next delay after callbacks have changed timer registrations.
+    /// The delay until the next armed timer.
     fn next_timer(&self) -> Option<Duration> {
-        self.timers
-            .keys()
-            .next()
-            .map(|(when, _)| when.saturating_duration_since(Instant::now()))
+        self.wheel.next_timer()
     }
 }
 
@@ -142,6 +121,11 @@ pub(crate) struct Reactor {
     pub(crate) sys: sys::Reactor,
 
     timers: RefCell<Timers>,
+
+    /// Reused across polls so expiring a batch of timers allocates nothing.
+    /// Lives outside `timers` so it can be filled under that borrow and
+    /// drained after it is released.
+    timer_wakers: RefCell<Vec<Waker>>,
 
     shared_channels: RefCell<SharedChannels>,
 
@@ -166,6 +150,7 @@ impl Reactor {
         Ok(Reactor {
             sys,
             timers: RefCell::new(Timers::new()),
+            timer_wakers: RefCell::new(Vec::new()),
             shared_channels: RefCell::new(SharedChannels::new()),
             io_scheduler: Rc::new(IoScheduler::new()),
             record_io_latencies,
@@ -723,39 +708,45 @@ impl Reactor {
 
     /// Registers a timer in the reactor.
     ///
-    /// Returns the registered timer's ID.
-    pub(crate) fn register_timer(&self) -> u64 {
+    /// The returned handle stays valid for the timer's whole life, however
+    /// many times it cascades between levels.
+    pub(crate) fn insert_timer(&self, when: Instant, waker: Waker) -> TimerId {
         let mut timers = self.timers.borrow_mut();
-        timers.new_id()
+        timers.insert(when, waker)
     }
 
-    /// Registers a timer in the reactor.
-    ///
-    /// Drops the replaced waker after releasing the registry borrow so task
-    /// cleanup can deregister other timers.
-    pub(crate) fn insert_timer(&self, id: u64, when: Instant, waker: Waker) {
-        let previous = self.timers.borrow_mut().insert(id, when, waker);
-        drop(previous);
-    }
-
-    /// Deregisters a timer from the reactor.
-    pub(crate) fn remove_timer(&self, id: u64) -> Option<Waker> {
+    /// Deregisters a timer, handing back its waker if it had not fired.
+    pub(crate) fn remove_timer(&self, id: TimerId) -> Option<Waker> {
         let mut timers = self.timers.borrow_mut();
         timers.remove(id)
     }
 
-    pub(crate) fn timer_exists(&self, id: &(Instant, u64)) -> bool {
+    /// Whether a handle still names a registered timer.
+    pub(crate) fn timer_exists(&self, id: TimerId) -> bool {
         let timers = self.timers.borrow();
-        timers.timers.contains_key(id)
+        timers.exists(id)
     }
 
-    /// Wakes expired timers after releasing the registry borrow.
+    /// Wakes everything that has come due, and says how many that was.
     fn process_timers(&self) -> usize {
-        let ready = self.timers.borrow_mut().take_ready();
-        let woke = ready.len();
-        for waker in ready.into_values() {
+        // Collect first, wake after. `timers` is a RefCell, so a waker that
+        // arms or cancels a timer while we still hold it re-enters and panics
+        // on the second borrow. The scratch buffer is kept across calls so a
+        // batch of expiries costs no allocation.
+        let mut scratch = std::mem::take(&mut *self.timer_wakers.borrow_mut());
+        debug_assert!(
+            scratch.is_empty(),
+            "scratch is drained before it is returned"
+        );
+
+        self.timers.borrow_mut().process_timers(&mut scratch);
+
+        let woke = scratch.len();
+        for waker in scratch.drain(..) {
             wake!(waker);
         }
+        *self.timer_wakers.borrow_mut() = scratch;
+
         woke
     }
 

@@ -93,6 +93,29 @@ fn yolo_recvmsg<T: SockaddrLike>(
     }
 }
 
+/// The vectored counterpart of [`yolo_send`].
+///
+/// `IoSlice` is guaranteed ABI-compatible with `struct iovec`, so the slice is
+/// handed to the kernel as-is rather than copied into one.
+fn yolo_sendv(fd: RawFd, bufs: &[std::io::IoSlice<'_>]) -> Option<io::Result<usize>> {
+    // The kernel rejects anything longer in one call; writing a prefix is
+    // allowed and the caller loops, exactly as it does for a short write.
+    let len = std::cmp::min(bufs.len(), libc::UIO_MAXIOV as usize);
+
+    match sys::sendmsg_iov_syscall(
+        fd,
+        bufs.as_ptr() as *const libc::iovec,
+        len,
+        MsgFlags::MSG_DONTWAIT.bits(),
+    ) {
+        Ok(x) => Some(Ok(x)),
+        Err(err) => match err.kind() {
+            io::ErrorKind::WouldBlock => None,
+            _ => Some(Err(err)),
+        },
+    }
+}
+
 fn yolo_sendmsg(
     fd: RawFd,
     buf: &[u8],

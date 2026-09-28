@@ -25,6 +25,7 @@ use io_uring::CompletionStatus;
 use nix::sys::socket::{MsgFlags, SockaddrLike, SockaddrStorage};
 use smallvec::SmallVec;
 
+use crate::sys::source::NativePath;
 use crate::{
     io::{FileScheduler, IoScheduler, ScheduledSource},
     sys::SockAddrStorage,
@@ -600,16 +601,12 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn rename<P, Q>(&self, old_path: P, new_path: Q) -> impl Future<Output = Source>
-    where
-        P: AsRef<Path>,
-        Q: AsRef<Path>,
-    {
-        let source = self.new_source(
-            -1,
-            SourceType::Rename(old_path.as_ref().to_owned(), new_path.as_ref().to_owned()),
-            None,
-        );
+    pub(crate) fn rename(
+        &self,
+        old_path: NativePath,
+        new_path: NativePath,
+    ) -> impl Future<Output = Source> {
+        let source = self.new_source(-1, SourceType::Rename(old_path, new_path), None);
         let waiter = self.sys.rename(&source);
 
         async move {
@@ -618,8 +615,8 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = Source> {
-        let source = self.new_source(-1, SourceType::Remove(path.as_ref().to_owned()), None);
+    pub(crate) fn remove_file(&self, path: NativePath) -> impl Future<Output = Source> {
+        let source = self.new_source(-1, SourceType::Remove(path), None);
         let waiter = self.sys.remove_file(&source);
 
         async move {
@@ -628,12 +625,12 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn create_dir<P: AsRef<Path>>(
+    pub(crate) fn create_dir(
         &self,
-        path: P,
+        path: NativePath,
         mode: libc::c_int,
     ) -> impl Future<Output = Source> {
-        let source = self.new_source(-1, SourceType::CreateDir(path.as_ref().to_owned()), None);
+        let source = self.new_source(-1, SourceType::CreateDir(path), None);
         let waiter = self.sys.create_dir(&source, mode);
 
         async move {

@@ -2877,16 +2877,7 @@ impl ExecutorProxy {
     /// [`std::thread::JoinHandle::join`] does. The pool thread survives and
     /// keeps serving later work.
     ///
-    /// The caller allocates the return value's storage for `func` to fill, so
-    /// a panic that was swallowed here would leave the caller to read memory
-    /// that was never written.
-    ///
-    /// `func` is asserted unwind safe rather than required to be, which is
-    /// what `rayon` does and for its reason: the panic is resumed rather than
-    /// swallowed, so nothing inside glommio ever observes state the panic tore.
-    /// A caller that catches the resumed panic and then reads state the closure
-    /// shared is in the same position as one calling [`std::thread::spawn`],
-    /// which takes no such bound either.
+    /// `func` is not required to be [`std::panic::UnwindSafe`].
     pub fn spawn_blocking<F, R>(&self, func: F) -> impl Future<Output = R>
     where
         F: FnOnce() -> R + Send + 'static,

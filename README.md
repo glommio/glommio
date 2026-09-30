@@ -78,3 +78,9 @@ Licensed under either of
 * MIT license ([](/LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
+
+### I/O statistics
+
+The `stats` feature enables support for I/O operation and byte counters and latency distributions. This used to be
+enabled by default prior to Glommio 0.10. With this feature, both single-executor and pool builders expose independent
+`record_io_stats(bool)` and `record_io_latencies(bool)` runtime switches (disabled by default).

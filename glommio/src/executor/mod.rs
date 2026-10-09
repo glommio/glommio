@@ -47,7 +47,7 @@ use latch::{Latch, LatchState};
 use log::warn;
 pub use placement::{CpuSet, Placement, PoolPlacement};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{hash_map::Entry, BinaryHeap, VecDeque},
     fmt,
     future::Future,
@@ -160,6 +160,9 @@ pub(crate) struct TaskQueue {
     scheduler: Rc<multitask::Scheduler>,
     /// Tasks retain scheduling metadata, while the queue owns runnable tasks.
     runnables: VecDeque<multitask::Runnable>,
+    /// Cross-thread notifications retain FIFO order separately from local work.
+    foreign_runnables: VecDeque<multitask::Runnable>,
+    foreign_streak: usize,
     active: bool,
     shares: Shares,
     vruntime: u64,
@@ -215,6 +218,8 @@ impl TaskQueue {
         Rc::new(RefCell::new(TaskQueue {
             scheduler: Rc::new(multitask::Scheduler::new(owner_id, registry)),
             runnables: VecDeque::new(),
+            foreign_runnables: VecDeque::new(),
+            foreign_streak: 0,
             active: false,
             stats: TaskQueueStats::new(index, shares.reciprocal_shares()),
             shares,
@@ -231,6 +236,13 @@ impl TaskQueue {
     }
 
     fn get_task(&mut self) -> Option<multitask::Runnable> {
+        if self.foreign_streak < 32 || self.runnables.is_empty() {
+            if let Some(task) = self.foreign_runnables.pop_front() {
+                self.foreign_streak = self.foreign_streak.saturating_add(1);
+                return Some(task);
+            }
+        }
+        self.foreign_streak = 0;
         self.runnables.pop_front()
     }
 
@@ -252,7 +264,7 @@ impl TaskQueue {
         let delta_scaled = (self.stats.reciprocal_shares * (delta.as_nanos() as u64)) >> 12;
         self.stats.runtime += delta;
         self.stats.queue_selected += 1;
-        self.active = !self.runnables.is_empty();
+        self.active = !self.runnables.is_empty() || !self.foreign_runnables.is_empty();
 
         let vruntime = self.vruntime.checked_add(delta_scaled);
         if let Some(x) = vruntime {
@@ -4459,3 +4471,28 @@ mod test {
         assert!(unsafe { LOCAL_EX.is_null() });
     }
 }
+
+thread_local! {
+    static PROCESSING_FOREIGN_WAKE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether this synchronous callback is dispatching a cross-thread notification.
+pub(crate) fn is_foreign_wake() -> bool {
+    PROCESSING_FOREIGN_WAKE.with(Cell::get)
+}
+
+/// Keeps wake classification scoped, including during nested callbacks and unwinding.
+pub(crate) fn with_foreign_wake<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROCESSING_FOREIGN_WAKE.with(|flag| flag.set(self.0));
+        }
+    }
+    let previous = PROCESSING_FOREIGN_WAKE.with(|flag| flag.replace(true));
+    let _reset = Reset(previous);
+    f()
+}
+
+#[cfg(test)]
+mod foreign_wake_tests;

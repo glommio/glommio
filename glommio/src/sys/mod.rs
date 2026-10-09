@@ -400,7 +400,9 @@ impl SleepNotifier {
         let mut processed = 0;
         while let Ok(waker) = self.foreign_wakes.try_recv() {
             processed += 1;
-            wake!(waker);
+            crate::executor::with_foreign_wake(|| {
+                wake!(waker);
+            });
         }
         processed
     }

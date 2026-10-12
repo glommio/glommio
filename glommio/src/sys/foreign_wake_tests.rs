@@ -1,4 +1,4 @@
-//! Notification coalescing and publication around a draining pass.
+//! Notification coalescing around eventfd reaping and foreign-wake draining.
 
 use std::{
     sync::{
@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use super::new_sleep_notifier;
+use super::{new_sleep_notifier, SleepNotifier};
 
 #[derive(Default)]
 struct Count(AtomicUsize);
@@ -23,7 +23,8 @@ impl Wake for Count {
     }
 }
 
-fn notification_count(fd: std::os::fd::RawFd) -> u64 {
+fn notification_count(notifier: &SleepNotifier) -> u64 {
+    let fd = notifier.eventfd_fd();
     let mut readiness = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -35,24 +36,44 @@ fn notification_count(fd: std::os::fd::RawFd) -> u64 {
         unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) },
         8
     );
+    notifier.notification_reaped();
     value
 }
 
 #[test]
-fn forced_notifications_coalesce_until_the_next_drain() {
+fn forced_notifications_coalesce_until_the_next_reap() {
     let notifier = new_sleep_notifier().unwrap();
     let count = Arc::new(Count::default());
     let waker = Waker::from(count.clone());
     for _ in 0..32 {
         notifier.queue_waker(waker.clone(), true);
     }
-    assert_eq!(notification_count(notifier.eventfd_fd()), 1);
     assert_eq!(notifier.process_foreign_wakes(), 32);
     assert_eq!(count.0.load(Ordering::Relaxed), 32);
     assert_eq!(notifier.process_foreign_wakes(), 0);
     notifier.queue_waker(waker, true);
-    assert_eq!(notification_count(notifier.eventfd_fd()), 1);
+    assert_eq!(notification_count(&notifier), 1);
     assert_eq!(notifier.process_foreign_wakes(), 1);
+}
+
+#[test]
+fn forced_notification_after_a_reap_writes_the_eventfd() {
+    let notifier = new_sleep_notifier().unwrap();
+    let waker = Waker::from(Arc::new(Count::default()));
+    notifier.queue_waker(waker.clone(), true);
+    assert_eq!(notification_count(&notifier), 1);
+    notifier.queue_waker(waker, true);
+    assert_eq!(notification_count(&notifier), 1);
+}
+
+#[test]
+fn forced_notification_after_an_ordinary_wake_writes_the_eventfd() {
+    let notifier = new_sleep_notifier().unwrap();
+    let waker = Waker::from(Arc::new(Count::default()));
+    notifier.queue_waker(waker.clone(), false);
+    notifier.queue_waker(waker, true);
+    assert_eq!(notification_count(&notifier), 1);
+    assert_eq!(notifier.process_foreign_wakes(), 2);
 }
 
 #[test]
@@ -64,7 +85,7 @@ fn sleeping_owner_is_notified_for_a_non_forced_batch() {
     for _ in 0..32 {
         notifier.queue_waker(waker.clone(), false);
     }
-    assert_eq!(notification_count(notifier.eventfd_fd()), 1);
+    assert_eq!(notification_count(&notifier), 1);
     assert_eq!(notifier.process_foreign_wakes(), 32);
     assert_eq!(count.0.load(Ordering::Relaxed), 32);
     notifier.wake_up();

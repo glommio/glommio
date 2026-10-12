@@ -92,6 +92,8 @@ static mut LOCAL_EX: *const ExecutorContext = std::ptr::null();
 #[cfg(any(not(nightly), not(feature = "native-tls")))]
 use local_context::LOCAL_EX;
 
+const MAX_FOREIGN_WAKES_PREEMPTING_LOCAL_TASKS: usize = 32;
+
 /// Returns a proxy struct to the [`LocalExecutor`]
 #[inline(always)]
 pub fn executor() -> ExecutorProxy {
@@ -236,7 +238,9 @@ impl TaskQueue {
     }
 
     fn get_task(&mut self) -> Option<multitask::Runnable> {
-        if self.foreign_streak < 32 || self.runnables.is_empty() {
+        if self.foreign_streak < MAX_FOREIGN_WAKES_PREEMPTING_LOCAL_TASKS
+            || self.runnables.is_empty()
+        {
             if let Some(task) = self.foreign_runnables.pop_front() {
                 self.foreign_streak = self.foreign_streak.saturating_add(1);
                 return Some(task);

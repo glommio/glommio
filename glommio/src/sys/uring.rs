@@ -407,7 +407,7 @@ where
             UringOpDescriptor::Read(pos, len) => {
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut x| {
                     match &mut x.source_type {
-                        SourceType::ForeignNotifier(result, _) => {
+                        SourceType::ForeignNotifier(result, _, _) => {
                             opcode::Read::new(fd, result as *mut u64 as *mut u8, 8)
                                 .offset(pos)
                                 .build()
@@ -1201,7 +1201,7 @@ impl SleepableRing {
 
             let buffer_ptr = {
                 match &mut *eventfd_src.source_type_mut() {
-                    SourceType::ForeignNotifier(result, _) => result as *mut _ as _,
+                    SourceType::ForeignNotifier(result, _, _) => result as *mut _ as _,
                     _ => unreachable!("Expected ForeignNotifier source type"),
                 }
             };
@@ -1224,7 +1224,7 @@ impl SleepableRing {
             }
 
             match &mut *eventfd_src.source_type_mut() {
-                SourceType::ForeignNotifier(_, installed) => {
+                SourceType::ForeignNotifier(_, installed, _) => {
                     *installed = self.submit_sqes().is_ok();
                     *installed
                 }
@@ -1372,8 +1372,9 @@ impl UringCommon for SleepableRing {
             },
             |mut src, res| {
                 record_stats(self, &mut src, &res);
-                if let SourceType::ForeignNotifier(_, installed) = &mut src.source_type {
+                if let SourceType::ForeignNotifier(_, installed, notifier) = &mut src.source_type {
                     *installed = false;
+                    notifier.notification_reaped();
                 }
                 res
             },
@@ -1530,7 +1531,7 @@ impl Reactor {
         let eventfd_src = Source::new(
             IoRequirements::default(),
             notifier.eventfd_fd(),
-            SourceType::ForeignNotifier(0, false),
+            SourceType::ForeignNotifier(0, false, notifier.clone()),
             None,
             None,
         );
@@ -2286,6 +2287,35 @@ mod tests {
                 "opcode {code} is submitted but never probed"
             );
         }
+    }
+
+    #[test]
+    fn forced_notification_after_reaping_eventfd_completion() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let allocator = Rc::new(UringBufferAllocator::new(65536));
+        let source_map = Rc::new(RefCell::new(SourceMap::default()));
+        let mut ring = SleepableRing::new(4, "latency", allocator, source_map).unwrap();
+        let source = Source::new(
+            IoRequirements::default(),
+            notifier.eventfd_fd(),
+            SourceType::ForeignNotifier(0, false, notifier.clone()),
+            None,
+            None,
+        );
+        assert!(ring.install_eventfd(&source));
+        notifier.queue_waker(std::task::Waker::noop().clone(), true);
+        ring.ring.submit_and_wait(1).unwrap();
+        assert_eq!(ring.consume_one_event(), Some(false));
+        assert_eq!(source.is_installed(), Some(false));
+
+        notifier.queue_waker(std::task::Waker::noop().clone(), true);
+        let mut readiness = libc::pollfd {
+            fd: notifier.eventfd_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 1);
+        assert_eq!(notifier.process_foreign_wakes(), 2);
     }
 
     #[test]

@@ -283,6 +283,8 @@ pub(crate) struct SleepNotifier {
     should_notify: AtomicBool,
     /// Accepted notifications that have not yet had a draining pass.
     foreign_pending: AtomicBool,
+    /// Whether a forced notification is waiting for its eventfd completion.
+    forced_notification_pending: AtomicBool,
     foreign_wakes: crossbeam::channel::Receiver<Waker>,
     waker_sender: crossbeam::channel::Sender<Waker>,
     foreign_wakes_closed: AtomicBool,
@@ -319,6 +321,7 @@ impl SleepNotifier {
             id,
             should_notify: AtomicBool::new(false),
             foreign_pending: AtomicBool::new(false),
+            forced_notification_pending: AtomicBool::new(false),
             waker_sender,
             foreign_wakes,
             foreign_wakes_closed: AtomicBool::new(false),
@@ -328,6 +331,12 @@ impl SleepNotifier {
 
     pub(crate) fn eventfd_fd(&self) -> RawFd {
         self.eventfd.as_raw_fd()
+    }
+
+    /// Allows another forced notification after an eventfd read is reaped.
+    pub(crate) fn notification_reaped(&self) {
+        self.forced_notification_pending
+            .store(false, Ordering::Release);
     }
 
     pub(crate) fn id(&self) -> usize {
@@ -360,7 +369,11 @@ impl SleepNotifier {
             return;
         }
         let result = self.waker_sender.send(waker);
-        let first = !self.foreign_pending.swap(true, Ordering::AcqRel);
+        self.foreign_pending.store(true, Ordering::Release);
+        let force_notify = force_notify
+            && !self
+                .forced_notification_pending
+                .swap(true, Ordering::AcqRel);
         drop(guard);
 
         if result.is_err() {
@@ -373,7 +386,7 @@ impl SleepNotifier {
         #[cfg(test)]
         test_support::after_foreign_wake_queued();
 
-        self.notify(force_notify && first);
+        self.notify(force_notify);
     }
 
     /// Whether a foreign waker can still be handed to the owning executor.

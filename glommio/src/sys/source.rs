@@ -6,8 +6,8 @@
 use crate::{
     sys::SockAddrStorage,
     sys::{
-        DmaBuffer, IoBuffer, OsResult, PollableStatus, ReactorQueue, SourceId, Statx, TimeSpec64,
-        Wakers,
+        DmaBuffer, IoBuffer, OsResult, PollableStatus, ReactorQueue, SleepNotifier, SourceId,
+        Statx, TimeSpec64, Wakers,
     },
     GlommioError, IoRequirements, ReactorErrorKind, RingIoStats, TaskQueueHandle,
 };
@@ -22,6 +22,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     rc::Rc,
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -54,7 +55,7 @@ pub(crate) enum SourceType {
     Truncate,
     Close,
     LinkRings,
-    ForeignNotifier(u64, bool),
+    ForeignNotifier(u64, bool, Arc<SleepNotifier>),
     Statx(Box<RefCell<Statx>>),
     Timeout(TimeSpec64, u32),
     Connect(nix::sys::socket::SockaddrStorage),
@@ -293,7 +294,7 @@ impl Source {
 
     pub(super) fn is_installed(&self) -> Option<bool> {
         match &self.inner.borrow().source_type {
-            SourceType::ForeignNotifier(_, installed) => Some(*installed),
+            SourceType::ForeignNotifier(_, installed, _) => Some(*installed),
             _ => None,
         }
     }

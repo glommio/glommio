@@ -558,7 +558,7 @@ pub mod prelude {
 /// the faces of pending events for latency classes.
 ///
 /// [`TaskQueue`]: struct.TaskQueueHandle.html
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub enum Latency {
     /// Tasks marked as `Latency::Matters` will cooperatively signal to other
     /// tasks that they should preempt often. The `Duration` argument
@@ -570,23 +570,29 @@ pub enum Latency {
     NotImportant,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct IoRequirements {
     latency_req: Latency,
+    #[cfg(test)]
+    _io_handle: usize,
 }
 
 impl Default for IoRequirements {
     fn default() -> Self {
         Self {
             latency_req: Latency::NotImportant,
+            #[cfg(test)]
+            _io_handle: 0,
         }
     }
 }
 
 impl IoRequirements {
-    fn new(latency: Latency, _handle: usize) -> Self {
+    fn new(latency: Latency, _io_handle: usize) -> Self {
         Self {
             latency_req: latency,
+            #[cfg(test)]
+            _io_handle,
         }
     }
 }

@@ -262,6 +262,10 @@ pub(crate) struct SleepNotifier {
     id: usize,
     eventfd: std::fs::File,
     should_notify: AtomicBool,
+    /// Accepted notifications that have not yet had a draining pass.
+    foreign_pending: AtomicBool,
+    /// Whether a forced notification has been issued for the pending batch.
+    forced_notification_pending: AtomicBool,
     foreign_wakes: crossbeam::channel::Receiver<Waker>,
     waker_sender: crossbeam::channel::Sender<Waker>,
     foreign_wakes_closed: AtomicBool,
@@ -297,6 +301,8 @@ impl SleepNotifier {
             eventfd,
             id,
             should_notify: AtomicBool::new(false),
+            foreign_pending: AtomicBool::new(false),
+            forced_notification_pending: AtomicBool::new(false),
             waker_sender,
             foreign_wakes,
             foreign_wakes_closed: AtomicBool::new(false),
@@ -338,6 +344,11 @@ impl SleepNotifier {
             return;
         }
         let result = self.waker_sender.send(waker);
+        self.foreign_pending.store(true, Ordering::Release);
+        let force_notify = force_notify
+            && !self
+                .forced_notification_pending
+                .swap(true, Ordering::AcqRel);
         drop(guard);
 
         if result.is_err() {
@@ -370,10 +381,18 @@ impl SleepNotifier {
     }
 
     pub(crate) fn process_foreign_wakes(&self) -> usize {
+        if !self.foreign_pending.load(Ordering::Acquire) {
+            return 0;
+        }
+        self.foreign_pending.store(false, Ordering::Release);
+        self.forced_notification_pending
+            .store(false, Ordering::Release);
         let mut processed = 0;
         while let Ok(waker) = self.foreign_wakes.try_recv() {
             processed += 1;
-            wake!(waker);
+            crate::executor::with_foreign_wake(|| {
+                wake!(waker);
+            });
         }
         processed
     }
@@ -706,3 +725,6 @@ pub(crate) fn shutdown(raw: RawFd, how: Shutdown) -> io::Result<()> {
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod foreign_wake_tests;

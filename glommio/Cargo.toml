@@ -141,3 +141,7 @@ name    = "echo"
 [[bench]]
 harness = false
 name    = "competing_io"
+
+[[bench]]
+harness = false
+name = "cross_wake_completion"

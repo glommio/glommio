@@ -20,6 +20,7 @@
 //! ```
 
 use super::Semaphore;
+use pin_project_lite::pin_project;
 use std::{
     cell::{Cell, UnsafeCell},
     future::Future,
@@ -45,54 +46,56 @@ pub struct OnceCell<T> {
     in_initialiser: Cell<bool>,
 }
 
-/// Polls an initialiser while marking its cell as "on the call stack".
-///
-/// The flag is raised for the duration of each `poll` and lowered on the way
-/// out, including when the initialiser panics, so an abandoned initialisation
-/// cannot leave the cell permanently un-enterable.
-struct Guarded<'a, Fut> {
-    inner: Fut,
-    flag: &'a Cell<bool>,
+pin_project! {
+    /// Polls an initialiser while marking its cell as "on the call stack".
+    ///
+    /// The flag is raised for the duration of each `poll` and lowered on the way
+    /// out, including when the initialiser panics, so an abandoned initialisation
+    /// cannot leave the cell permanently un-enterable.
+    struct Guarded<'a, Fut> {
+        #[pin]
+        inner: Fut,
+        flag: &'a Cell<bool>,
+    }
 }
 
 impl<Fut: Future> Future for Guarded<'_, Fut> {
     type Output = Fut::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Fut::Output> {
-        // Safety: `inner` is pinned structurally and never moved out of, and
-        // `flag` is a shared reference that needs no pinning.
-        let this = unsafe { self.get_unchecked_mut() };
-        let flag = this.flag;
-        let inner = unsafe { Pin::new_unchecked(&mut this.inner) };
+        let this = self.project();
+        let flag = *this.flag;
 
         flag.set(true);
         let _lower = scopeguard::guard((), |()| flag.set(false));
-        inner.poll(cx)
+        this.inner.poll(cx)
     }
 }
 
-/// Polls `inner` while refusing to proceed from inside this cell's own
-/// initialiser.
-///
-/// Checked on every poll rather than once on entry. A future can be created
-/// outside the initialiser, where the check passes because the flag is still
-/// clear, and then handed in and awaited inside it.
-struct RefusingReentry<'a, Fut> {
-    inner: Fut,
-    flag: &'a Cell<bool>,
+pin_project! {
+    /// Polls `inner` while refusing to proceed from inside this cell's own
+    /// initialiser.
+    ///
+    /// Checked on every poll rather than once on entry. A future can be created
+    /// outside the initialiser, where the check passes because the flag is still
+    /// clear, and then handed in and awaited inside it.
+    struct RefusingReentry<'a, Fut> {
+        #[pin]
+        inner: Fut,
+        flag: &'a Cell<bool>,
+    }
 }
 
 impl<Fut: Future> Future for RefusingReentry<'_, Fut> {
     type Output = Fut::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Fut::Output> {
-        // Safety: as in `Guarded`.
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.project();
         assert!(
             !this.flag.get(),
             "OnceCell initialiser re-entered its own cell; it would wait for itself forever"
         );
-        unsafe { Pin::new_unchecked(&mut this.inner) }.poll(cx)
+        this.inner.poll(cx)
     }
 }
 

@@ -1526,7 +1526,7 @@ impl LocalExecutor {
                 // the opportunity to install the timer.
                 this.context
                     .reactor
-                    .react(|| Some(this.preempt_timer_duration()))
+                    .react(|| Some(this.preempt_timer_duration()), false)
                     .expect("Failed to poll io! This is actually pretty bad!");
 
                 // run user code
@@ -1553,7 +1553,7 @@ impl LocalExecutor {
                                 );
                                 this.context
                                     .reactor
-                                    .react(|| None)
+                                    .react(|| None, true)
                                     .expect("Failed to park! This is actually pretty bad!");
                                 break;
                             }

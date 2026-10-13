@@ -455,6 +455,7 @@ fn foreign_cleanup_while_parking_closes_file() {
                 .wait(
                     || None,
                     None,
+                    true,
                     0,
                     || {
                         checked_before_sleep.set(true);

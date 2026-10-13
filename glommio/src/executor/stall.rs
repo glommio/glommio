@@ -171,7 +171,7 @@ impl StallDetector {
     ) -> JoinHandle<()> {
         struct SendWrapper(libc::pthread_t);
         unsafe impl Send for SendWrapper {}
-        let tid = SendWrapper(unsafe { nix::libc::pthread_self() });
+        let tid = SendWrapper(nix::sys::pthread::pthread_self());
         std::thread::spawn(move || {
             let tid = tid;
             while timer.wait().is_ok() {

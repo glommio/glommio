@@ -86,39 +86,6 @@ pub(crate) fn write_eventfd(eventfd: RawFd) {
     assert_eq!(ret, 8);
 }
 
-pub(crate) fn send_syscall(fd: RawFd, buf: *const u8, len: usize, flags: i32) -> io::Result<usize> {
-    syscall!(send(fd, buf as _, len, flags)).map(|x| x as usize)
-}
-
-/// `sendmsg` over an iovec array, i.e. `writev` with room for socket flags.
-///
-/// `writev` itself would do, except that it takes none, and the socket may be
-/// in blocking mode -- the whole readiness path depends on passing
-/// `MSG_DONTWAIT` per call.
-pub(crate) fn sendmsg_iov_syscall(
-    fd: RawFd,
-    iov: *const libc::iovec,
-    iovlen: usize,
-    flags: i32,
-) -> io::Result<usize> {
-    let mut hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
-    hdr.msg_iov = iov as *mut libc::iovec;
-    // `msg_iovlen` is a `size_t` on glibc and an `int` on musl.
-    hdr.msg_iovlen = iovlen as _;
-
-    syscall!(sendmsg(fd, &hdr as *const libc::msghdr, flags)).map(|x| x as usize)
-}
-
-pub(crate) fn recv_syscall(fd: RawFd, buf: *mut u8, len: usize, flags: i32) -> io::Result<usize> {
-    syscall!(recv(fd, buf as _, len, flags)).map(|x| x as usize)
-}
-
-pub(crate) fn accept_syscall(fd: RawFd) -> io::Result<RawFd> {
-    let mut addr: MaybeUninit<libc::sockaddr_storage> = MaybeUninit::uninit();
-    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    syscall!(accept(fd, addr.as_mut_ptr() as *mut _, &mut length))
-}
-
 pub(crate) fn direct_io_ify(fd: RawFd, flags: libc::c_int) -> io::Result<()> {
     syscall!(fcntl(fd, libc::F_SETFL, flags | libc::O_DIRECT))?;
     Ok(())
@@ -166,30 +133,6 @@ pub(crate) fn recvmsg_syscall<T: SockaddrLike>(
     let x = syscall!(recvmsg(fd, &mut hdr, flags)).map(|x| x as usize)?;
     let addr = unsafe { ssptr_to_sockaddr(msg_name, hdr.msg_namelen as _)? };
     Ok((x, addr))
-}
-
-pub(crate) fn sendmsg_syscall(
-    fd: RawFd,
-    buf: *const u8,
-    len: usize,
-    addr: &impl nix::sys::socket::SockaddrLike,
-    flags: i32,
-) -> io::Result<usize> {
-    let mut iov = libc::iovec {
-        iov_base: buf as *mut libc::c_void,
-        iov_len: len,
-    };
-
-    let msg_name = addr.as_ptr() as *mut libc::c_void;
-    let msg_namelen = addr.len();
-
-    let mut hdr = unsafe { std::mem::zeroed::<libc::msghdr>() };
-    hdr.msg_name = msg_name;
-    hdr.msg_namelen = msg_namelen;
-    hdr.msg_iov = &mut iov as *mut libc::iovec;
-    hdr.msg_iovlen = 1;
-
-    syscall!(sendmsg(fd, &hdr, flags)).map(|x| x as usize)
 }
 
 mod dma_buffer;

@@ -2883,7 +2883,6 @@ impl ExecutorProxy {
 
 #[cfg(test)]
 mod test {
-    use core::mem::MaybeUninit;
     use rusty_fork::rusty_fork_test;
     use std::{
         cell::Cell,
@@ -3296,19 +3295,14 @@ mod test {
         });
     }
 
-    /// As far as impl From<libc::timeval> for Duration is not allowed.
-    fn from_timeval(v: libc::timeval) -> Duration {
-        Duration::from_secs(v.tv_sec as u64) + Duration::from_micros(v.tv_usec as u64)
-    }
-
     fn getrusage() -> Duration {
-        let mut s0 = MaybeUninit::<libc::rusage>::uninit();
-        let err = unsafe { libc::getrusage(libc::RUSAGE_THREAD, s0.as_mut_ptr()) };
-        if err != 0 {
-            panic!("getrusage error = {}", err);
-        }
-        let usage = unsafe { s0.assume_init() };
-        from_timeval(usage.ru_utime) + from_timeval(usage.ru_stime)
+        use nix::sys::{
+            resource::{getrusage, UsageWho},
+            time::TimeValLike,
+        };
+        let usage = getrusage(UsageWho::RUSAGE_THREAD).expect("getrusage failed");
+        let micros = usage.user_time().num_microseconds() + usage.system_time().num_microseconds();
+        Duration::from_micros(micros as u64)
     }
 
     #[test]

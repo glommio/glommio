@@ -18,10 +18,11 @@ version.workspace = true
 rust-version = "1.92"
 
 [features]
+default   = []
 bench     = []
 debugging = []
-default   = ["macros"]
 macros    = ["dep:glommio-macros"]
+stats     = ["dep:sketches-ddsketch"]
 
 # Unstable features based on nightly
 native-tls = []
@@ -46,7 +47,7 @@ pin-project-lite      = "0.2"
 rlimit                = "0.10"
 scopeguard            = "1.2"
 signal-hook           = { version = "0.4" }
-sketches-ddsketch     = "0.3"
+sketches-ddsketch     = { version = "0.3", optional = true }
 smallvec              = { version = "1.15", features = ["union"] }
 socket2               = { version = "0.6", features = ["all"] }
 tracing               = "0.1"
@@ -107,6 +108,7 @@ name    = "preempt"
 [[bench]]
 harness = false
 name    = "socket_io"
+required-features = ["stats"]
 
 [[bench]]
 harness = false

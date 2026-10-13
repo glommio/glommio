@@ -21,7 +21,7 @@
 
 use super::Semaphore;
 use std::{
-    cell::{Cell, UnsafeCell},
+    cell::Cell,
     future::Future,
     pin::Pin,
     task::{Context, Poll},
@@ -29,7 +29,7 @@ use std::{
 
 /// A cell holding a value that is initialised at most once.
 pub struct OnceCell<T> {
-    value: UnsafeCell<Option<T>>,
+    value: std::cell::OnceCell<T>,
     /// Held for the duration of an initialisation, so a second caller waits
     /// for the first instead of running its own initialiser.
     initialising: Semaphore,
@@ -100,7 +100,7 @@ impl<T> OnceCell<T> {
     /// Creates an empty cell.
     pub fn new() -> Self {
         OnceCell {
-            value: UnsafeCell::new(None),
+            value: std::cell::OnceCell::new(),
             initialising: Semaphore::new(1),
             in_initialiser: Cell::new(false),
         }
@@ -108,14 +108,7 @@ impl<T> OnceCell<T> {
 
     /// Returns the value, or `None` if the cell is still empty.
     pub fn get(&self) -> Option<&T> {
-        // Safety: the value is written at most once and is never replaced, so
-        // a shared reference handed out here cannot be invalidated while it
-        // lives. `take` does remove it, but it needs `&mut self`, which the
-        // borrow checker will not hand out while the reference returned here
-        // is alive. Every writer checks the cell is empty
-        // and writes without awaiting in between, which on a single-threaded
-        // executor is what makes "at most once" true.
-        unsafe { (*self.value.get()).as_ref() }
+        self.value.get()
     }
 
     /// Returns whether the cell holds a value.
@@ -147,30 +140,20 @@ impl<T> OnceCell<T> {
             return Err(value);
         };
 
-        // Safety: as in `get`. The permit is held, so no initialiser can be
-        // between its emptiness check and its write.
-        unsafe { *self.value.get() = Some(value) };
+        self.value.set(value)?;
         self.initialising.close();
         Ok(())
     }
 
     /// Returns a mutable reference to the value, or `None` if the cell is
     /// still empty.
-    ///
-    /// Taking `&mut self` proves no shared reference from [`get`] is alive, so
-    /// this needs no `unsafe`.
-    ///
-    /// [`get`]: Self::get
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        self.value.get_mut().as_mut()
+        self.value.get_mut()
     }
 
     /// Takes the value out, leaving the cell empty and reusable.
     ///
-    /// Returns `None` if the cell was empty. As with [`get_mut`], `&mut self`
-    /// is what makes removing the value sound.
-    ///
-    /// [`get_mut`]: Self::get_mut
+    /// Returns `None` if the cell was empty.
     ///
     /// # Examples
     ///
@@ -262,9 +245,9 @@ impl<T> OnceCell<T> {
                 flag: &self.in_initialiser,
             }
             .await?;
-            // Safety: as in `get`. Nothing else can publish while this
-            // permit is held, which is what `set` taking it too buys.
-            unsafe { *self.value.get() = Some(value) };
+            if self.value.set(value).is_err() {
+                unreachable!("the permit excludes every other writer");
+            }
             // Releases everyone queued behind this initialisation in one pass.
             // A failed initialiser does not get here, so the next caller still
             // takes the permit and runs its own.
@@ -367,7 +350,7 @@ impl<T> From<T> for OnceCell<T> {
     /// Builds a cell already holding `value`.
     fn from(value: T) -> Self {
         let cell = OnceCell {
-            value: UnsafeCell::new(Some(value)),
+            value: std::cell::OnceCell::from(value),
             initialising: Semaphore::new(1),
             in_initialiser: Cell::new(false),
         };

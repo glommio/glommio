@@ -122,20 +122,8 @@ impl<T> OnceCell<T> {
     ///
     /// Hands `value` back in two cases: the cell already holds one, or a
     /// [`get_or_init`](Self::get_or_init) is in flight and suspended in its
-    /// initialiser. Overwriting the second would leave that caller waiting for
-    /// a computation whose result is then thrown away, so it is reported
-    /// instead. `tokio::sync::OnceCell` draws the same line, with a richer
-    /// error that names which of the two happened.
-    ///
-    /// The two are not distinguished here because [`std::cell::OnceCell::set`]
-    /// returns `Result<(), T>` and this keeps that shape. Ask
-    /// [`is_initialized`](Self::is_initialized) if the difference matters.
+    /// initialiser. [`is_initialized`](Self::is_initialized) tells them apart.
     pub fn set(&self, value: T) -> Result<(), T> {
-        // The permit is what makes this safe against an initialiser, and
-        // taking it fails in exactly the two cases where the value is not this
-        // caller's to set: another task holds it, so a `get_or_init` is
-        // suspended mid-await and will publish when it wakes; or the semaphore
-        // is closed, so a value already landed.
         let Ok(_permit) = self.initialising.try_acquire_permit(1) else {
             return Err(value);
         };
@@ -171,9 +159,6 @@ impl<T> OnceCell<T> {
     /// });
     /// ```
     pub fn take(&mut self) -> Option<T> {
-        // Swapped for a fresh cell rather than emptied in place: the semaphore
-        // was closed when the value landed, and an emptied cell has to be
-        // initialisable again.
         std::mem::take(self).value.into_inner()
     }
 
@@ -221,20 +206,12 @@ impl<T> OnceCell<T> {
         })
         .await
         else {
-            // Closed means a previous initialiser published and released every
-            // waiter at once, rather than handing the permit down the queue.
             return Ok(self
                 .get()
                 .expect("the semaphore is closed only after a value lands"));
         };
 
-        // Re-checked under the permit: whoever held it before may have
-        // succeeded, in which case there is nothing to do -- or failed, in
-        // which case the cell is still empty and this caller tries.
         if self.get().is_none() {
-            // Armed across the call to `init`, not only across the future it
-            // hands back: a closure is free to do its re-entering before
-            // returning anything there is to poll.
             let building = {
                 self.in_initialiser.set(true);
                 let _armed = scopeguard::guard((), |()| self.in_initialiser.set(false));
@@ -248,9 +225,6 @@ impl<T> OnceCell<T> {
             if self.value.set(value).is_err() {
                 unreachable!("the permit excludes every other writer");
             }
-            // Releases everyone queued behind this initialisation in one pass.
-            // A failed initialiser does not get here, so the next caller still
-            // takes the permit and runs its own.
             self.initialising.close();
         }
 
@@ -296,9 +270,6 @@ impl<T> OnceCell<T> {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        // The infallible case is the fallible one whose initialiser cannot
-        // fail, which is how `std` builds it too: one path to audit rather
-        // than two that have to agree.
         self.get_or_try_init(|| async { Ok::<T, std::convert::Infallible>(init().await) })
             .await
             .unwrap()
@@ -354,8 +325,6 @@ impl<T> From<T> for OnceCell<T> {
             initialising: Semaphore::new(1),
             in_initialiser: Cell::new(false),
         };
-        // Closed because the cell arrives initialised: an open semaphore would
-        // let `set` take a permit and overwrite the value it was built with.
         cell.initialising.close();
         cell
     }

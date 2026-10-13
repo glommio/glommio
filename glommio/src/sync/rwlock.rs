@@ -482,12 +482,11 @@ impl<T> RwLock<T> {
     /// });
     /// ```
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
-        let state = self.state.borrow();
-        if state.closed {
+        if self.state.get_mut().closed {
             return Err(GlommioError::Closed(ResourceType::RwLock));
         }
 
-        Ok(unsafe { &mut *(self.value.borrow_mut().as_mut().unwrap() as *mut _) })
+        Ok(self.value.get_mut().as_mut().unwrap())
     }
 
     /// Locks this RwLock with shared read access, suspending the current fiber

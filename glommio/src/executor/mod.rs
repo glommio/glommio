@@ -38,7 +38,7 @@ use crate::{
     io::DmaBuffer,
     reactor,
     sys::{self, blocking::BlockingThreadPool},
-    task::{self, registry::TaskRegistry, waker_fn::dummy_waker},
+    task::{self, registry::TaskRegistry},
     GlommioError, IoRequirements, IoStats, Latency, Shares,
 };
 use ahash::AHashMap;
@@ -58,7 +58,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     thread::{Builder, JoinHandle},
     time::{Duration, Instant},
 };
@@ -1495,10 +1495,7 @@ impl LocalExecutor {
     /// ```
     pub fn run<T>(&self, future: impl Future<Output = T>) -> T {
         let run = |this: &Self| {
-            // this waker is never exposed in the public interface and is only used to check
-            // whether the task's `JoinHandle` is `Ready`
-            let waker = dummy_waker();
-            let cx = &mut Context::from_waker(&waker);
+            let cx = &mut Context::from_waker(Waker::noop());
 
             let spin_before_park = self.spin_before_park().unwrap_or_default();
 

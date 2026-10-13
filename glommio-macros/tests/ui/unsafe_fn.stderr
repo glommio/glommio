@@ -1,0 +1,5 @@
+error: expected a safe `async fn`; a `main`/`test` entry point cannot be `unsafe` because the executor is what calls it, not the caller. Move the unsafe code inside the body instead
+ --> tests/ui/unsafe_fn.rs:2:7
+  |
+2 | async unsafe fn unsafe_main() {}
+  |       ^^^^^^

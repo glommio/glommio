@@ -1,0 +1,7 @@
+error[E0433]: failed to resolve: use of unresolved module or unlinked crate `definitely_not_a_real_crate`
+ --> tests/ui/crate_override_is_honoured.rs:4:32
+  |
+4 | #[glommio_macros::main(crate = definitely_not_a_real_crate)]
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `definitely_not_a_real_crate`
+  |
+  = help: if you wanted to use a crate named `definitely_not_a_real_crate`, use `cargo add definitely_not_a_real_crate` to add it to your `Cargo.toml`

@@ -13,7 +13,7 @@ use std::{
     net::{Shutdown, TcpStream},
     os::unix::io::{AsRawFd, FromRawFd, RawFd},
     rc::Rc,
-    sync::{atomic::Ordering, Arc, Mutex, RwLock},
+    sync::{atomic::Ordering, Arc, RwLock},
     task::Waker,
     time::Duration,
 };
@@ -80,6 +80,7 @@ pub(crate) fn create_eventfd() -> io::Result<RawFd> {
     syscall!(eventfd(0, libc::O_CLOEXEC))
 }
 
+#[cfg_attr(loom, allow(dead_code))]
 pub(crate) fn write_eventfd(eventfd: RawFd) {
     let buf = [1u64; 1];
     let ret = syscall!(write(eventfd, &buf as *const u64 as _, 8)).unwrap();
@@ -193,17 +194,22 @@ pub(crate) fn sendmsg_syscall(
 }
 
 mod dma_buffer;
+#[cfg(all(test, loom))]
+mod loom_tests;
+#[cfg_attr(loom, allow(dead_code))]
 mod membarrier;
+mod sync;
 pub(crate) use membarrier::initialize_strategy as initialize_membarrier_strategy;
 pub(crate) mod source;
 pub(crate) mod sysfs;
 mod uring;
 
 pub use self::dma_buffer::DmaBuffer;
+use self::sync::{AtomicBool, Mutex};
 pub(crate) use self::{source::*, uring::*};
 use crate::error::{ExecutorErrorKind, GlommioError};
 use smallvec::SmallVec;
-use std::{convert::TryFrom, ops::Deref, sync::atomic::AtomicBool};
+use std::{convert::TryFrom, ops::Deref};
 
 #[derive(Debug, Default)]
 pub(crate) struct ReactorGlobalState {
@@ -285,6 +291,9 @@ pub(crate) struct SleepNotifier {
     waker_sender: crossbeam::channel::Sender<Waker>,
     foreign_wakes_closed: AtomicBool,
     foreign_wakes_lock: Mutex<()>,
+    /// Counts eventfd writes in place of making them, so loom can observe them.
+    #[cfg(loom)]
+    signals: self::sync::AtomicU64,
 }
 
 lazy_static! {
@@ -320,6 +329,8 @@ impl SleepNotifier {
             foreign_wakes,
             foreign_wakes_closed: AtomicBool::new(false),
             foreign_wakes_lock: Mutex::new(()),
+            #[cfg(loom)]
+            signals: self::sync::AtomicU64::new(0),
         }))
     }
 
@@ -338,8 +349,23 @@ impl SleepNotifier {
             .is_ok()
             || force
         {
-            write_eventfd(self.eventfd_fd());
+            self.signal();
         }
+    }
+
+    #[cfg(not(loom))]
+    fn signal(&self) {
+        write_eventfd(self.eventfd_fd());
+    }
+
+    #[cfg(loom)]
+    fn signal(&self) {
+        self.signals.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(all(loom, test))]
+    pub(super) fn signals(&self) -> u64 {
+        self.signals.load(Ordering::SeqCst)
     }
 
     /// Queues a waker, and notifies the destination executor.
@@ -406,6 +432,25 @@ impl SleepNotifier {
 
     pub(super) fn wake_up(&self) {
         self.should_notify.store(false, Ordering::Relaxed);
+    }
+
+    /// Lets foreign wakers know the owner is going to sleep, drains what they
+    /// sent meanwhile, and sleeps only if that was nothing.
+    ///
+    /// Notification is turned off again only after a sleep that succeeded.
+    pub(super) fn sleep_unless_woken(
+        &self,
+        drain: impl FnOnce() -> usize,
+        sleep: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<usize> {
+        self.prepare_to_sleep();
+        membarrier::heavy();
+        let events = drain();
+        if events == 0 {
+            sleep()?;
+            self.wake_up();
+        }
+        Ok(events)
     }
 }
 

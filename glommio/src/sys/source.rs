@@ -36,6 +36,9 @@ pub(crate) enum SourceType {
     PollAdd,
     SockSend(DmaBuffer),
     SockRecv(Option<DmaBuffer>),
+    /// A read into a stream's own receive buffer, held here until the
+    /// completion arrives so the stream can be dropped mid-read.
+    SockRecvInto(Option<crate::net::OwnedRxBuf>),
     SockRecvMsg(
         Option<DmaBuffer>,
         libc::iovec,
@@ -195,7 +198,7 @@ impl Source {
         Ref::map(self.inner.borrow(), |x| &x.timeout)
     }
 
-    pub(super) fn source_type(&self) -> Ref<'_, SourceType> {
+    pub(crate) fn source_type(&self) -> Ref<'_, SourceType> {
         Ref::map(self.inner.borrow(), |x| &x.source_type)
     }
 

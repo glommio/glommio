@@ -68,6 +68,7 @@ enum UringOpDescriptor {
     SockSend(*const u8, usize, i32),
     SockSendMsg(*mut libc::msghdr, i32),
     SockRecv(usize, i32),
+    SockRecvInto(i32),
     SockRecvMsg(usize, i32),
     Nop,
 }
@@ -522,6 +523,21 @@ where
                 opcode::SendMsg::new(fd, hdr as *const libc::msghdr)
                     .flags(flags as u32)
                     .build()
+            }
+            UringOpDescriptor::SockRecvInto(flags) => {
+                source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
+                    match &mut src.source_type {
+                        SourceType::SockRecvInto(slot) => {
+                            let buffer = slot
+                                .as_mut()
+                                .expect("a SockRecvInto source without its buffer");
+                            opcode::Recv::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
+                                .flags(flags)
+                                .build()
+                        }
+                        _ => unreachable!(),
+                    }
+                })
             }
             UringOpDescriptor::SockRecv(len, flags) => {
                 let mut buf = DmaBuffer::new(len).expect("failed to allocate buffer");
@@ -1675,6 +1691,16 @@ impl Reactor {
             }
             _ => unreachable!(),
         };
+        queue_request_into_ring(
+            &mut *self.ring_for_source(source),
+            source,
+            op,
+            &mut self.source_map.borrow_mut(),
+        );
+    }
+
+    pub(crate) fn recv_into(&self, source: &Source, flags: MsgFlags) {
+        let op = UringOpDescriptor::SockRecvInto(flags.bits());
         queue_request_into_ring(
             &mut *self.ring_for_source(source),
             source,

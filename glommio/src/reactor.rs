@@ -462,6 +462,14 @@ impl Reactor {
         Ok(source)
     }
 
+    /// A completion-based read into `buffer`, which stays in the `Source`
+    /// until the read completes.
+    pub(crate) fn recv_into(&self, fd: RawFd, buffer: crate::net::OwnedRxBuf) -> Source {
+        let source = self.new_source(fd, SourceType::SockRecvInto(Some(buffer)), None);
+        self.sys.recv_into(&source, MsgFlags::empty());
+        source
+    }
+
     pub(crate) fn recv(&self, fd: RawFd, size: usize, flags: MsgFlags) -> Source {
         let source = self.new_source(fd, SourceType::SockRecv(None), None);
         self.sys.recv(&source, size, flags);

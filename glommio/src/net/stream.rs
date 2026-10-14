@@ -21,6 +21,33 @@ use std::{
 
 use crate::Result;
 
+/// A receive buffer on loan to the kernel.
+///
+/// It lives in the `Source` until the completion arrives, so the read can
+/// outlive the future that started it.
+#[derive(Debug)]
+pub struct OwnedRxBuf {
+    memory: Vec<u8>,
+}
+
+impl OwnedRxBuf {
+    pub(crate) fn new(memory: Vec<u8>) -> Self {
+        OwnedRxBuf { memory }
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.memory.as_mut_ptr()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.memory
+    }
+}
+
 /// Root trait for socket stream receive buffer
 pub trait RxBuf {
     fn read(&mut self, buf: &mut [u8]) -> usize;
@@ -31,6 +58,25 @@ pub trait RxBuf {
     fn buffer_size(&self) -> usize;
     fn handle_result(&mut self, result: usize);
     fn unfilled(&mut self) -> &mut [u8];
+
+    /// Lends the whole buffer to the kernel for a completion-based read.
+    ///
+    /// Called only when the buffer is empty. `None`, the default, keeps the
+    /// readiness path; returning `Some` requires
+    /// [`restore_kernel_buffer`](Self::restore_kernel_buffer) as well.
+    fn take_kernel_buffer(&mut self) -> Option<OwnedRxBuf> {
+        None
+    }
+
+    /// Takes the buffer back, empty. The byte count arrives separately,
+    /// through [`handle_result`](Self::handle_result).
+    fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
+        let _ = buffer;
+        unreachable!(
+            "restore_kernel_buffer called on an RxBuf that never lends its buffer out: \
+             take_kernel_buffer and restore_kernel_buffer must be implemented together"
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +198,22 @@ impl RxBuf for Preallocated {
         }
         &mut self.buf[self.tail..]
     }
+
+    fn take_kernel_buffer(&mut self) -> Option<OwnedRxBuf> {
+        debug_assert!(
+            self.is_empty(),
+            "lending a buffer that still holds unread bytes would lose them"
+        );
+        self.head = 0;
+        self.tail = 0;
+        Some(OwnedRxBuf::new(std::mem::take(&mut self.buf)))
+    }
+
+    fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
+        self.buf = buffer.memory;
+        self.head = 0;
+        self.tail = 0;
+    }
 }
 
 #[derive(Debug)]
@@ -251,6 +313,11 @@ impl<S: AsRawFd> NonBufferedStream<S> {
             _ => unreachable!(),
         }
         Ok(sz)
+    }
+
+    /// One non-blocking `recv`; `None` when the socket has nothing.
+    pub(crate) fn poll_read_speculative(&mut self, buf: &mut [u8]) -> Option<io::Result<usize>> {
+        super::yolo_recv(self.stream.as_raw_fd(), buf)
     }
 
     /// Speculates with a plain `recv`, and registers for readiness only when
@@ -374,6 +441,8 @@ pub(crate) struct GlommioStream<S, B> {
     stream: NonBufferedStream<S>,
     rx_buf: B,
     rx_done: Cell<bool>,
+    /// A completion-based read with the receive buffer lent to the kernel.
+    rx_source: Option<Source>,
 }
 
 impl<S> From<socket2::Socket> for GlommioStream<S, NonBuffered>
@@ -395,6 +464,7 @@ where
             stream,
             rx_buf: NonBuffered,
             rx_done: Cell::new(false),
+            rx_source: None,
         }
     }
 }
@@ -421,6 +491,7 @@ impl<S> GlommioStream<S, NonBuffered> {
             stream: self.stream,
             rx_buf,
             rx_done: self.rx_done,
+            rx_source: self.rx_source,
         }
     }
 }
@@ -433,6 +504,24 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// Successive calls return the same data. This is accomplished by passing
     /// `MSG_PEEK` as a flag to the underlying `recv` system call.
     pub(crate) async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(source) = self.rx_source.as_ref() {
+            let read = std::future::poll_fn(|cx| match source.result() {
+                Some(result) => Poll::Ready(result),
+                None => {
+                    source.add_waiter_single(cx.waker());
+                    Poll::Pending
+                }
+            })
+            .await?;
+            let len = read.min(buf.len());
+            match &*source.source_type() {
+                SourceType::SockRecvInto(Some(lent)) => {
+                    buf[..len].copy_from_slice(&lent.as_bytes()[..len]);
+                }
+                _ => unreachable!("a completion read without its buffer"),
+            }
+            return Ok(len);
+        }
         let mut pos = self.rx_buf.peek(buf);
         if pos < buf.len() && !self.rx_done.get() {
             if let Some(result) = self.stream.try_peek(&mut buf[pos..]) {
@@ -459,7 +548,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         if self.rx_buf.is_empty() {
-            if buf.len() >= self.rx_buf.buffer_size() {
+            if buf.len() >= self.rx_buf.buffer_size() && self.rx_source.is_none() {
                 return self.stream.poll_read(cx, buf);
             }
             if !self.rx_done.get() {
@@ -470,12 +559,52 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     }
 
     fn poll_replenish_buffer(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
-        let result = poll_err!(ready!(self.stream.poll_read(cx, self.rx_buf.unfilled())));
+        let result = poll_err!(ready!(self.poll_fill(cx)));
         self.rx_buf.handle_result(result);
         if result == 0 {
             self.rx_done.set(true);
         }
         Poll::Ready(Ok(result))
+    }
+
+    /// Fills the receive buffer by a speculative `recv`, a completion read
+    /// into the lent buffer, or readiness when the buffer cannot be lent.
+    fn poll_fill(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
+        if let Some(source) = self.rx_source.as_ref() {
+            let reactor = self.stream.reactor.upgrade().unwrap();
+            let Some(result) = source.result() else {
+                poll_err!(self.stream.read_timeout.check(&reactor));
+                source.add_waiter_single(cx.waker());
+                self.stream
+                    .read_timeout
+                    .maybe_set_timer(&reactor, cx.waker());
+                return Poll::Pending;
+            };
+            self.stream.read_timeout.cancel_timer(&reactor);
+
+            let source = self.rx_source.take().unwrap();
+            match source.extract_source_type() {
+                SourceType::SockRecvInto(Some(buffer)) => {
+                    self.rx_buf.restore_kernel_buffer(buffer);
+                }
+                _ => unreachable!("a completion read came back without its buffer"),
+            }
+
+            return Poll::Ready(result);
+        }
+
+        if let Some(result) = self.stream.poll_read_speculative(self.rx_buf.unfilled()) {
+            return Poll::Ready(result);
+        }
+
+        match self.rx_buf.take_kernel_buffer() {
+            Some(buffer) => {
+                let reactor = self.stream.reactor.upgrade().unwrap();
+                self.rx_source = Some(reactor.recv_into(self.stream.stream.as_raw_fd(), buffer));
+                self.poll_fill(cx)
+            }
+            None => self.stream.poll_read(cx, self.rx_buf.unfilled()),
+        }
     }
 
     pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
@@ -528,8 +657,10 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
 }
 
 impl<S: AsRawFd, B: Buffered> GlommioStream<S, B> {
+    /// Stays ready at end of stream, where a completion read would otherwise
+    /// return `Pending` again.
     pub(crate) fn poll_fill_buf(&mut self, cx: &Context<'_>) -> Poll<io::Result<&[u8]>> {
-        if self.rx_buf.is_empty() {
+        if self.rx_buf.is_empty() && !self.rx_done.get() {
             poll_err!(ready!(self.poll_replenish_buffer(cx)));
         }
         Poll::Ready(Ok(self.rx_buf.as_bytes()))

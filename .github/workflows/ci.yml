@@ -195,3 +195,23 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: .github/scripts/run-tests.sh "${TARGET}"
+
+  loom:
+    name: Loom model checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Use Rust MSRV
+        run: rustup override set 1.92.0
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Run loom models
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --release --locked -p glommio --lib loom_tests

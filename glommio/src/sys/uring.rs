@@ -35,8 +35,8 @@ use crate::{
         self,
         blocking::{BlockingThreadOp, BlockingThreadPool},
         dma_buffer::{BufferStorage, DmaBuffer},
-        membarrier, DirectIo, EnqueuedSource, EnqueuedStatus, InnerSource, IoBuffer,
-        PollableStatus, SockAddrStorage, Source, SourceType, Statx, TimeSpec64,
+        DirectIo, EnqueuedSource, EnqueuedStatus, InnerSource, IoBuffer, PollableStatus,
+        SockAddrStorage, Source, SourceType, Statx, TimeSpec64,
     },
     GlommioError, IoRequirements, IoStats, ReactorErrorKind, RingIoStats, TaskQueueHandle,
 };
@@ -2073,23 +2073,25 @@ impl Reactor {
                     .set(Some(lat_ring.prepare_latency_preemption_timer(dur)));
                 assert!(flush_rings!(lat_ring)? > 0);
             }
-            self.notifier.prepare_to_sleep();
-            membarrier::heavy();
             drop((poll_ring, main_ring, lat_ring));
-            let events = process_remote_channels() + self.flush_syscall_thread();
-            poll_ring = self.poll_ring.borrow_mut();
+            self.notifier.sleep_unless_woken(
+                || process_remote_channels() + self.flush_syscall_thread(),
+                || {
+                    let mut poll_ring = self.poll_ring.borrow_mut();
+                    let mut main_ring = self.main_ring.borrow_mut();
+                    let mut lat_ring = self.latency_ring.borrow_mut();
+                    if self.eventfd_src.is_installed().unwrap() {
+                        self.link_rings_and_sleep(&mut main_ring)
+                            .expect("some error");
+                        flush_cancellations!(into &mut 0; lat_ring, poll_ring, main_ring);
+                        flush_rings!(lat_ring, poll_ring, main_ring)?;
+                        consume_rings!(into &mut 0; lat_ring, poll_ring, main_ring);
+                    }
+                    Ok(())
+                },
+            )?;
             main_ring = self.main_ring.borrow_mut();
             lat_ring = self.latency_ring.borrow_mut();
-            if events == 0 {
-                if self.eventfd_src.is_installed().unwrap() {
-                    self.link_rings_and_sleep(&mut main_ring)
-                        .expect("some error");
-                    flush_cancellations!(into &mut 0; lat_ring, poll_ring, main_ring);
-                    flush_rings!(lat_ring, poll_ring, main_ring)?;
-                    consume_rings!(into &mut 0; lat_ring, poll_ring, main_ring);
-                }
-                self.notifier.wake_up();
-            }
         }
 
         if let Some(preempt) = preempt_timer() {

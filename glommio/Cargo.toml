@@ -51,6 +51,9 @@ smallvec              = { version = "1.15", features = ["union"] }
 socket2               = { version = "0.6", features = ["all"] }
 tracing               = "0.1"
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [build-dependencies]
 rustc_version = "0.4.1"
 
@@ -74,7 +77,7 @@ tokio = { version = "1.49", default-features = false, features = [
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(nightly)'] }
 
 [[bench]]
 harness = false

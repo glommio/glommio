@@ -197,6 +197,7 @@ mod mprotect {
 ///
 /// It issues a compiler fence, which disallows compiler optimizations across
 /// itself. It incurs basically no costs in run-time.
+#[cfg(not(loom))]
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn light() {
@@ -212,6 +213,7 @@ pub(crate) fn light() {
 /// It issues a private expedited membarrier using the `sys_membarrier()` system
 /// call, if supported; otherwise, it falls back to `mprotect()`-based
 /// process-wide memory barrier.
+#[cfg(not(loom))]
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn heavy() {
@@ -221,6 +223,20 @@ pub(crate) fn heavy() {
         Mprotect => mprotect::barrier(),
         Fallback => atomic::fence(atomic::Ordering::SeqCst),
     }
+}
+
+/// Under loom both barriers are a sequentially consistent fence, the closest
+/// thing loom models to a barrier that orders every thread at once.
+#[cfg(loom)]
+#[allow(dead_code)]
+pub(crate) fn light() {
+    super::sync::fence(atomic::Ordering::SeqCst)
+}
+
+/// See [`light`].
+#[cfg(loom)]
+pub(crate) fn heavy() {
+    super::sync::fence(atomic::Ordering::SeqCst)
 }
 
 /// The membarrier strategy is expensive to initialize. Expose that initialization so

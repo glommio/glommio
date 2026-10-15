@@ -359,17 +359,21 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
         let poll_inner = |this: &mut Self, cx: &mut Context<'_>| match this.iovs.poll_next(cx) {
             Poll::Ready(Some(res)) => {
                 this.inflight_memory += res.1.size();
-                this.inflight.push_front(res)
+                this.inflight.push_front(res);
+                Poll::Ready(())
             }
-            Poll::Ready(None) => this.terminated = true,
-            _ => {}
+            Poll::Ready(None) => {
+                this.terminated = true;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
         };
 
         let poll_buffer = |this: &mut Self, cx: &mut Context<'_>| {
             if this.inflight.back_mut().unwrap().0.result().is_some() {
                 let ret = this.inflight.pop_back().unwrap();
                 if !this.terminated {
-                    poll_inner(this, cx);
+                    let _ = poll_inner(this, cx);
                 }
                 this.inflight_memory -= ret.1.size();
                 Poll::Ready(Some(ret))
@@ -387,13 +391,17 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
             poll_buffer(this, cx)
         } else {
             while !this.is_full() && !this.terminated {
-                poll_inner(this, cx);
+                if poll_inner(this, cx).is_pending() {
+                    break;
+                }
             }
 
-            if !this.terminated || !this.inflight.is_empty() {
+            if !this.inflight.is_empty() {
                 poll_buffer(this, cx)
-            } else {
+            } else if this.terminated {
                 Poll::Ready(None)
+            } else {
+                Poll::Pending
             }
         }
     }

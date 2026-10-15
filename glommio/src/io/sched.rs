@@ -147,7 +147,8 @@ impl FileScheduler {
                         .clone_pointer()
                         .unwrap(),
                     file: Rc::downgrade(&self.inner),
-                    offseted_range: offset_start..offset_start + data_range.end,
+                    offseted_range: offset_start
+                        ..offset_start + (data_range.end - data_range.start),
                 })
             }
         } else {
@@ -321,6 +322,19 @@ pub(crate) mod test {
         assert_eq!(file.inner.sources.borrow().iter().count(), 1);
         drop(sched_source2);
         assert_eq!(file.inner.sources.borrow().iter().count(), 0);
+    }
+
+    /// The reused range is the request's length, wherever in the file it is.
+    #[test]
+    fn a_reused_read_away_from_offset_zero_covers_only_the_request() {
+        let sched = Rc::new(IoScheduler::new());
+        let file = sched.get_file_scheduler((0, 1));
+        let _in_flight = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            4096..8192,
+        );
+        let reused = file.consume_scheduled(4096..8192, None).unwrap();
+        assert_eq!(reused.offseted_range, 0..4096);
     }
 
     /// Tests dropping a `ScheduledSource` with a `ScheduledFile` but no io

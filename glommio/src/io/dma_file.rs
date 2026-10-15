@@ -1697,6 +1697,72 @@ pub(crate) mod test {
         new_file.close_rc().await.expect("failed to close file");
     });
 
+    /// Runs `f` on its own thread and fails if it has not returned in time,
+    /// so a hung executor fails the test instead of the run.
+    fn finishes_within(secs: u64, f: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(secs))
+            .expect("read_many did not finish");
+    }
+
+    /// A request stream that is not ready yet must let the task feeding it run.
+    #[test]
+    fn read_many_waits_for_a_pending_stream() {
+        finishes_within(5, || {
+            let dir = make_test_directories("dma-read-many-pending").remove(0);
+            test_executor!(async move {
+                let file = Rc::new(write_dma_file(dir.path.join("testfile"), 4096).await);
+                let (tx, rx) = crate::channels::local_channel::new_unbounded::<(u64, usize)>();
+                crate::spawn_local(async move {
+                    sleep(Duration::from_millis(10)).await;
+                    for i in 0..4u64 {
+                        tx.send((i * 512, 512)).await.unwrap();
+                    }
+                })
+                .detach();
+                let got = file
+                    .read_many(
+                        rx.stream(),
+                        MergedBufferLimit::NoMerging,
+                        ReadAmplificationLimit::NoAmplification,
+                    )
+                    .count()
+                    .await;
+                assert_eq!(got, 4);
+            });
+        });
+    }
+
+    /// A read must be submitted before the next request arrives, so a caller
+    /// can wait for one result before asking for the next.
+    #[test]
+    fn read_many_reads_before_the_next_request_arrives() {
+        finishes_within(5, || {
+            let dir = make_test_directories("dma-read-many-in-turn").remove(0);
+            test_executor!(async move {
+                let file = Rc::new(write_dma_file(dir.path.join("testfile"), 4096).await);
+                let (tx, rx) = crate::channels::local_channel::new_unbounded::<(u64, usize)>();
+                tx.try_send((0, 512)).unwrap();
+                let mut results = file.read_many(
+                    rx.stream(),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                );
+                for i in 1..4u64 {
+                    results.next().await.unwrap().unwrap();
+                    tx.try_send((i * 512, 512)).unwrap();
+                }
+                drop(tx);
+                results.next().await.unwrap().unwrap();
+                assert!(results.next().await.is_none());
+            });
+        });
+    }
+
     dma_file_test!(write_past_end, path, _k, {
         let writer = DmaFile::create(path.join("testfile")).await.unwrap();
         let reader = DmaFile::open(path.join("testfile")).await.unwrap();

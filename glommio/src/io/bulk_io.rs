@@ -262,7 +262,17 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
         };
 
         let this = self.get_mut();
-        while let Some(mut inner) = ready!(next_inner(this, cx)) {
+        loop {
+            let mut inner = match next_inner(this, cx) {
+                Poll::Ready(Some(inner)) => inner,
+                Poll::Ready(None) => return Poll::Ready(this.last.take()),
+                Poll::Pending => {
+                    return this
+                        .last
+                        .take()
+                        .map_or(Poll::Pending, |last| Poll::Ready(Some(last)))
+                }
+            };
             if let Some(alignment) = this.alignment {
                 inner = align(inner, alignment);
             }
@@ -275,7 +285,6 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
                 this.last = Some(inner);
             }
         }
-        Poll::Ready(this.last.take())
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

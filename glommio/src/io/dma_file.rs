@@ -1735,6 +1735,32 @@ pub(crate) mod test {
         });
     }
 
+    /// A read must be submitted before the next request arrives, so a caller
+    /// can wait for one result before asking for the next.
+    #[test]
+    fn read_many_reads_before_the_next_request_arrives() {
+        finishes_within(5, || {
+            let dir = make_test_directories("dma-read-many-in-turn").remove(0);
+            test_executor!(async move {
+                let file = Rc::new(write_dma_file(dir.path.join("testfile"), 4096).await);
+                let (tx, rx) = crate::channels::local_channel::new_unbounded::<(u64, usize)>();
+                tx.try_send((0, 512)).unwrap();
+                let mut results = file.read_many(
+                    rx.stream(),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                );
+                for i in 1..4u64 {
+                    results.next().await.unwrap().unwrap();
+                    tx.try_send((i * 512, 512)).unwrap();
+                }
+                drop(tx);
+                results.next().await.unwrap().unwrap();
+                assert!(results.next().await.is_none());
+            });
+        });
+    }
+
     dma_file_test!(write_past_end, path, _k, {
         let writer = DmaFile::create(path.join("testfile")).await.unwrap();
         let reader = DmaFile::open(path.join("testfile")).await.unwrap();

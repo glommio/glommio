@@ -7,7 +7,7 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::CString,
     fmt,
     future::Future,
@@ -42,6 +42,8 @@ type SharedChannelWakerChecker = (SmallVec<[Waker; 1]>, Option<Box<dyn Fn() -> u
 struct SharedChannels {
     id: u64,
     wakers_map: BTreeMap<u64, SharedChannelWakerChecker>,
+    /// Channels with at least one pending waker, so a pass skips idle ones.
+    waiting: BTreeSet<u64>,
     connection_wakers: Vec<Waker>,
 }
 
@@ -51,6 +53,7 @@ impl SharedChannels {
             id: 0,
             connection_wakers: Vec::new(),
             wakers_map: BTreeMap::new(),
+            waiting: BTreeSet::new(),
         }
     }
 
@@ -59,13 +62,19 @@ impl SharedChannels {
         let mut ready = SmallVec::new();
         ready.extend(self.connection_wakers.drain(..));
 
-        for (pending, check) in self.wakers_map.values_mut() {
-            if pending.is_empty() {
-                continue;
-            }
+        let Self {
+            wakers_map,
+            waiting,
+            ..
+        } = self;
+        waiting.retain(|id| {
+            let Some((pending, check)) = wakers_map.get_mut(id) else {
+                return false;
+            };
             let room = std::cmp::min(check.as_ref().unwrap()(), pending.len());
             ready.extend(pending.drain(0..room).rev());
-        }
+            !pending.is_empty()
+        });
         ready
     }
 }
@@ -233,7 +242,10 @@ impl Reactor {
     }
 
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
-        let removed = self.shared_channels.borrow_mut().wakers_map.remove(&id);
+        let mut channels = self.shared_channels.borrow_mut();
+        channels.waiting.remove(&id);
+        let removed = channels.wakers_map.remove(&id);
+        drop(channels);
         drop(removed);
     }
 
@@ -250,6 +262,7 @@ impl Reactor {
             .or_insert_with(|| (SmallVec::new(), None));
 
         map.0.push(waker);
+        channels.waiting.insert(id);
     }
 
     pub(crate) fn alloc_dma_buffer(&self, size: usize) -> DmaBuffer {
@@ -780,13 +793,15 @@ impl Reactor {
     }
 
     pub(crate) fn process_shared_channels_by_id(&self, id: u64) -> usize {
-        let ready = self
-            .shared_channels
-            .borrow_mut()
-            .wakers_map
-            .get_mut(&id)
-            .map(|(pending, _)| mem::take(pending))
-            .unwrap_or_default();
+        let ready = {
+            let mut channels = self.shared_channels.borrow_mut();
+            channels.waiting.remove(&id);
+            channels
+                .wakers_map
+                .get_mut(&id)
+                .map(|(pending, _)| mem::take(pending))
+                .unwrap_or_default()
+        };
         let processed = ready.len();
         for waker in ready {
             wake!(waker);

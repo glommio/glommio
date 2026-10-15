@@ -43,6 +43,7 @@ impl IoScheduler {
                 link: RBTreeLink::new(),
                 identity,
                 sources: RefCell::new(Default::default()),
+                longest: Cell::new(0),
             });
             borrow.insert(file_sched.clone());
             file_sched
@@ -69,6 +70,9 @@ struct FileSchedulerInner {
     link: RBTreeLink,
     identity: Identity,
     sources: RefCell<RBTree<ScheduledSourceAdapter>>,
+    /// The longest range ever scheduled, which bounds how far before a
+    /// request a source covering it can start.
+    longest: Cell<u64>,
 }
 
 intrusive_adapter!(FileSchedulerAdapter = Rc<FileSchedulerInner>: FileSchedulerInner { link => RBTreeLink });
@@ -115,14 +119,21 @@ impl FileScheduler {
         sys: Option<&Reactor>,
     ) -> Option<ScheduledSource> {
         let sources = self.inner.sources.borrow();
-        let mut candidates = sources.range(
-            Bound::Included(&data_range.start),
-            Bound::Excluded(&data_range.end),
-        );
+        let earliest = data_range.end.saturating_sub(self.inner.longest.get());
+        let mut cursor = sources.upper_bound(Bound::Included(&data_range.start));
+        let covering = loop {
+            match cursor.get() {
+                Some(x) if x.data_range.start >= earliest => {
+                    if x.data_range.end >= data_range.end {
+                        break cursor.clone_pointer();
+                    }
+                    cursor.move_prev();
+                }
+                _ => break None,
+            }
+        };
 
-        if let Some(sched_source) = candidates.find(|&x| {
-            x.data_range.contains(&data_range.start) && x.data_range.contains(&(data_range.end - 1))
-        }) {
+        if let Some(sched_source) = covering {
             if let (Some(sys), Some(result)) = (sys, sched_source.source.result()) {
                 if let Some(reused) = sched_source
                     .source
@@ -139,18 +150,12 @@ impl FileScheduler {
                 }
             }
 
-            unsafe {
-                let offset_start = data_range.start - sched_source.data_range.start;
-                Some(ScheduledSource {
-                    inner: sources
-                        .cursor_from_ptr(sched_source)
-                        .clone_pointer()
-                        .unwrap(),
-                    file: Rc::downgrade(&self.inner),
-                    offseted_range: offset_start
-                        ..offset_start + (data_range.end - data_range.start),
-                })
-            }
+            let offset_start = data_range.start - sched_source.data_range.start;
+            Some(ScheduledSource {
+                inner: sched_source,
+                file: Rc::downgrade(&self.inner),
+                offseted_range: offset_start..offset_start + (data_range.end - data_range.start),
+            })
         } else {
             None
         }
@@ -162,6 +167,12 @@ impl FileScheduler {
             link: Default::default(),
             data_range: data_range.clone(),
         });
+        self.inner.longest.set(
+            self.inner
+                .longest
+                .get()
+                .max(data_range.end - data_range.start),
+        );
         self.inner.sources.borrow_mut().insert(scheduled.clone());
         ScheduledSource {
             inner: scheduled,
@@ -335,6 +346,50 @@ pub(crate) mod test {
         );
         let reused = file.consume_scheduled(4096..8192, None).unwrap();
         assert_eq!(reused.offseted_range, 0..4096);
+    }
+
+    /// A read that starts inside an in-flight one and ends within it reuses it.
+    #[test]
+    fn a_covering_read_that_starts_earlier_is_reused() {
+        let sched = Rc::new(IoScheduler::new());
+        let file = sched.get_file_scheduler((0, 1));
+        let in_flight = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            0..16384,
+        );
+        let reused = file.consume_scheduled(4096..8192, None).unwrap();
+        assert!(Rc::ptr_eq(&reused.inner, &in_flight.inner));
+        assert_eq!(reused.offseted_range, 4096..8192);
+    }
+
+    /// A read that runs past the end of every in-flight one is not reused.
+    #[test]
+    fn a_partly_overlapping_read_is_not_reused() {
+        let sched = Rc::new(IoScheduler::new());
+        let file = sched.get_file_scheduler((0, 1));
+        let _in_flight = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            0..4096,
+        );
+        assert!(file.consume_scheduled(2048..6144, None).is_none());
+    }
+
+    /// The covering read is found behind a shorter one that starts later.
+    #[test]
+    fn a_covering_read_is_found_behind_a_closer_one() {
+        let sched = Rc::new(IoScheduler::new());
+        let file = sched.get_file_scheduler((0, 1));
+        let wide = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            0..16384,
+        );
+        let _narrow = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            4096..6144,
+        );
+        let reused = file.consume_scheduled(5120..12288, None).unwrap();
+        assert!(Rc::ptr_eq(&reused.inner, &wide.inner));
+        assert_eq!(reused.offseted_range, 5120..12288);
     }
 
     /// Tests dropping a `ScheduledSource` with a `ScheduledFile` but no io

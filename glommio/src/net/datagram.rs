@@ -138,9 +138,7 @@ impl<S: AsRawFd + FromRawFd + From<socket2::Socket>> GlommioDatagram<S> {
                 let mut src = src.take().unwrap();
                 src.trim_to_size(sz);
                 buf[0..sz].copy_from_slice(&src.as_bytes()[0..sz]);
-                let addr = unsafe {
-                    T::from_raw(addr.as_ptr() as *const _, Some(hdr.msg_namelen)).unwrap()
-                };
+                let addr = unsafe { crate::sys::ssptr_to_sockaddr(addr, hdr.msg_namelen as _)? };
                 self.rx_yolo.set(true);
                 Ok((sz, addr))
             }

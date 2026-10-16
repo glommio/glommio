@@ -123,8 +123,7 @@ impl TcpListener {
     /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
         let addr = addr
-            .to_socket_addrs()
-            .unwrap()
+            .to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::other("empty address"))?;
 
@@ -458,6 +457,14 @@ impl TcpStream<NonBuffered> {
     }
 }
 
+fn no_addresses() -> GlommioError<()> {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "could not resolve to any addresses",
+    )
+    .into()
+}
+
 fn make_tcp_socket(addr: &SocketAddr) -> io::Result<Socket> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6
@@ -482,7 +489,17 @@ impl TcpStream {
     /// })
     /// ```
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpStream> {
-        let addr = addr.to_socket_addrs()?.next().unwrap();
+        let mut failed = None;
+        for addr in addr.to_socket_addrs()? {
+            match Self::connect_one(addr).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => failed = Some(err),
+            }
+        }
+        Err(failed.unwrap_or_else(no_addresses))
+    }
+
+    async fn connect_one(addr: SocketAddr) -> Result<TcpStream> {
         let socket = make_tcp_socket(&addr)?;
         let reactor = crate::executor().reactor();
         let source = reactor.connect(socket.as_raw_fd(), SockaddrStorage::from(addr));
@@ -526,7 +543,17 @@ impl TcpStream {
             .into());
         }
 
-        let addr = addr.to_socket_addrs()?.next().unwrap();
+        let mut failed = None;
+        for addr in addr.to_socket_addrs()? {
+            match Self::connect_one_timeout(addr, duration).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) => failed = Some(err),
+            }
+        }
+        Err(failed.unwrap_or_else(no_addresses))
+    }
+
+    async fn connect_one_timeout(addr: SocketAddr, duration: Duration) -> Result<TcpStream> {
         let socket = make_tcp_socket(&addr)?;
         let reactor = crate::executor().reactor();
         let source =
@@ -811,6 +838,43 @@ impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolvable_addresses_are_errors() {
+        test_executor!(async move {
+            assert!(TcpListener::bind("no port here").is_err());
+            assert!(crate::net::UdpSocket::bind("no port here").is_err());
+            let udp = crate::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            assert!(udp.send_to(b"x", "no port here").await.is_err());
+            let empty: &[SocketAddr] = &[];
+            assert!(TcpStream::connect(empty).await.is_err());
+            assert!(TcpStream::connect_timeout(empty, Duration::from_secs(1))
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn connect_tries_each_address_in_turn() {
+        test_executor!(async move {
+            let closed = TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addrs = [closed, listener.local_addr().unwrap()];
+            crate::spawn_local(async move { while listener.accept().await.is_ok() {} }).detach();
+            crate::timer::timeout(Duration::from_secs(5), async {
+                TcpStream::connect(&addrs[..]).await.unwrap();
+                TcpStream::connect_timeout(&addrs[..], Duration::from_secs(1))
+                    .await
+                    .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        });
+    }
     use crate::{channels::shared_channel, enclose, timer::Timer, LocalExecutorBuilder};
     use futures_lite::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},

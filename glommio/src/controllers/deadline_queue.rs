@@ -9,7 +9,7 @@ use crate::{
     enclose, task, Latency, Shares, SharesManager, TaskQueueHandle,
 };
 use futures_lite::StreamExt;
-use log::{trace, warn};
+use log::trace;
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
@@ -123,6 +123,7 @@ impl<T> Drop for PriorityBump<T> {
 }
 
 type QueueItem<T> = Rc<dyn DeadlineSource<Output = T>>;
+type Request<T> = (QueueItem<T>, LocalSender<T>);
 
 #[derive(Debug)]
 struct InnerQueue<T> {
@@ -296,6 +297,13 @@ impl<T> InnerQueue<T> {
         queue.push_back((expiration, source.clone()));
         Ok(())
     }
+
+    fn withdraw(&self, source: &QueueItem<T>) {
+        let mut queue = self.queue.borrow_mut();
+        if let Some(at) = queue.iter().rposition(|(_, s)| Rc::ptr_eq(s, source)) {
+            queue.remove(at);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -360,8 +368,7 @@ impl<T> InnerQueue<T> {
 /// points per minute so that the entire queue is flushed in 3 minutes.
 pub struct DeadlineQueue<T> {
     tq: TaskQueueHandle,
-    sender: LocalSender<Rc<dyn DeadlineSource<Output = T>>>,
-    responder: LocalReceiver<T>,
+    sender: LocalSender<Request<T>>,
     _handle: task::join_handle::JoinHandle<()>,
     queue: Rc<InnerQueue<T>>,
 }
@@ -400,19 +407,15 @@ impl<T: 'static> DeadlineQueue<T> {
         };
 
         let tq = crate::executor().create_task_queue(Shares::Dynamic(queue.clone()), lat, name);
-        let (sender, receiver): (LocalSender<QueueItem<T>>, LocalReceiver<QueueItem<T>>) =
-            local_channel::new_bounded(1);
-
-        let (response_sender, responder): (LocalSender<T>, LocalReceiver<T>) =
+        let (sender, receiver): (LocalSender<Request<T>>, LocalReceiver<Request<T>>) =
             local_channel::new_bounded(1);
 
         let queue_weak = Rc::downgrade(&queue);
 
         let handle = crate::spawn_local_into(
             enclose! { (queue_weak) async move {
-                let response = Rc::new(response_sender);
                 let mut stream = receiver.stream();
-                while let Some(request) = stream.next().await {
+                while let Some((request, reply)) = stream.next().await {
                     let res = request.action().await;
                     // now that we have executed the action, pop it from
                     // the queue. We must do it regardless of whether we succeeded.
@@ -429,9 +432,8 @@ impl<T: 'static> DeadlineQueue<T> {
                         let mut queue = queue.queue.borrow_mut();
                         queue.pop_front().unwrap();
                     }
-                    if response.send(res).await.is_err() {
-                        warn!("receiver channel broken!");
-                        break;
+                    if reply.try_send(res).is_err() {
+                        trace!("the caller stopped waiting for its result");
                     }
                 }
             }},
@@ -443,7 +445,6 @@ impl<T: 'static> DeadlineQueue<T> {
         DeadlineQueue {
             tq,
             sender,
-            responder,
             _handle: handle,
             queue,
         }
@@ -495,8 +496,11 @@ impl<T: 'static> DeadlineQueue<T> {
     /// ```
     pub async fn push_work(&self, source: Rc<dyn DeadlineSource<Output = T>>) -> io::Result<T> {
         self.queue.admit(source.clone())?;
-        self.sender.send(source.clone()).await?;
-        self.responder
+        let admitted = scopeguard::guard(source.clone(), |source| self.queue.withdraw(&source));
+        let (reply, response) = local_channel::new_bounded(1);
+        self.sender.send((source, reply)).await?;
+        scopeguard::ScopeGuard::into_inner(admitted);
+        response
             .recv()
             .await
             .ok_or_else(|| io::Error::other("no response from response channel"))
@@ -547,6 +551,80 @@ impl<T: 'static> DeadlineQueue<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    struct Tagged(u32, Duration);
+
+    impl DeadlineSource for Tagged {
+        type Output = u32;
+
+        fn expected_duration(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn action(self: Rc<Self>) -> Pin<Box<dyn Future<Output = u32> + 'static>> {
+            Box::pin(async move {
+                crate::timer::sleep(self.1).await;
+                self.0
+            })
+        }
+
+        fn total_units(&self) -> u64 {
+            1
+        }
+
+        fn processed_units(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn a_cancelled_push_does_not_take_the_next_answer() {
+        test_executor!(async move {
+            let queue: DeadlineQueue<u32> =
+                DeadlineQueue::new("answers", Duration::from_millis(250));
+            let cancelled = crate::timer::timeout(Duration::from_millis(5), async {
+                Ok(queue
+                    .push_work(Rc::new(Tagged(1, Duration::from_millis(20))))
+                    .await)
+            })
+            .await;
+            assert!(cancelled.is_err());
+            let answer = queue
+                .push_work(Rc::new(Tagged(2, Duration::from_millis(1))))
+                .await
+                .unwrap();
+            assert_eq!(answer, 2);
+        });
+    }
+
+    #[test]
+    fn a_push_cancelled_before_it_was_sent_leaves_no_entry() {
+        test_executor!(async move {
+            let queue = Rc::new(DeadlineQueue::<u32>::new(
+                "entries",
+                Duration::from_millis(250),
+            ));
+            let slow = |id| Rc::new(Tagged(id, Duration::from_millis(30)));
+            let first = crate::spawn_local(enclose! { (queue) async move {
+                queue.push_work(slow(1)).await.unwrap()
+            }})
+            .detach();
+            crate::executor().yield_task_queue_now().await;
+            let second = crate::spawn_local(enclose! { (queue) async move {
+                queue.push_work(slow(2)).await.unwrap()
+            }})
+            .detach();
+            crate::executor().yield_task_queue_now().await;
+            let blocked = crate::timer::timeout(Duration::from_millis(5), async {
+                Ok(queue.push_work(slow(3)).await)
+            })
+            .await;
+            assert!(blocked.is_err());
+            assert_eq!(first.await, Some(1));
+            assert_eq!(second.await, Some(2));
+            assert!(queue.queue.queue.borrow().is_empty());
+        });
+    }
     use crate::{
         enclose,
         timer::{Timer, TimerActionRepeat},

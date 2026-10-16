@@ -5,8 +5,11 @@
 //!
 use std::{
     fmt::{self, Debug, Formatter},
+    future::poll_fn,
     io::{Error, ErrorKind},
+    mem,
     sync::{Arc, Mutex},
+    task::{Poll, Waker},
 };
 
 use crate::{
@@ -194,6 +197,8 @@ impl Role {
 struct JoinState<T: Send> {
     peers: Vec<Peer>,
     ready: bool,
+    /// Peers waiting for the last one to join, woken once the channels exist.
+    waiters: Vec<Waker>,
     senders: Vec<Vec<Option<SharedSender<T>>>>,
     receivers: Vec<Vec<Option<SharedReceiver<T>>>>,
 }
@@ -211,6 +216,7 @@ impl<T: Send> JoinState<T> {
         Self {
             peers: Vec::new(),
             ready: false,
+            waiters: Vec::new(),
             senders,
             receivers,
         }
@@ -373,21 +379,23 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 }
 
                 state.ready = true;
+                let waiters = mem::take(&mut state.waiters);
+                drop(state);
+                for waiter in waiters {
+                    waiter.wake();
+                }
             }
         } else {
-            // Wait until last joiner finishes building
-            loop {
-                let ready = {
-                    let state = self.state.lock().unwrap();
-                    state.ready
-                };
-
-                if ready {
-                    break;
+            poll_fn(|cx| {
+                let mut state = self.state.lock().unwrap();
+                if state.ready {
+                    return Poll::Ready(());
                 }
-
-                futures_lite::future::yield_now().await;
-            }
+                state.waiters.retain(|w| !w.will_wake(cx.waker()));
+                state.waiters.push(cx.waker().clone());
+                Poll::Pending
+            })
+            .await;
         }
 
         let state = self.state.lock().unwrap();
@@ -487,6 +495,37 @@ mod tests {
     use crate::{enclose, prelude::*};
 
     use super::*;
+
+    fn thread_cpu() -> std::time::Duration {
+        nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+            .unwrap()
+            .into()
+    }
+
+    /// A peer waiting for the others to join parks instead of spinning.
+    #[test]
+    fn waiting_for_peers_to_join_does_not_spin() {
+        let mesh = MeshBuilder::<u32, _>::full(2, 1);
+        let early = LocalExecutorBuilder::default()
+            .spawn(enclose!((mesh) move || async move {
+                let before = thread_cpu();
+                let _ = mesh.join().await.unwrap();
+                thread_cpu() - before
+            }))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let late = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let _ = mesh.join().await.unwrap();
+            })
+            .unwrap();
+        let spent = early.join().unwrap();
+        late.join().unwrap();
+        assert!(
+            spent < std::time::Duration::from_millis(50),
+            "{spent:?} of CPU waiting 300ms"
+        );
+    }
 
     #[test]
     fn test_channel_mesh() {

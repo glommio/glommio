@@ -723,8 +723,10 @@ enum FileStatus {
     Open,
     /// We are closing it.
     Closing,
-    /// It was closed, but the poll may still need to wake the writer to
-    /// deliver the final result.
+    /// The close or seal has finished, and its result is waiting for the
+    /// poll to collect it.
+    Finished,
+    /// It was closed, and the result was handed to the caller.
     Closed,
 }
 
@@ -897,6 +899,7 @@ impl DmaStreamWriterState {
 
             defer! {
                 let mut state = state.borrow_mut();
+                state.file_status = FileStatus::Finished;
                 if let Some(waker) = state.waker.take() {
                     drop(state);
                     waker.wake();
@@ -1346,10 +1349,9 @@ impl DmaStreamWriter {
         cx: &Context<'_>,
     ) -> Poll<io::Result<DmaStreamReaderBuilder>> {
         let mut state = self.state.borrow_mut();
-        let previous_waker = state.waker.take();
         match state.file_status {
             FileStatus::Open => {
-                if let Some(waker) = previous_waker {
+                if let Some(waker) = state.waker.take() {
                     waker.wake();
                 }
                 let file = ensure_not_closed!(self.file.clone());
@@ -1358,11 +1360,10 @@ impl DmaStreamWriter {
                 Poll::Pending
             }
             FileStatus::Closing => {
-                if previous_waker.is_some() {
-                    state.add_waker(cx.waker().clone());
-                    return Poll::Pending;
-                }
-
+                state.add_waker(cx.waker().clone());
+                Poll::Pending
+            }
+            FileStatus::Finished => {
                 state.file_status = FileStatus::Closed;
                 let file = ensure_not_closed!(self.file);
 
@@ -1412,15 +1413,8 @@ impl AsyncWrite for &DmaStreamWriter {
         if !matches!(state.file_status, FileStatus::Open) {
             return already_closed!();
         }
-        let previous_waker = state.waker.take();
-
         if let Some(err) = state.current_error() {
             return Poll::Ready(err);
-        }
-
-        if previous_waker.is_some() {
-            state.add_waker(cx.waker().clone());
-            return Poll::Pending;
         }
 
         let mut written = 0;
@@ -1477,20 +1471,16 @@ impl AsyncWrite for &DmaStreamWriter {
         if !matches!(state.file_status, FileStatus::Open) {
             return already_closed!();
         }
-        let previous_waker = state.waker.take();
         state.add_waker(cx.waker().clone());
-        if previous_waker.is_none() {
-            state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
-        }
+        state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
         Poll::Pending
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.state.borrow_mut();
-        let previous_waker = state.waker.take();
         match state.file_status {
             FileStatus::Open => {
-                if let Some(waker) = previous_waker {
+                if let Some(waker) = state.waker.take() {
                     waker.wake();
                 }
                 state.add_waker(cx.waker().clone());
@@ -1499,11 +1489,10 @@ impl AsyncWrite for &DmaStreamWriter {
                 Poll::Pending
             }
             FileStatus::Closing => {
-                if previous_waker.is_some() {
-                    state.add_waker(cx.waker().clone());
-                    return Poll::Pending;
-                }
-
+                state.add_waker(cx.waker().clone());
+                Poll::Pending
+            }
+            FileStatus::Finished => {
                 state.file_status = FileStatus::Closed;
                 match state.current_error() {
                     Some(err) => Poll::Ready(err),
@@ -2437,6 +2426,25 @@ mod test {
             assert_eq!(file_size(&filename), 10);
         }
     );
+
+    file_stream_write_test!(write_after_cancelled_flush, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .build();
+
+        writer.write_all(&[7u8; 10]).await.unwrap();
+        {
+            let mut flush = Box::pin(writer.flush());
+            assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+        }
+        let mut write = Box::pin(writer.write(&[7u8; 10]));
+        let written = futures_lite::future::poll_once(&mut write).await;
+        assert_eq!(written.map(|r| r.unwrap()), Some(10));
+        drop(write);
+
+        writer.close().await.unwrap();
+        assert_eq!(file_size(&filename), 20);
+    });
 
     #[test]
     fn flushstate() {

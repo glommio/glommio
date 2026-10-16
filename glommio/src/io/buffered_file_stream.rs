@@ -422,10 +422,7 @@ impl StreamWriter {
                     self.source = Some(source);
                     Poll::Pending
                 }
-                Some(source) => {
-                    let _ = source.result().unwrap();
-                    Poll::Ready(Ok(()))
-                }
+                Some(source) => Poll::Ready(source.result().unwrap().map(|_| ())),
             }
         }
     }
@@ -443,12 +440,12 @@ impl StreamWriter {
                 Poll::Pending
             }
             Some(source) => {
-                let _ = source.result().unwrap();
+                let res = source.result().unwrap();
                 let file = self.file.take().unwrap();
                 let fd = file.as_raw_fd();
                 let (last_fd, _) = file.discard();
                 assert!(last_fd.is_some(), "Handling inner close for fd {fd} but it's still owned - fd reuse is a real risk");
-                Poll::Ready(Ok(()))
+                Poll::Ready(res.map(|_| ()))
             }
         }
     }
@@ -699,6 +696,21 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn close_reports_a_failed_sync() {
+        test_executor!(async move {
+            let file = crate::io::OpenOptions::new()
+                .write(true)
+                .buffered_open("/dev/null")
+                .await
+                .unwrap();
+            let mut writer = StreamWriterBuilder::new(file).build();
+            writer.write_all(b"abc").await.unwrap();
+            let err = writer.close().await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        });
+    }
     use crate::{test_utils::make_test_directories, GlommioError};
     use futures_lite::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt};
     use std::{io::ErrorKind, time::Duration};

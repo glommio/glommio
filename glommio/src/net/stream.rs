@@ -187,7 +187,7 @@ impl Timeout {
     fn maybe_set_timer(&self, reactor: &Reactor, waker: &Waker) {
         if let Some(timeout) = self.timeout.get() {
             if self.timer.get().is_none() {
-                let deadline = Instant::now() + timeout;
+                let deadline = crate::timer::deadline_after(timeout);
                 reactor.insert_timer(self.id, deadline, waker.clone());
                 self.timer.set(Some(deadline));
             }

@@ -36,7 +36,7 @@ impl Inner {
         }
 
         // Update the timeout.
-        self.when = Instant::now() + dur;
+        self.when = super::deadline_after(dur);
 
         if let Some(waker) = waker {
             // Re-register the timer with the new timeout.
@@ -106,7 +106,7 @@ impl Timer {
             inner: Rc::new(RefCell::new(Inner {
                 id: reactor.register_timer(),
                 is_charged: false,
-                when: Instant::now() + dur,
+                when: super::deadline_after(dur),
                 reactor: Rc::downgrade(&reactor),
             })),
         }
@@ -119,7 +119,7 @@ impl Timer {
             inner: Rc::new(RefCell::new(Inner {
                 id,
                 is_charged: false,
-                when: Instant::now() + dur,
+                when: super::deadline_after(dur),
                 reactor: Rc::downgrade(&crate::executor().reactor()),
             })),
         }
@@ -758,6 +758,33 @@ impl TimerActionRepeat {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn duration_max_waits_forever() {
+        test_executor!(async move {
+            let cpu = || -> Duration {
+                nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+                    .unwrap()
+                    .into()
+            };
+            let before = cpu();
+            let raced = futures::future::select(
+                Box::pin(crate::timer::sleep(Duration::MAX)),
+                Box::pin(crate::timer::sleep(Duration::from_millis(100))),
+            )
+            .await;
+            assert!(matches!(raced, futures::future::Either::Right(_)));
+            let pending = crate::timer::timeout(Duration::MAX, async {
+                crate::timer::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            });
+            pending.await.unwrap();
+            let mut timer = Timer::new(Duration::MAX);
+            timer.reset(Duration::MAX);
+            assert!(futures::poll!(&mut timer).is_pending());
+            assert!(cpu() - before < Duration::from_millis(50));
+        });
+    }
     use crate::LocalExecutorBuilder;
     use std::{
         cell::{Cell, RefCell},

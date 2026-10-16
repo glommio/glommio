@@ -9,6 +9,15 @@ mod timer_impl;
 use std::{future::Future, time::Duration};
 pub use timer_impl::{Timer, TimerActionOnce, TimerActionRepeat};
 
+/// The instant `dur` from now, or about thirty years from now if that is
+/// further than an `Instant` reaches, so a duration meaning "forever" waits
+/// rather than panics.
+pub(crate) fn deadline_after(dur: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_add(dur)
+        .unwrap_or_else(|| now + Duration::from_secs(30 * 365 * 24 * 60 * 60))
+}
+
 use crate::Result;
 
 /// Sleep for some time on the current task. Explicit sleeps can introduce undesirable delays if not used correctly.

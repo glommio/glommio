@@ -6,7 +6,7 @@
 use crate::{channels::ChannelCapacity, GlommioError, ResourceType};
 use futures_lite::{stream::Stream, Future};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     pin::Pin,
     rc::Rc,
     task::{Context, Poll, Waker},
@@ -93,6 +93,7 @@ where
                 waker: RefCell::new(None),
                 link: LinkedListLink::new(),
                 kind: RefCell::new(None),
+                woken: Cell::new(false),
 
                 _p: PhantomPinned,
             },
@@ -110,6 +111,7 @@ where
         let future_mut = unsafe { self.get_unchecked_mut() };
         let pinned_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
 
+        pinned_node.woken.set(false);
         let result = (future_mut.poll_fn)();
         match result {
             PollResult::Pending(kind) => {
@@ -189,7 +191,17 @@ fn remove_from_the_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut Stat
 
 impl<T, F> Drop for Waiter<'_, T, F> {
     fn drop(&mut self) {
-        if self.node.link.is_linked() {
+        if self.node.woken.get() {
+            let kind = self
+                .node
+                .kind
+                .borrow()
+                .expect("A woken Future has a known kind");
+            let waker = self.channel.state.borrow_mut().pass_on_wakeup(kind);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        } else if self.node.link.is_linked() {
             //if future is linked into the waiting queue then it is already pinned
             let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
             let kind = pinned_node
@@ -223,6 +235,8 @@ struct WaiterNode {
     waker: RefCell<Option<Waker>>,
     link: LinkedListLink,
     kind: RefCell<Option<WaiterKind>>,
+    /// Woken by the other side and unlinked, but not yet polled.
+    woken: Cell<bool>,
 
     _p: PhantomPinned,
 }
@@ -306,15 +320,17 @@ impl<T> State<T> {
         } else {
             self.channel.push_back(item);
 
-            Ok(self.recv_waiters.as_mut().and_then(|x| {
-                x.pop_front().map(|n| {
-                    unsafe { n.as_ref() }
-                        .waker
-                        .borrow_mut()
-                        .take()
-                        .expect("Future was added to the waiting queue without a waker")
-                })
-            }))
+            Ok(wake_first(&mut self.recv_waiters))
+        }
+    }
+
+    /// Hands a wakeup that a dropped waiter received on to the next waiter
+    /// of the same kind, if what it was woken for is still there.
+    fn pass_on_wakeup(&mut self, kind: WaiterKind) -> Option<Waker> {
+        match kind {
+            WaiterKind::Sender if !self.is_full() => wake_first(&mut self.send_waiters),
+            WaiterKind::Receiver if !self.channel.is_empty() => wake_first(&mut self.recv_waiters),
+            _ => None,
         }
     }
 
@@ -335,13 +351,7 @@ impl<T> State<T> {
 
     fn recv_one(&mut self) -> PollResult<Option<(T, Option<Waker>)>> {
         match self.channel.pop_front() {
-            Some(item) => PollResult::Ready(Some((
-                item,
-                self.send_waiters.as_mut().and_then(|x| {
-                    x.pop_front()
-                        .and_then(|node| unsafe { node.as_ref() }.waker.borrow_mut().take())
-                }),
-            ))),
+            Some(item) => PollResult::Ready(Some((item, wake_first(&mut self.send_waiters)))),
             None => {
                 if self.send_waiters.is_some() {
                     PollResult::Pending(WaiterKind::Receiver)
@@ -418,6 +428,7 @@ impl<T> LocalChannel<T> {
                     waker: RefCell::new(None),
                     link: LinkedListLink::new(),
                     kind: RefCell::new(None),
+                    woken: Cell::new(false),
 
                     _p: PhantomPinned,
                 },
@@ -582,6 +593,13 @@ impl<T> LocalSender<T> {
     }
 }
 
+/// Unlinks the first waiter, marks it woken and returns its waker.
+fn wake_first(ws: &mut Option<LinkedList<WaiterAdapter>>) -> Option<Waker> {
+    let node = unsafe { ws.as_mut()?.pop_front()?.as_ref() };
+    node.woken.set(true);
+    node.waker.borrow_mut().take()
+}
+
 fn wake_up_all(ws: &mut Option<LinkedList<WaiterAdapter>>) {
     if let Some(ref mut waiters) = ws {
         // we assume here that wakes don't try to acquire a borrow on
@@ -639,6 +657,7 @@ impl<'a, T> ChannelStream<'a, T> {
                 waker: RefCell::new(None),
                 link: LinkedListLink::new(),
                 kind: RefCell::new(None),
+                woken: Cell::new(false),
 
                 _p: PhantomPinned,
             }),
@@ -651,6 +670,7 @@ impl<T> Stream for ChannelStream<'_, T> {
 
     #[inline]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.node.woken.set(false);
         let result = self.channel.state.borrow_mut().recv_one();
 
         let this = unsafe { self.get_unchecked_mut() };
@@ -687,7 +707,16 @@ impl<T> Stream for ChannelStream<'_, T> {
 
 impl<T> Drop for ChannelStream<'_, T> {
     fn drop(&mut self) {
-        remove_from_the_waiting_queue(self.node.as_mut(), &mut self.channel.state.borrow_mut());
+        let mut state = self.channel.state.borrow_mut();
+        if self.node.woken.get() {
+            let waker = state.pass_on_wakeup(WaiterKind::Receiver);
+            drop(state);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        } else {
+            remove_from_the_waiting_queue(self.node.as_mut(), &mut state);
+        }
     }
 }
 
@@ -752,6 +781,13 @@ mod test {
     use super::*;
     use crate::enclose;
     use futures_lite::stream::{self, StreamExt};
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::Wake,
+    };
 
     #[test]
     fn producer_consumer() {
@@ -883,6 +919,86 @@ mod test {
             drop(sender);
             handle.await;
         });
+    }
+
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn flagged() -> (Arc<WakeFlag>, Waker) {
+        let flag = Arc::new(WakeFlag::default());
+        (flag.clone(), Waker::from(flag))
+    }
+
+    fn noop() -> Context<'static> {
+        Context::from_waker(Waker::noop())
+    }
+
+    #[test]
+    fn dropping_a_woken_sender_wakes_the_next() {
+        let (sender, receiver) = new_bounded(1);
+        sender.try_send(0).unwrap();
+        let mut first = Box::pin(sender.send(1));
+        let mut second = Box::pin(sender.send(2));
+        let (flag, waker) = flagged();
+        let mut cx = Context::from_waker(&waker);
+        assert!(first.as_mut().poll(&mut noop()).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        let mut recv = Box::pin(receiver.recv());
+        assert_eq!(recv.as_mut().poll(&mut noop()), Poll::Ready(Some(0)));
+        drop(first);
+
+        assert!(
+            flag.0.load(Ordering::Relaxed),
+            "the second sender was never woken"
+        );
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn dropping_a_woken_receiver_wakes_the_next() {
+        let (sender, receiver) = new_unbounded();
+        let mut first = Box::pin(receiver.recv());
+        let mut second = Box::pin(receiver.recv());
+        let (flag, waker) = flagged();
+        let mut cx = Context::from_waker(&waker);
+        assert!(first.as_mut().poll(&mut noop()).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        sender.try_send(7).unwrap();
+        drop(first);
+
+        assert!(
+            flag.0.load(Ordering::Relaxed),
+            "the second receiver was never woken"
+        );
+        assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
+    }
+
+    #[test]
+    fn dropping_a_woken_stream_wakes_the_next() {
+        let (sender, receiver) = new_unbounded();
+        let mut first = receiver.stream();
+        let mut second = Box::pin(receiver.recv());
+        let (flag, waker) = flagged();
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut first).poll_next(&mut noop()).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        sender.try_send(7).unwrap();
+        drop(first);
+
+        assert!(
+            flag.0.load(Ordering::Relaxed),
+            "the second receiver was never woken"
+        );
+        assert_eq!(second.as_mut().poll(&mut cx), Poll::Ready(Some(7)));
     }
 
     #[test]

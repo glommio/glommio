@@ -464,7 +464,8 @@ impl DmaFile {
             self.file.scheduler.borrow().as_ref(),
         );
         let read_size = enhanced_try!(source.collect_rw().await, "Reading", self.file)?;
-        Ok(ReadResult::from_sliced_buffer(source, 0, read_size))
+        let len = source.bytes_in_range(read_size);
+        Ok(ReadResult::from_sliced_buffer(source, 0, len))
     }
 
     /// Reads into buffer in buf from a specific position in the file.
@@ -489,11 +490,8 @@ impl DmaFile {
         );
 
         let read_size = enhanced_try!(source.collect_rw().await, "Reading", self.file)?;
-        Ok(ReadResult::from_sliced_buffer(
-            source,
-            b,
-            std::cmp::min(read_size, size),
-        ))
+        let len = source.bytes_in_range(read_size).saturating_sub(b).min(size);
+        Ok(ReadResult::from_sliced_buffer(source, b, len))
     }
 
     /// Submit many reads and process the results in a stream-like fashion via a
@@ -2628,6 +2626,53 @@ pub(crate) mod test {
             .try_take_last_clone_unlocking_guard(shared)
             .await
             .unwrap();
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(read_at_stops_at_the_end_of_the_file, path, _k, {
+        std::fs::write(path.join("f"), vec![7u8; 100]).unwrap();
+        let file = DmaFile::open(path.join("f")).await.unwrap();
+        for (pos, size, expected) in [
+            (0, 100, 100),
+            (50, 100, 50),
+            (99, 10, 1),
+            (100, 10, 0),
+            (200, 10, 0),
+        ] {
+            let read = file.read_at(pos, size).await.unwrap();
+            assert_eq!(read.len(), expected, "read_at({pos}, {size})");
+            assert!(read.iter().all(|&b| b == 7));
+        }
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(read_many_stops_at_the_end_of_the_file, path, _k, {
+        std::fs::write(path.join("f"), vec![7u8; 100]).unwrap();
+        let file = Rc::new(DmaFile::open(path.join("f")).await.unwrap());
+        let reads: Vec<(u64, usize)> = vec![(0, 100), (50, 100), (300, 8)];
+        let lens: Vec<usize> = file
+            .read_many(
+                stream::iter(reads),
+                MergedBufferLimit::NoMerging,
+                ReadAmplificationLimit::NoAmplification,
+            )
+            .map(|r| r.unwrap().1.len())
+            .collect()
+            .await;
+        assert_eq!(lens, [100, 50, 0]);
+        file.close_rc().await.unwrap();
+    });
+
+    dma_file_test!(a_reused_read_is_as_long_as_requested, path, _k, {
+        std::fs::write(path.join("f"), vec![7u8; 16384]).unwrap();
+        let file = DmaFile::open(path.join("f")).await.unwrap();
+        file.attach_scheduler();
+        let (long, short) = join!(
+            file.read_at_aligned(0, 16384),
+            file.read_at_aligned(0, 4096)
+        );
+        assert_eq!(long.unwrap().len(), 16384);
+        assert_eq!(short.unwrap().len(), 4096);
         file.close().await.unwrap();
     });
 }

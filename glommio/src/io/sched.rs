@@ -205,6 +205,14 @@ impl ScheduledSource {
         }
     }
 
+    /// How many of the `read` bytes the underlying read returned lie in this
+    /// source's range, which a reused source starts partway into.
+    pub(crate) fn bytes_in_range(&self, read: usize) -> usize {
+        let start = self.offseted_range.start as usize;
+        let len = (self.offseted_range.end - self.offseted_range.start) as usize;
+        read.saturating_sub(start).min(len)
+    }
+
     pub(crate) unsafe fn as_bytes(&self) -> &[u8] {
         std::slice::from_raw_parts(
             self.inner

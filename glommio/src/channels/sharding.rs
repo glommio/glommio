@@ -136,6 +136,7 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     /// will not be rejected. So it would be important to truncate the streams
     /// from upstream before calling this method to prevent it from hanging.
     pub async fn close(&mut self) {
+        self.closed = true;
         while let Some(consumer) = self.consumers.pop() {
             consumer.await;
         }
@@ -159,7 +160,9 @@ struct Shard<T: Send, H> {
 impl<T: Send + 'static, H: Handler<T> + 'static> Shard<T, H> {
     async fn handle<S: Stream<Item = T> + Unpin>(&self, mut messages: S) {
         while let Some(msg) = messages.next().await {
-            self.send(msg).await.unwrap();
+            if self.send(msg).await.is_err() {
+                break;
+            }
         }
     }
 
@@ -313,5 +316,66 @@ mod tests {
         for s in shards.collect::<Vec<_>>() {
             s.unwrap().join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::{channels::channel_mesh::MeshBuilder, timer::sleep, LocalExecutorBuilder};
+    use std::{sync::mpsc, time::Duration};
+
+    #[derive(Clone)]
+    struct Discard;
+
+    impl Handler<u32> for Discard {
+        fn handle(&self, _msg: u32, _src: usize, _cur: usize) -> HandlerResult {
+            Box::pin(async {})
+        }
+    }
+
+    fn to_other(msg: &u32, _nr_shards: usize) -> usize {
+        *msg as usize
+    }
+
+    #[test]
+    fn handle_after_close_is_refused() {
+        test_executor!(async move {
+            let mesh = MeshBuilder::full(1, 4);
+            let mut sharded = Sharded::new(mesh, to_other, Discard).await.unwrap();
+            sharded.close().await;
+            let refused = sharded.handle(futures_lite::stream::iter(vec![0u32]));
+            assert!(matches!(refused, Err(GlommioError::Closed(_))));
+        });
+    }
+
+    #[test]
+    fn sending_to_a_shard_that_is_gone_does_not_panic() {
+        let mesh = MeshBuilder::full(2, 4);
+        let (gone_tx, gone_rx) = mpsc::channel::<()>();
+        let leaving = LocalExecutorBuilder::default()
+            .spawn({
+                let mesh = mesh.clone();
+                move || async move {
+                    let sharded = Sharded::new(mesh, to_other, Discard).await.unwrap();
+                    sharded.shard_id()
+                }
+            })
+            .unwrap();
+        let staying = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let mut sharded = Sharded::new(mesh, to_other, Discard).await.unwrap();
+                gone_rx.recv().unwrap();
+                let other = 1 - sharded.shard_id() as u32;
+                sharded
+                    .handle(futures_lite::stream::iter(vec![other, other]))
+                    .unwrap();
+                sleep(Duration::from_millis(50)).await;
+                sharded.close().await;
+            })
+            .unwrap();
+        leaving.join().unwrap();
+        gone_tx.send(()).unwrap();
+        staying.join().unwrap();
     }
 }

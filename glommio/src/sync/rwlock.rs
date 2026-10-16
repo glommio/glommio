@@ -749,7 +749,7 @@ impl<T> RwLock<T> {
 
         state.closed = true;
 
-        Self::wake_up_fibers(&mut state);
+        Self::wake_up_all_fibers(&mut state);
         Ok(())
     }
 
@@ -908,7 +908,15 @@ mod test {
     use std::time::Duration;
 
     use crate::sync::Semaphore;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::Wake,
+    };
 
     #[derive(Eq, PartialEq, Debug)]
     struct NonCopy(i32);
@@ -952,6 +960,50 @@ mod test {
 
             join_all(futures).await;
         });
+    }
+
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn flagged() -> (Arc<WakeFlag>, Waker) {
+        let flag = Arc::new(WakeFlag::default());
+        (flag.clone(), Waker::from(flag))
+    }
+
+    #[test]
+    fn close_wakes_every_waiter() {
+        let rw = RwLock::new(());
+        let guard = rw.try_write().unwrap();
+        let mut first = Box::pin(rw.write());
+        assert!(first
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let mut rest = [Box::pin(rw.write()), Box::pin(rw.write())];
+        let flags = rest.each_mut().map(|waiter| {
+            let (flag, waker) = flagged();
+            assert!(waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            flag
+        });
+
+        drop(guard);
+        rw.close().unwrap();
+
+        for flag in flags {
+            assert!(
+                flag.0.load(Ordering::Relaxed),
+                "a waiter was never woken by close"
+            );
+        }
     }
 
     #[test]

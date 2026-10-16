@@ -807,7 +807,10 @@ impl IoStats {
 pub(crate) mod test_utils {
     use super::*;
     use nix::sys::statfs::*;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     use tracing::{debug, error, info, trace, warn};
     use tracing_subscriber::EnvFilter;
 
@@ -863,7 +866,7 @@ pub(crate) mod test_utils {
         let mut dir = path.as_ref().to_owned();
         std::assert!(dir.exists());
 
-        dir.push(test_name);
+        dir.push(unique_name(test_name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -873,9 +876,17 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Tests in different modules share names and can run at the same time,
+    /// in one process or in several, so the name alone is not enough.
+    fn unique_name(test_name: &str) -> String {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("{test_name}-{}-{n}", std::process::id())
+    }
+
     pub(crate) fn make_tmp_test_directory(test_name: &str) -> TestDirectory {
         let mut dir = std::env::temp_dir();
-        dir.push(test_name);
+        dir.push(unique_name(test_name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let buf = statfs(&dir).unwrap();

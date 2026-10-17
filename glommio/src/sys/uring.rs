@@ -1662,7 +1662,10 @@ impl Reactor {
 
     pub(crate) fn sendmsg(&self, source: &Source, flags: MsgFlags) {
         let op = match &mut *source.source_type_mut() {
-            SourceType::SockSendMsg(_, iov, hdr, addr) => {
+            SourceType::SockSendMsg(buf, iov, hdr, addr) => {
+                iov.iov_base = buf.as_ptr() as *mut libc::c_void;
+                iov.iov_len = buf.len();
+
                 let msg_name = addr.as_ptr() as *mut libc::c_void;
                 let msg_namelen = addr.len();
 

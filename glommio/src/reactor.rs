@@ -399,8 +399,8 @@ impl Reactor {
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
         let iov = libc::iovec {
-            iov_base: buf.as_ptr() as *mut libc::c_void,
-            iov_len: 1,
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
         };
         // Note that the iov and addresses we have above are stack addresses. We will
         // leave it blank and the `io_uring` callee will fill that up

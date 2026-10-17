@@ -2239,8 +2239,16 @@ fn queue_request_into_ring(
     }
 }
 
+/// Closes the descriptors `async_close` queued that never reached the ring.
 impl Drop for Reactor {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        let queue = self.main_ring.get_mut().submission_queue();
+        for op in queue.borrow().submissions.iter() {
+            if let (UringOpDescriptor::Close, 0) = (&op.args, op.user_data) {
+                let _ = nix::unistd::close(op.fd);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

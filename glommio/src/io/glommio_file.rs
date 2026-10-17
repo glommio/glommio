@@ -791,4 +791,27 @@ pub(crate) mod test {
             assert!(!file_list().contains(&gf_fd), "file is gone");
         });
     }
+
+    /// The file is dropped as the executor's last future returns, so no
+    /// reactor pass submits its close.
+    #[test]
+    fn drop_as_the_executor_exits_closes_the_file() {
+        let dir = make_tmp_test_directory("drop_as_the_executor_exits_closes_the_file");
+        let file = dir.path.join("file");
+        let ex = crate::LocalExecutorBuilder::default().make().unwrap();
+        let path = ex.run(async move {
+            let gf = GlommioFile::open_at(-1, &file, libc::O_CREAT, 644)
+                .await
+                .unwrap();
+            let path = gf.path.borrow().as_ref().cloned().unwrap();
+            path
+        });
+        drop(ex);
+
+        let still_open = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|f| std::fs::canonicalize(f.unwrap().path()).ok())
+            .any(|f| f == path);
+        assert!(!still_open, "file is gone");
+    }
 }

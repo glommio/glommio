@@ -768,14 +768,11 @@ fn idle_handle_cleanup_restores_other_executor_context() {
         assert_eq!(observed.get(), Some((owner.id(), owner_queue)));
         assert_eq!(crate::executor::executor_id(), Some(other.id()));
         assert_eq!(ex.current_task_queue(), queue);
-        assert_eq!(
-            ex.reactor().io_requirements()._io_handle,
-            requirements._io_handle
-        );
+        assert_eq!(ex.reactor().io_requirements(), requirements);
     });
     assert_eq!(
-        owner_reactor.io_requirements()._io_handle,
-        owner_requirements._io_handle,
+        owner_reactor.io_requirements(),
+        owner_requirements,
         "cleanup did not restore its owner's I/O requirements",
     );
     assert_eq!(crate::executor::executor_id(), None);

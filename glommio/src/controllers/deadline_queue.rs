@@ -394,14 +394,8 @@ impl<T: 'static> DeadlineQueue<T> {
     /// we'll just document it and leave it to the user.
     ///
     /// Internally, a spawned task executes each queued action and then pops
-    /// it from the queue, regardless of whether it succeeded. It is legal
-    /// for the queue not to be present anymore in case the `DeadlineQueue`
-    /// itself was destroyed after the action was done; but if it does exist
-    /// we expect to be able to pop the element, so we `unwrap()`
-    /// `pop_front()`. Note that because this is a queue with concurrency of
-    /// one we can safely `pop_front()`: if we ever do this with higher
-    /// concurrency (very unlikely), we need to move to a more complex data
-    /// structure.
+    /// it from the queue, regardless of whether it succeeded.
+    #[allow(no_comments_allowed)]
     pub fn new(name: &'static str, adjustment_period: Duration) -> DeadlineQueue<T> {
         let queue = Rc::new(InnerQueue::new(adjustment_period));
         let lat = {
@@ -429,6 +423,12 @@ impl<T: 'static> DeadlineQueue<T> {
                     let res = request.action().await;
                     if let Some(queue) = queue_weak.upgrade() {
                         let mut queue = queue.queue.borrow_mut();
+                        // The queue is expected to be present here unless the
+                        // `DeadlineQueue` itself was destroyed after the action
+                        // was done; because this is a queue with concurrency of
+                        // one we can safely `pop_front()`: if we ever do this
+                        // with higher concurrency (very unlikely), we need to
+                        // move to a more complex data structure.
                         queue.pop_front().unwrap();
                     }
                     if response.send(res).await.is_err() {

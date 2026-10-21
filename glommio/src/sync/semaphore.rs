@@ -77,6 +77,7 @@ unsafe impl Adapter for WaiterAdapter {
         container_of!(link.as_ptr(), WaiterNode, link)
     }
 
+    /// The unchecked call is safe because of the null check above.
     unsafe fn get_link(
         &self,
         value: *const <Self::PointerOps as PointerOps>::Value,

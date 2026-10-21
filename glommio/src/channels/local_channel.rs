@@ -133,6 +133,8 @@ where
     }
 }
 
+/// It is safe to use the unchecked calls below because we convert from a
+/// reference, which cannot be null.
 fn register_into_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut State<T>) {
     if node.link.is_linked() {
         return;

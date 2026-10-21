@@ -119,6 +119,8 @@ unsafe impl Adapter for WaiterAdapter {
         container_of!(link.as_ptr(), WaiterNode, link)
     }
 
+    /// The null check is performed above, so the unchecked `NonNull`
+    /// construction is sound.
     unsafe fn get_link(
         &self,
         value: *const <Self::PointerOps as PointerOps>::Value,
@@ -797,7 +799,9 @@ impl<T> RwLock<T> {
     ///
     /// All tasks are woken up in the fair order (in the order of acquiring
     /// of the lock) if that matters. That allows to avoid lock starvation
-    /// as much as possible.
+    /// as much as possible. When both readers and a writer are queued, all
+    /// readers plus the first writer are woken: they will likely execute in
+    /// order, so all get a chance to proceed.
     fn wake_up_fibers(rw: &mut State) {
         if rw.readers == 0 && rw.writers == 0 {
             if rw.queued_writers == 0 {

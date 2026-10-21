@@ -124,7 +124,6 @@ impl<T: BufferHalf> Connector<T> {
 
 impl<T: BufferHalf> Future for Connector<T> {
     type Output = Arc<SleepNotifier>;
-    #[allow(no_comments_allowed)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let reactor = self.reactor.upgrade().unwrap();
 

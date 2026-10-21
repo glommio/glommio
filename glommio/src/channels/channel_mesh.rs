@@ -329,6 +329,7 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
         self.nr_peers
     }
 
+    #[allow(no_comments_allowed)]
     async fn register(&self, role: Role) -> Result<(usize, usize), ()> {
         let (is_last, exec_id) = {
             let mut state = self.state.lock().unwrap();
@@ -389,6 +390,8 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
         }
 
         let state = self.state.lock().unwrap();
+        // At this point `ready` is true and `peers` is stable: the peers list
+        // is frozen once `ready` flips.
 
         let peer_id = state
             .peers

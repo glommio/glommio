@@ -811,6 +811,24 @@ impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_timeout_of_duration_max_waits() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, server) = futures::join!(TcpStream::connect(addr), listener.accept());
+            let (_client, mut server) = (client.unwrap(), server.unwrap());
+            server.set_read_timeout(Some(Duration::MAX)).unwrap();
+            let mut buf = [0u8; 8];
+            let raced = futures::future::select(
+                Box::pin(server.read(&mut buf)),
+                Box::pin(crate::timer::sleep(Duration::from_millis(50))),
+            )
+            .await;
+            assert!(matches!(raced, futures::future::Either::Right(_)));
+        });
+    }
     use crate::{channels::shared_channel, enclose, timer::Timer, LocalExecutorBuilder};
     use futures_lite::{
         io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},

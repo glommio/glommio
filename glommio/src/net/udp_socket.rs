@@ -679,6 +679,23 @@ mod tests {
         }};
     }
 
+    #[test]
+    fn send_to_through_the_ring_sends_the_whole_datagram() {
+        test_executor!(async move {
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender.socket.tx_yolo.set(false);
+            let sent = sender
+                .send_to(&[7u8; 100], receiver.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(sent, 100);
+            let mut buf = [0u8; 256];
+            let (n, _) = receiver.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], &[7u8; 100]);
+        });
+    }
+
     #[should_panic]
     #[test]
     fn udp_unconnected_recv() {

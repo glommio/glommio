@@ -42,6 +42,7 @@ lazy_static           = "1.5"
 libc                  = "0.2"
 log                   = "0.4"
 nix                   = { version = "0.30", features = ["event", "fs", "ioctl", "mman", "net", "poll", "sched", "time"] }
+pin-project           = "1.1"
 pin-project-lite      = "0.2"
 rlimit                = "0.10"
 scopeguard            = "1.2"

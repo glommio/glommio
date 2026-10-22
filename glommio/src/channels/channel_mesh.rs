@@ -5,8 +5,11 @@
 //!
 use std::{
     fmt::{self, Debug, Formatter},
+    future::poll_fn,
     io::{Error, ErrorKind},
+    mem,
     sync::{Arc, Mutex},
+    task::{Poll, Waker},
 };
 
 use crate::{
@@ -194,6 +197,8 @@ impl Role {
 struct JoinState<T: Send> {
     peers: Vec<Peer>,
     ready: bool,
+    /// Peers waiting for the last one to join, woken once the channels exist.
+    waiters: Vec<Waker>,
     senders: Vec<Vec<Option<SharedSender<T>>>>,
     receivers: Vec<Vec<Option<SharedReceiver<T>>>>,
 }
@@ -211,6 +216,7 @@ impl<T: Send> JoinState<T> {
         Self {
             peers: Vec::new(),
             ready: false,
+            waiters: Vec::new(),
             senders,
             receivers,
         }
@@ -373,21 +379,23 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 }
 
                 state.ready = true;
+                let waiters = mem::take(&mut state.waiters);
+                drop(state);
+                for waiter in waiters {
+                    waiter.wake();
+                }
             }
         } else {
-            // Wait until last joiner finishes building
-            loop {
-                let ready = {
-                    let state = self.state.lock().unwrap();
-                    state.ready
-                };
-
-                if ready {
-                    break;
+            poll_fn(|cx| {
+                let mut state = self.state.lock().unwrap();
+                if state.ready {
+                    return Poll::Ready(());
                 }
-
-                futures_lite::future::yield_now().await;
-            }
+                state.waiters.retain(|w| !w.will_wake(cx.waker()));
+                state.waiters.push(cx.waker().clone());
+                Poll::Pending
+            })
+            .await;
         }
 
         let state = self.state.lock().unwrap();
@@ -487,6 +495,55 @@ mod tests {
     use crate::{enclose, prelude::*};
 
     use super::*;
+
+    /// A peer waiting for the others to join is not polled again until the
+    /// last one arrives.
+    #[test]
+    fn waiting_for_peers_to_join_parks() {
+        use std::{
+            future::Future,
+            pin::pin,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+
+        let mesh = MeshBuilder::<u32, _>::full(2, 1);
+        let late_started = Arc::new(AtomicBool::new(false));
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let early = LocalExecutorBuilder::default()
+            .spawn(enclose!((mesh, late_started) move || async move {
+                let mut join = pin!(mesh.join());
+                let mut parked = Some(parked_tx);
+                let mut polls_while_alone = 0;
+                poll_fn(|cx| {
+                    if !late_started.load(Ordering::Acquire) {
+                        polls_while_alone += 1;
+                    }
+                    let poll = join.as_mut().poll(cx);
+                    if poll.is_pending() {
+                        if let Some(parked) = parked.take() {
+                            parked.send(()).unwrap();
+                        }
+                    }
+                    poll.map(|joined| joined.unwrap())
+                })
+                .await;
+                polls_while_alone
+            }))
+            .unwrap();
+        parked_rx.recv().unwrap();
+        let late = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                late_started.store(true, Ordering::Release);
+                let _ = mesh.join().await.unwrap();
+            })
+            .unwrap();
+        let polls_while_alone = early.join().unwrap();
+        late.join().unwrap();
+        assert_eq!(
+            polls_while_alone, 1,
+            "polled again before the last peer joined"
+        );
+    }
 
     #[test]
     fn test_channel_mesh() {

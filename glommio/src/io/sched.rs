@@ -5,6 +5,7 @@ use crate::{
 };
 use intrusive_collections::{intrusive_adapter, Bound, KeyAdapter, RBTree, RBTreeLink};
 use std::{
+    borrow::Borrow,
     cell::{Cell, RefCell},
     ops::{Deref, Range},
     rc::{Rc, Weak},
@@ -221,6 +222,12 @@ impl Deref for ScheduledSource {
     type Target = Source;
 
     fn deref(&self) -> &Self::Target {
+        &self.inner.source
+    }
+}
+
+impl Borrow<Source> for ScheduledSource {
+    fn borrow(&self) -> &Source {
         &self.inner.source
     }
 }

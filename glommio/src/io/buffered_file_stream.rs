@@ -110,6 +110,7 @@ pub struct StreamWriter {
     file_pos: u64,
     sync_on_close: bool,
     source: Option<Source>,
+    seek_source: Option<Source>,
     buffer: Buffer,
     file_status: FileStatus,
     reactor: Weak<Reactor>,
@@ -184,6 +185,11 @@ impl Buffer {
 
     fn consume(&mut self, amt: usize) {
         self.buffer_pos += amt;
+    }
+
+    fn clear(&mut self) {
+        self.buffer_pos = 0;
+        self.data.clear();
     }
 
     /// Copies as many bytes as possible from `buf` to ourselves, returning
@@ -371,6 +377,7 @@ impl StreamWriter {
             sync_on_close: builder.sync_on_close,
             file_pos: 0,
             source: None,
+            seek_source: None,
             buffer: Buffer::new(builder.buffer_size),
             reactor: Rc::downgrade(&crate::executor().reactor()),
         }
@@ -492,33 +499,35 @@ impl StreamWriter {
 }
 
 macro_rules! do_seek {
-    ( $self:expr, $source:expr, $fileobj:expr, $cx:expr, $pos:expr ) => {
-        match $pos {
-            SeekFrom::Start(pos) => {
-                $self.file_pos = pos;
-                Poll::Ready(Ok(pos))
-            }
-            SeekFrom::Current(pos) => {
-                $self.file_pos = ($self.file_pos as i64 + pos) as u64;
-                Poll::Ready(Ok($self.file_pos))
-            }
-            SeekFrom::End(pos) => match $source.take() {
+    ( $self:expr, $source:expr, $fileobj:expr, $cx:expr, $pos:expr, $current:expr ) => {{
+        let target = match $pos {
+            SeekFrom::Start(pos) => Some(pos),
+            SeekFrom::Current(delta) => $current.checked_add_signed(delta),
+            SeekFrom::End(delta) => match $source.take() {
                 None => {
                     let source = $self.reactor.upgrade().unwrap().statx($fileobj.as_raw_fd());
                     source.add_waiter_single($cx.waker());
                     $source = Some(source);
-                    Poll::Pending
+                    return Poll::Pending;
                 }
                 Some(source) => {
                     let stype = source.extract_source_type();
                     let stat_buf: Statx = stype.try_into().unwrap();
-                    let end = stat_buf.stx_size as i64;
-                    $self.file_pos = (end + pos) as u64;
-                    Poll::Ready(Ok($self.file_pos))
+                    stat_buf.stx_size.checked_add_signed(delta)
                 }
             },
+        };
+        match target {
+            Some(pos) => {
+                $self.file_pos = pos;
+                Poll::Ready(Ok(pos))
+            }
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek to a negative or overflowing position",
+            ))),
         }
-    };
+    }};
 }
 
 impl AsyncSeek for StreamReader {
@@ -527,7 +536,13 @@ impl AsyncSeek for StreamReader {
         cx: &mut Context<'_>,
         pos: SeekFrom,
     ) -> Poll<io::Result<u64>> {
-        do_seek!(self, self.seek_source, &self.file, cx, pos)
+        let current = self.file_pos - self.buffer.remaining_unconsumed_bytes() as u64;
+        let sought = do_seek!(self, self.seek_source, &self.file, cx, pos, current);
+        if let Poll::Ready(Ok(_)) = sought {
+            self.buffer.clear();
+            self.io_source = None;
+        }
+        sought
     }
 }
 
@@ -537,7 +552,16 @@ impl AsyncSeek for StreamWriter {
         cx: &mut Context<'_>,
         pos: SeekFrom,
     ) -> Poll<io::Result<u64>> {
-        do_seek!(self, self.source, self.file.as_ref().unwrap(), cx, pos)
+        ready!(self.do_poll_flush(cx))?;
+        let current = self.file_pos;
+        do_seek!(
+            self,
+            self.seek_source,
+            self.file.as_ref().unwrap(),
+            cx,
+            pos,
+            current
+        )
     }
 }
 
@@ -699,6 +723,56 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn seeking_a_reader_reads_from_the_new_position() {
+        let dir = make_test_directories("seek-reader").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("f");
+            let byte = |pos: u64| (pos % 251) as u8;
+            std::fs::write(&path, (0..8192).map(byte).collect::<Vec<_>>()).unwrap();
+            let mut reader =
+                StreamReaderBuilder::new(BufferedFile::open(&path).await.unwrap()).build();
+            let mut b = [0u8; 1];
+
+            reader.read_exact(&mut [0u8; 10]).await.unwrap();
+            assert_eq!(reader.seek(SeekFrom::Current(0)).await.unwrap(), 10);
+            assert_eq!(reader.seek(SeekFrom::Current(-5)).await.unwrap(), 5);
+            reader.read_exact(&mut b).await.unwrap();
+            assert_eq!(b[0], byte(5));
+
+            assert_eq!(reader.seek(SeekFrom::Start(1000)).await.unwrap(), 1000);
+            reader.read_exact(&mut b).await.unwrap();
+            assert_eq!(b[0], byte(1000));
+
+            assert_eq!(reader.seek(SeekFrom::End(-1)).await.unwrap(), 8191);
+            reader.read_exact(&mut b).await.unwrap();
+            assert_eq!(b[0], byte(8191));
+
+            let err = reader.seek(SeekFrom::Current(-10_000)).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            reader.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn seeking_a_writer_keeps_what_was_written_before() {
+        let dir = make_test_directories("seek-writer").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("f");
+            let mut writer =
+                StreamWriterBuilder::new(BufferedFile::create(&path).await.unwrap()).build();
+            writer.write_all(b"abc").await.unwrap();
+            assert_eq!(writer.seek(SeekFrom::Start(100)).await.unwrap(), 100);
+            writer.write_all(b"xyz").await.unwrap();
+            assert_eq!(writer.seek(SeekFrom::End(0)).await.unwrap(), 103);
+            writer.close().await.unwrap();
+            let data = std::fs::read(&path).unwrap();
+            assert_eq!(data.len(), 103);
+            assert_eq!(&data[..3], b"abc");
+            assert_eq!(&data[100..], b"xyz");
+        });
+    }
     use crate::{test_utils::make_test_directories, GlommioError};
     use futures_lite::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt};
     use std::{io::ErrorKind, time::Duration};

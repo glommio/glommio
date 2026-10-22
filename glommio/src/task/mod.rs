@@ -76,7 +76,6 @@ pub(crate) mod task_impl;
 mod test_support;
 mod tests;
 pub(crate) mod utils;
-pub(crate) mod waker_fn;
 
 pub use crate::task::{join_handle::JoinHandle, task_impl::Task};
 

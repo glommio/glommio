@@ -18,7 +18,6 @@ use futures_lite::future::yield_now;
 use super::{
     task_impl,
     test_support::{completed_waker, executor, AllocationProbe, DropGuard, DropProbe},
-    waker_fn::dummy_waker,
 };
 
 #[derive(Clone, Copy)]
@@ -118,8 +117,7 @@ fn completed_output<const N: usize>(waker_first: bool, foreign: bool) {
         allocation.assert_live();
         output_drops.assert_not_dropped();
         let mut handle = handle;
-        let dummy = dummy_waker();
-        let output = match Pin::new(&mut handle).poll(&mut Context::from_waker(&dummy)) {
+        let output = match Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Some(output)) => output,
             _ => panic!("completed result was lost during shutdown"),
         };
@@ -220,8 +218,7 @@ fn suspended_handle_survives_shutdown<const N: usize>(foreign: bool) {
     let drops_at_shutdown = future_drops.drops();
     allocation.assert_live();
 
-    let dummy = dummy_waker();
-    let result = Pin::new(&mut handle).poll(&mut Context::from_waker(&dummy));
+    let result = Pin::new(&mut handle).poll(&mut Context::from_waker(Waker::noop()));
     drop(handle);
     release_waker(waker, foreign);
 

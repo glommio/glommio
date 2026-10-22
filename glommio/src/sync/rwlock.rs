@@ -32,7 +32,7 @@
 //! ```
 use core::fmt::Debug;
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
@@ -69,6 +69,8 @@ struct WaiterNode {
     kind: WaiterKind,
     link: LinkedListLink,
     waker: RefCell<Option<Waker>>,
+    /// Woken by a release and unlinked, but not yet polled.
+    woken: Cell<bool>,
 
     // waiter node can not be `Unpin` so its pointer could be used inside intrusive
     // collection, it also can not outlive the container which is guaranteed by the
@@ -223,6 +225,7 @@ impl<'a, T> Waiter<'a, T> {
                 kind,
                 link: LinkedListLink::new(),
                 waker: RefCell::new(None),
+                woken: Cell::new(false),
                 _p: PhantomPinned,
             },
         }
@@ -271,6 +274,7 @@ impl<T> Future for Waiter<'_, T> {
         let future_mut = unsafe { self.get_unchecked_mut() };
         let pinned_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
 
+        pinned_node.woken.set(false);
         match pinned_node.kind {
             WaiterKind::Writer => {
                 if rw.try_write()? {
@@ -307,7 +311,12 @@ impl<T> Future for Waiter<'_, T> {
 
 impl<T> Drop for Waiter<'_, T> {
     fn drop(&mut self) {
-        if self.node.link.is_linked() {
+        if self.node.woken.get() {
+            let mut state = self.rw.state.borrow_mut();
+            if !state.closed {
+                RwLock::<T>::wake_up_fibers(&mut state);
+            }
+        } else if self.node.link.is_linked() {
             // If node is lined them future is already pinned
             let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
             Self::remove_from_waiting_queue(pinned_node, &mut self.rw.state.borrow_mut())
@@ -749,7 +758,7 @@ impl<T> RwLock<T> {
 
         state.closed = true;
 
-        Self::wake_up_fibers(&mut state);
+        Self::wake_up_all_fibers(&mut state);
         Ok(())
     }
 
@@ -834,6 +843,7 @@ impl<T> RwLock<T> {
                 }
 
                 let waker = node.waker.borrow_mut().take();
+                node.woken.set(true);
                 if let Some(waker) = waker {
                     waker.wake();
                 } else {
@@ -856,6 +866,7 @@ impl<T> RwLock<T> {
                 let node = unsafe { Pin::new_unchecked(cursor.get().unwrap()) };
 
                 let waker = node.waker.borrow_mut().take();
+                node.woken.set(true);
                 if let Some(waker) = waker {
                     waker.wake();
                 } else {
@@ -875,8 +886,9 @@ impl<T> RwLock<T> {
     fn wake_up_all_fibers(rw: &mut State) {
         let mut cursor = rw.waiters_queue.front_mut();
         while !cursor.is_null() {
-            let node = cursor.remove().unwrap();
-            let waker = (unsafe { node.as_ref() }).waker.borrow_mut().take();
+            let node = unsafe { cursor.remove().unwrap().as_ref() };
+            let waker = node.waker.borrow_mut().take();
+            node.woken.set(true);
             if let Some(waker) = waker {
                 waker.wake();
             } else {
@@ -908,7 +920,15 @@ mod test {
     use std::time::Duration;
 
     use crate::sync::Semaphore;
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::Wake,
+    };
 
     #[derive(Eq, PartialEq, Debug)]
     struct NonCopy(i32);
@@ -952,6 +972,74 @@ mod test {
 
             join_all(futures).await;
         });
+    }
+
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn flagged() -> (Arc<WakeFlag>, Waker) {
+        let flag = Arc::new(WakeFlag::default());
+        (flag.clone(), Waker::from(flag))
+    }
+
+    #[test]
+    fn dropping_a_woken_waiter_wakes_the_next() {
+        let rw = RwLock::new(());
+        let guard = rw.try_write().unwrap();
+        let mut first = Box::pin(rw.write());
+        let mut second = Box::pin(rw.write());
+        let (flag, waker) = flagged();
+        let mut cx = Context::from_waker(&waker);
+        assert!(first
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        drop(guard);
+        drop(first);
+
+        assert!(
+            flag.0.load(Ordering::Relaxed),
+            "the second waiter was never woken"
+        );
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(_))));
+    }
+
+    #[test]
+    fn close_wakes_every_waiter() {
+        let rw = RwLock::new(());
+        let guard = rw.try_write().unwrap();
+        let mut first = Box::pin(rw.write());
+        assert!(first
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+        let mut rest = [Box::pin(rw.write()), Box::pin(rw.write())];
+        let flags = rest.each_mut().map(|waiter| {
+            let (flag, waker) = flagged();
+            assert!(waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending());
+            flag
+        });
+
+        drop(guard);
+        rw.close().unwrap();
+
+        for flag in flags {
+            assert!(
+                flag.0.load(Ordering::Relaxed),
+                "a waiter was never woken by close"
+            );
+        }
     }
 
     #[test]

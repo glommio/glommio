@@ -713,6 +713,7 @@ impl TimerActionRepeat {
     /// [`TimerActionRepeat`]: struct.TimerActionRepeat.html
     /// [`cancel`]: struct.TimerActionRepeat.html#method.cancel
     /// [`join`]: struct.TimerActionRepeat.html#method.join
+    #[allow(no_comments_allowed)]
     pub fn destroy(&self) {
         // Cancelling the task drops whichever `Timer` the loop is currently
         // waiting on, and that timer's `Drop` withdraws its registration.

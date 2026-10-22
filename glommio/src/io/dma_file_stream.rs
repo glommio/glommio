@@ -4,7 +4,7 @@
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
 use crate::{
-    io::{dma_file::align_down, read_result::ReadResult, DmaFile},
+    io::{read_result::ReadResult, DmaFile},
     sys::DmaBuffer,
     task, ByteSliceMutExt,
 };
@@ -183,8 +183,6 @@ struct DmaStreamReaderState {
     buffer_read_ahead_current_pos: u64,
     max_pos: u64,
     buffer_size: u64,
-    buffer_size_mask: u64,
-    buffer_size_shift: u64,
     read_ahead: usize,
     wakermap: AHashMap<u64, Waker>,
     pending: AHashMap<u64, task::JoinHandle<()>>,
@@ -251,11 +249,11 @@ impl DmaStreamReaderState {
     }
 
     fn offset_of(&self, pos: u64) -> usize {
-        (pos - align_down(pos, self.buffer_size)) as usize
+        (pos % self.buffer_size) as usize
     }
 
     fn buffer_id(&self, pos: u64) -> u64 {
-        (pos & self.buffer_size_mask) >> self.buffer_size_shift
+        pos / self.buffer_size
     }
 
     /// Returns true if heir was no waker for this `buffer_id`, otherwise, it
@@ -392,12 +390,11 @@ impl DmaStreamReader {
 
     fn new(builder: DmaStreamReaderBuilder) -> DmaStreamReader {
         let state = DmaStreamReaderState {
-            buffer_read_ahead_current_pos: align_down(builder.start, builder.buffer_size as u64),
+            buffer_read_ahead_current_pos: builder.start
+                - builder.start % builder.buffer_size as u64,
             read_ahead: builder.read_ahead,
             max_pos: builder.end,
             buffer_size: builder.buffer_size as u64,
-            buffer_size_mask: !(builder.buffer_size as u64 - 1),
-            buffer_size_shift: (builder.buffer_size as f64).log2() as u64,
             wakermap: AHashMap::with_capacity(builder.read_ahead),
             buffermap: AHashMap::with_capacity(builder.read_ahead),
             pending: AHashMap::with_capacity(builder.read_ahead),
@@ -458,7 +455,7 @@ impl DmaStreamReader {
         self.current_pos = std::cmp::min(self.current_pos + bytes, self.end);
         let new_buffer_id = state.buffer_id(self.current_pos);
         if buffer_id != new_buffer_id {
-            let candidate_read_ahead_pos = align_down(self.current_pos, self.buffer_size);
+            let candidate_read_ahead_pos = self.current_pos - self.current_pos % self.buffer_size;
             state.buffer_read_ahead_current_pos = std::cmp::max(
                 state.buffer_read_ahead_current_pos,
                 candidate_read_ahead_pos,
@@ -1574,6 +1571,38 @@ mod test {
         let rfile = DmaFile::open(&filename).await.unwrap();
         assert_eq!(rfile.file_size().await.unwrap(), 1_000_000);
     });
+
+    /// A buffer size that is a multiple of the alignment but not a power of
+    /// two still reads every byte from where it is in the file.
+    #[test]
+    fn read_with_a_buffer_size_that_is_not_a_power_of_two() {
+        let dir = make_test_directories("read-npot-buffer").remove(0);
+        test_executor!(async move {
+            let filename = dir.path.join("testfile");
+            let pattern = |v: usize| (v / 4096) as u8 ^ v as u8;
+            let size = 16 * 4096;
+            let file = DmaFile::create(&filename).await.unwrap();
+            let mut buf = DmaBuffer::new(size).unwrap();
+            for (v, x) in buf.as_bytes_mut().iter_mut().enumerate() {
+                *x = pattern(v);
+            }
+            file.write_at(buf, 0).await.unwrap();
+            file.close().await.unwrap();
+
+            for start in [0, 13000] {
+                let file = DmaFile::open(&filename).await.unwrap();
+                let mut reader = DmaStreamReaderBuilder::new(file)
+                    .with_buffer_size(3 * 4096)
+                    .with_start_pos(start as u64)
+                    .build();
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out).await.unwrap();
+                reader.close().await.unwrap();
+                let expected: Vec<u8> = (start..size).map(pattern).collect();
+                assert!(out == expected, "wrong bytes reading from {start}");
+            }
+        });
+    }
 
     file_stream_read_test!(read_exact_zero_buffer, path, _k, file, _file_size: 131072, {
         let mut reader = DmaStreamReaderBuilder::new(file)

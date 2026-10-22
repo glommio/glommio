@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! Stable storage for wheel entries.
 //!
 //! A cascading wheel moves a timer between slots as time advances, so a handle
@@ -28,7 +28,7 @@ pub(crate) struct SlotIndex(u32);
 impl SlotIndex {
     /// The slab is addressed by `u32`, so it cannot grow past `u32::MAX`
     /// entries. At the entry sizes involved that bound is hundreds of
-    /// gigabytes, which is to say memory runs out first — but the conversion
+    /// gigabytes, which is to say memory runs out first, but the conversion
     /// is checked rather than assumed, and this is the only place a `usize`
     /// becomes a `SlotIndex`.
     fn new(index: usize) -> Option<Self> {
@@ -44,7 +44,7 @@ impl SlotIndex {
 ///
 /// `u64` rather than `u32` on purpose. A slot is reused every time a timer is
 /// cancelled and another inserted, and with a LIFO free list a hot slot is
-/// reused immediately — at a million operations a second a 32-bit counter
+/// reused immediately: at a million operations a second a 32-bit counter
 /// returns to a value a stale handle still matches in about 72 minutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct Generation(NonZeroU64);
@@ -208,7 +208,7 @@ impl<T> Slab<T> {
     /// Look up the handle for a slot whose generation is current.
     ///
     /// The wheel stores bare `SlotIndex` values, so this is how it recovers a
-    /// full handle when it needs one — on expiry, where the entry it is
+    /// full handle when it needs one: on expiry, where the entry it is
     /// looking at is live by construction.
     pub(crate) fn id_at(&self, slot: SlotIndex) -> Option<Key> {
         match self.slots.get(slot.as_usize())? {
@@ -257,7 +257,6 @@ mod tests {
         let first = slab.insert("first");
         assert_eq!(slab.remove(first), Some("first"));
 
-        // Reuses the slot `first` occupied.
         let second = slab.insert("second");
         assert_eq!(second.slot, first.slot, "the slot is reused");
         assert_ne!(second.generation, first.generation, "but not the identity");
@@ -267,12 +266,12 @@ mod tests {
         assert_eq!(slab.get(second), Some(&"second"));
     }
 
+    /// The defect this replaces used a monotonic counter, which this loop
+    /// would have advanced a thousand times.
     #[test]
     fn slots_are_bounded_by_live_entries_not_by_insertions() {
         let mut slab = Slab::new();
 
-        // The defect this replaces used a monotonic counter, so this loop
-        // would have advanced an index a thousand times.
         for _ in 0..1_000 {
             let id = slab.insert(());
             slab.remove(id).expect("just inserted");
@@ -292,9 +291,9 @@ mod tests {
         assert_eq!(slab.get(id), Some(&2));
     }
 
+    /// `Option<Generation>` is eight bytes only while zero stays unused.
     #[test]
     fn generations_never_take_the_zero_niche() {
-        // Option<Generation> is eight bytes only while zero stays unused.
         assert_eq!(
             std::mem::size_of::<Option<Generation>>(),
             std::mem::size_of::<u64>()

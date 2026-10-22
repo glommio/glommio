@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! A hierarchical timing wheel with stable handles.
 //!
 //! The reactor keeps its timers here. The module is public only when
@@ -20,11 +20,11 @@
 //! What the wheel decides for itself and what the caller decides is spelled out
 //! in [`Policy`]: the level layout, which way a deadline between two ticks is
 //! rounded, and how much work answering "what is due next" is worth.
+//!
+//! Outside the `bench` feature only the reactor reaches the module, and it uses
+//! a fraction of the surface, so dead code is allowed there.
 
 #![warn(missing_docs, missing_debug_implementations)]
-// The module is `pub` only under the `bench` feature. A default build reaches
-// it from the reactor alone, which wants a fraction of the surface, so the rest
-// is unused there by construction rather than by neglect.
 #![cfg_attr(not(feature = "bench"), allow(dead_code, unused_imports))]
 
 #[cfg(test)]
@@ -51,6 +51,8 @@ mod readme_examples {
     use super::{Millis, Policy, Rounding, TimingWheel};
     use std::time::{Duration, Instant};
 
+    /// Nothing is due yet and the wheel says when to come back; then the read
+    /// completes and withdraws its timeout before it fires.
     #[test]
     fn insert_then_withdraw_before_it_fires() {
         let start = Instant::now();
@@ -58,14 +60,12 @@ mod readme_examples {
 
         let key = wheel.insert(start + Duration::from_millis(50), "read timeout");
 
-        // Nothing is due yet, and the wheel says when to come back.
         wheel.advance_to(start + Duration::from_millis(10));
         let mut due = Vec::new();
         wheel.drain_expired_into(&mut due);
         assert!(due.is_empty());
         assert!(wheel.next_expiry().unwrap() <= start + Duration::from_millis(50));
 
-        // The read completed, so withdraw the timeout before it fires.
         assert_eq!(wheel.remove(key), Some("read timeout"));
         assert!(wheel.is_empty());
     }
@@ -77,10 +77,10 @@ mod readme_examples {
         const ROUNDING: Rounding = Rounding::Down;
     }
 
+    /// Each level here spans exactly what the one below it covers, 64 x 1 and
+    /// then 64 x 64.
     #[test]
     fn building_a_wheel_checks_the_layout_tiles() {
-        // Each level here spans exactly what the one below it covers,
-        // 64 x 1 and then 64 x 64.
         let wheel: TimingWheel<(), Coarse> = TimingWheel::new();
         assert!(wheel.is_empty());
     }

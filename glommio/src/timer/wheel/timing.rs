@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! The wheel itself.
 
 use super::{
@@ -77,6 +77,8 @@ pub struct TimingWheel<T, P: Policy> {
     expired: Vec<SlotIndex>,
     levels: Vec<Level>,
     overflow: BTreeMap<Instant, Vec<SlotIndex>>,
+    /// Ticks in one full revolution of the coarsest level, which is everything
+    /// the wheel can address.
     reach: u64,
     policy: PhantomData<P>,
 }
@@ -108,8 +110,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
             })
             .collect();
 
-        // One full revolution of the coarsest level is everything the wheel
-        // can address.
         let reach = P::RESOLUTION[P::RESOLUTION.len() - 1] * P::SLOTS[P::SLOTS.len() - 1] as u64;
 
         Self {
@@ -195,10 +195,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
     /// `None` only when the deadline is beyond the wheel's reach and the
     /// policy is [`Overflow::Reject`].
     pub fn try_insert(&mut self, expires_at: Instant, payload: T) -> Option<Key> {
-        // Worked out once and handed on. Asking whether a deadline is beyond
-        // the wheel's reach means rounding it to a tick, which is exactly what
-        // placing it needs, and computing that twice made refusing overflow
-        // cost as much again as accepting it.
         let deadline = self.tick_for(expires_at);
         if P::OVERFLOW == Overflow::Reject
             && deadline.is_some_and(|tick| tick.saturating_sub(self.current_tick) >= self.reach)
@@ -215,11 +211,12 @@ impl<T, P: Policy> TimingWheel<T, P> {
     }
 
     /// Withdraws an entry, handing back its payload.
+    ///
+    /// Forgets its slot's cached minimum only when this entry supplied it.
     pub fn remove(&mut self, key: Key) -> Option<T> {
         let entry = self.slab.get(key)?;
         let at = entry.at;
         let expires_at = entry.expires_at;
-        // Only the entry that supplied a slot's minimum can invalidate it.
         if let Position::Slot { level, slot, .. } = at {
             if let Some(cell) = self.earliest_cell(level, slot) {
                 if cell.get() == Some(expires_at) {
@@ -241,8 +238,6 @@ impl<T, P: Policy> Default for TimingWheel<T, P> {
         Self::new()
     }
 }
-
-// ---- placement ----------------------------------------------------------
 
 impl<T, P: Policy> TimingWheel<T, P> {
     /// The tick a deadline is stored at, under the configured rounding.
@@ -275,7 +270,11 @@ impl<T, P: Policy> TimingWheel<T, P> {
         self.place_at(key, deadline);
     }
 
-    /// Places an entry whose tick the caller has already worked out.
+    /// Places an entry whose tick the caller has already worked out, in the
+    /// finest level whose reach still covers it.
+    ///
+    /// A slot's cached minimum is only ever tightened here. An unknown one
+    /// stays unknown, since an earlier entry may already be in the slot.
     fn place_at(&mut self, key: Key, deadline: Option<u64>) {
         let expires_at = self
             .slab
@@ -303,7 +302,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
             return self.record(key, at);
         }
 
-        // The finest level whose reach still covers the deadline.
         let level = self
             .levels
             .iter()
@@ -311,9 +309,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
             .unwrap_or(self.levels.len() - 1);
         let slot = ((deadline >> self.levels[level].shift) as usize) & self.levels[level].wrap;
 
-        // Only ever tighten a known minimum. `None` means unknown, not empty:
-        // an entry earlier than this one may already be here, and claiming
-        // this deadline as the minimum would hide it.
         if let Some(cell) = self.earliest_cell(level, slot) {
             if let Some(current) = cell.get() {
                 cell.set(Some(current.min(expires_at)));
@@ -341,8 +336,11 @@ impl<T, P: Policy> TimingWheel<T, P> {
         }
     }
 
-    /// Detaches an entry from wherever it sits, correcting whatever moves into
-    /// the hole it leaves.
+    /// Detaches an entry from wherever it sits, correcting the recorded
+    /// position of whatever `swap_remove` moves into the hole it leaves.
+    ///
+    /// A slot left empty also forgets its cached minimum, so the next
+    /// insertion does not tighten against a deadline that is no longer there.
     ///
     /// `expect` is the entry being detached. Nothing verifies a recorded
     /// position as it is written, and a wrong one does not merely miss: the
@@ -361,9 +359,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
                 let moved = bucket.get(index).copied();
                 if bucket.is_empty() {
                     self.levels[level].mask.clear(slot);
-                    // An empty slot has no minimum. Leaving the old value
-                    // would have the next insertion tighten against a deadline
-                    // that is no longer here.
                     if let Some(cell) = self.earliest_cell(level, slot) {
                         cell.set(None);
                     }
@@ -397,8 +392,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
             }
         };
 
-        // `swap_remove` moved the last element into the hole. Its recorded
-        // position now lies, so correct it before anything reads it.
         if let Some(moved) = moved {
             if let Some(key) = self.slab.id_at(moved) {
                 self.record(key, corrected);
@@ -406,8 +399,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
         }
     }
 }
-
-// ---- querying -----------------------------------------------------------
 
 impl<T, P: Policy> TimingWheel<T, P> {
     /// The earliest deadline held, if any.
@@ -431,14 +422,22 @@ impl<T, P: Policy> TimingWheel<T, P> {
         [from_levels, from_overflow].into_iter().flatten().min()
     }
 
+    /// The earliest time anything in a level could be due.
+    ///
+    /// The search starts one past the cursor: the cursor's own slot was emptied
+    /// at its boundary, so anything left in it wrapped a whole revolution and
+    /// holds the level's latest deadlines, not its earliest.
+    ///
+    /// Without a cached minimum the answer is the tick the slot's bucket
+    /// begins at, less the rounding slack of [`TimingWheel::tick_instant`]. In
+    /// the last tick before the slot breaks down that bound is at or before
+    /// now, which would have a caller sleep for zero and wake into the same
+    /// answer, so the slot is scanned instead.
     fn next_in_level(&self, level: usize) -> Option<Instant> {
         let l = &self.levels[level];
         if l.mask.is_empty() {
             return None;
         }
-        // One past the cursor. The cursor's own slot was emptied at its
-        // boundary, so anything left in it wrapped a whole revolution and
-        // holds the level's latest deadlines, not its earliest.
         let cursor = (self.current_tick >> l.shift) as usize;
         let from = (cursor + 1) & l.wrap;
         let offset = l.mask.distance_to_next(from)?;
@@ -449,18 +448,11 @@ impl<T, P: Policy> TimingWheel<T, P> {
             return self.earliest_in_slot(level, slot);
         }
 
-        // The bucket this slot represents cannot begin before this tick, so
-        // nothing in it is due before then. One tick is subtracted when
-        // placement rounds up, because an entry recorded at tick `t` is really
-        // due somewhere in `(t - 1, t]`.
         let quotient = ((self.current_tick >> l.shift) + 1 + offset as u64) << l.shift;
         let bound = self.tick_instant(quotient);
         if bound > self.advanced_to {
             return Some(bound);
         }
-        // In the last tick before this slot breaks down, the bound lands on
-        // the cursor and says only "at or before now", which would have a
-        // caller sleep for zero and wake straight back into the same answer.
         self.earliest_in_slot(level, slot)
     }
 
@@ -471,14 +463,14 @@ impl<T, P: Policy> TimingWheel<T, P> {
     /// rounding policy decided. A bound that forgets that is a bound that can
     /// name a time later than a live deadline, which is the one direction a
     /// caller sleeping on this answer cannot survive.
+    ///
+    /// Rounded up, the truth lies anywhere in the tick below. Rounded to the
+    /// nearer tick, it can have come up from half a tick below. Rounded down,
+    /// it is at or after the recorded tick.
     fn tick_instant(&self, tick: u64) -> Instant {
         let slack_nanos = match P::ROUNDING {
-            // Rounded up, so the truth lies anywhere in the tick below.
             Rounding::Up => 1_000_000,
-            // Rounded to the nearer tick, so it can have come up from as much
-            // as half a tick below.
             Rounding::Nearest => 500_000,
-            // Rounded down, so the truth is at or after the recorded tick.
             Rounding::Down => 0,
         };
         (self.start + Duration::from_millis(tick)) - Duration::from_nanos(slack_nanos)
@@ -508,14 +500,19 @@ impl<T, P: Policy> TimingWheel<T, P> {
     }
 }
 
-// ---- advancing ----------------------------------------------------------
-
 impl<T, P: Policy> TimingWheel<T, P> {
     /// Moves time forward, expiring whatever has come due.
     ///
     /// Cost is the work crossed, not the interval: an idle wheel skips to the
     /// next tick that has something to do rather than stepping through every
     /// tick between.
+    ///
+    /// The overflow map is reclaimed before the final sweep for entries whose
+    /// tick has not arrived. An entry coming back from it can already be due,
+    /// and a sweep that ran first would leave it in a level with a past
+    /// deadline, which `next_expiry` would then report. Wheels with a short
+    /// reach send almost everything through the overflow map, so for them this
+    /// is the common path.
     pub fn advance_to(&mut self, now: Instant) {
         if now <= self.start {
             return;
@@ -539,18 +536,13 @@ impl<T, P: Policy> TimingWheel<T, P> {
             }
         }
 
-        // Reclaim before sweeping, not after. An entry coming back from the
-        // overflow map can already be due, and a sweep that has already run
-        // will not look at it: it would sit in a level with a deadline in the
-        // past until the next call, and `next_expiry` would report that past
-        // time. Wheels with a short reach send almost everything through the
-        // overflow map, so for them this is the common path rather than an
-        // edge case.
         self.check_overflow();
         self.expire_due(now);
     }
 
-    /// The next tick at or before `limit` at which the wheel has work.
+    /// The next tick at or before `limit` at which the wheel has work: the
+    /// finest level's next occupied slot, or the boundary where an occupied
+    /// coarser level breaks down.
     fn next_work_tick(&self, limit: u64) -> Option<u64> {
         let finest = &self.levels[0];
         let from = ((self.current_tick + 1) & finest.wrap as u64) as usize;
@@ -559,7 +551,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
             .distance_to_next(from)
             .map(|offset| self.current_tick + 1 + offset as u64);
 
-        // A coarser level has work at the boundary where it breaks down.
         let cascade = (1..self.levels.len())
             .filter(|level| !self.levels[*level].mask.is_empty())
             .map(|level| {
@@ -631,84 +622,83 @@ impl<T, P: Policy> TimingWheel<T, P> {
     /// Deadlines are stored at whole ticks, so under [`Rounding::Up`] an entry
     /// due at 1.7 ticks sits at tick 2 and the tick sweep alone would not
     /// reach it until 2.0. Without this the wheel's resolution becomes a floor
-    /// under every wait.
+    /// under every wait. Only the slot `now` rounds into can hold such an
+    /// entry.
     fn expire_due(&mut self, now: Instant) {
         let Some(rounded) = self.tick_for(now) else {
             return;
         };
         for level in 0..self.levels.len() {
-            // The slot `now` rounds into is the one that can hold an entry
-            // whose tick has not arrived but whose real deadline has passed.
             let slot = ((rounded >> self.levels[level].shift) as usize) & self.levels[level].wrap;
             self.expire_due_in(level, slot, now);
         }
     }
 
     /// Expires everything in one slot whose real deadline has passed.
+    ///
+    /// The cached minimum is never later than the truth, so one later than
+    /// `now` proves nothing here is due and the walk is skipped.
     fn expire_due_in(&mut self, level: usize, slot: usize, now: Instant) {
+        if self
+            .earliest_cell(level, slot)
+            .map(|cell| cell.get().is_some_and(|earliest| earliest > now))
+            .unwrap_or(false)
         {
-            // The cached minimum is never later than the truth, so one later
-            // than `now` proves nothing here is due and the walk is skipped.
-            if self
-                .earliest_cell(level, slot)
-                .map(|cell| cell.get().is_some_and(|earliest| earliest > now))
-                .unwrap_or(false)
-            {
-                return;
-            }
+            return;
+        }
 
-            let held = std::mem::take(&mut self.levels[level].slots[slot]);
-            if held.is_empty() {
-                return;
-            }
-            let mut survivor_min: Option<Instant> = None;
-            let mut retained = Vec::with_capacity(held.len());
-            for index in held {
-                let Some(key) = self.slab.id_at(index) else {
-                    continue;
+        let held = std::mem::take(&mut self.levels[level].slots[slot]);
+        if held.is_empty() {
+            return;
+        }
+        let mut survivor_min: Option<Instant> = None;
+        let mut retained = Vec::with_capacity(held.len());
+        for index in held {
+            let Some(key) = self.slab.id_at(index) else {
+                continue;
+            };
+            let due = self.slab.get(key).is_some_and(|e| e.expires_at <= now);
+            if due {
+                self.expired.push(index);
+                let at = Position::Expired {
+                    index: self.expired.len() - 1,
                 };
-                let due = self.slab.get(key).is_some_and(|e| e.expires_at <= now);
-                if due {
-                    self.expired.push(index);
-                    let at = Position::Expired {
-                        index: self.expired.len() - 1,
-                    };
-                    self.record(key, at);
-                } else {
-                    if let Some(entry) = self.slab.get(key) {
-                        survivor_min = Some(match survivor_min {
-                            Some(m) => m.min(entry.expires_at),
-                            None => entry.expires_at,
-                        });
-                    }
-                    retained.push(index);
-                    let at = Position::Slot {
-                        level,
-                        slot,
-                        index: retained.len() - 1,
-                    };
-                    self.record(key, at);
+                self.record(key, at);
+            } else {
+                if let Some(entry) = self.slab.get(key) {
+                    survivor_min = Some(match survivor_min {
+                        Some(m) => m.min(entry.expires_at),
+                        None => entry.expires_at,
+                    });
                 }
+                retained.push(index);
+                let at = Position::Slot {
+                    level,
+                    slot,
+                    index: retained.len() - 1,
+                };
+                self.record(key, at);
             }
-            if retained.is_empty() {
-                self.levels[level].mask.clear(slot);
-            }
-            self.levels[level].slots[slot] = retained;
-            if let Some(cell) = self.earliest_cell(level, slot) {
-                cell.set(survivor_min);
-            }
+        }
+        if retained.is_empty() {
+            self.levels[level].mask.clear(slot);
+        }
+        self.levels[level].slots[slot] = retained;
+        if let Some(cell) = self.earliest_cell(level, slot) {
+            cell.set(survivor_min);
         }
     }
 
     /// Pulls overflow entries that have come within the wheel's reach.
+    ///
+    /// Only those strictly earlier than the threshold placement evicts at.
+    /// Reclaiming the boundary itself would hand back an entry that placement
+    /// returns at once, on every call for as long as the cursor sits there.
     fn check_overflow(&mut self) {
         if self.overflow.is_empty() {
             return;
         }
         let threshold = self.current_time() + Duration::from_millis(self.reach);
-        // Strictly earlier than the threshold placement evicts at. Reclaiming
-        // the boundary itself hands back an entry that placement returns
-        // immediately, once per call for as long as the cursor sits there.
         let due: Vec<Instant> = self.overflow.range(..threshold).map(|(k, _)| *k).collect();
         for key in due {
             if let Some(bucket) = self.overflow.remove(&key) {
@@ -728,6 +718,9 @@ impl<T, P: Policy> TimingWheel<T, P> {
     /// taken. A caller draining on every poll should prefer this to
     /// [`TimingWheel::drain_expired`], which allocates a vector per call to
     /// hand back an iterator.
+    ///
+    /// Nothing on this path may register an entry: the pending list is cleared
+    /// at the end, so anything appended while draining would be lost.
     pub fn drain_expired_into(&mut self, out: &mut Vec<(Key, T)>) {
         let due = self.expired.len();
         for i in 0..due {
@@ -738,9 +731,6 @@ impl<T, P: Policy> TimingWheel<T, P> {
                 }
             }
         }
-        // The bound above was read once. Nothing on this path re-registers an
-        // entry, but were that to change, anything appended behind us would be
-        // cleared without ever being handed back.
         debug_assert_eq!(
             self.expired.len(),
             due,

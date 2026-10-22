@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! The contract, over every combination of layout and policy.
 //!
 //! A policy is a set of associated constants, so each combination is a
@@ -15,8 +15,6 @@ use std::{
     marker::PhantomData,
     time::{Duration, Instant},
 };
-
-// ---- the axes -----------------------------------------------------------
 
 trait Layout {
     const NAME: &'static str;
@@ -40,7 +38,8 @@ trait Spill {
 }
 
 macro_rules! layouts {
-    ($($name:ident: $slots:expr, $res:expr;)*) => {$(
+    ($($(#[$doc:meta])* $name:ident: $slots:expr, $res:expr;)*) => {$(
+        $(#[$doc])*
         struct $name;
         impl Layout for $name {
             const NAME: &'static str = stringify!($name);
@@ -51,19 +50,19 @@ macro_rules! layouts {
 }
 
 layouts! {
-    // One level: no cascading at all, everything either fits or overflows.
+    /// One level: no cascading at all, everything either fits or overflows.
     Flat:        [64], [1];
-    // Two levels, the smallest shape that cascades.
+    /// Two levels, the smallest shape that cascades.
     Tiny:        [2, 2], [1, 2];
-    // Deep and narrow: eight levels of two slots, so an entry cascades seven
-    // times on its way in. Maximises the moves a handle has to survive.
+    /// Deep and narrow: eight levels of two slots, so an entry cascades seven
+    /// times on its way in. Maximises the moves a handle has to survive.
     Deep:        [2, 2, 2, 2, 2, 2, 2, 2], [1, 2, 4, 8, 16, 32, 64, 128];
-    // Wide and shallow: one cascade, but a thousand slots to search.
+    /// Wide and shallow: one cascade, but a thousand slots to search.
     Wide:        [1024, 1024], [1, 1024];
-    // Uneven, because equal levels can hide an arithmetic mistake that only
-    // shows when the levels differ.
+    /// Uneven, because equal levels can hide an arithmetic mistake that only
+    /// shows when the levels differ.
     Uneven:      [256, 8, 64, 4], [1, 256, 2048, 131_072];
-    // What a reactor uses.
+    /// What a reactor uses.
     Realistic:   [256, 64, 64, 64], [1, 256, 16_384, 1_048_576];
 }
 
@@ -108,8 +107,6 @@ fn name<L: Layout, R: Round, Q: Query, S: Spill>() -> String {
     format!("{}/{}/{}/{}", L::NAME, R::NAME, Q::NAME, S::NAME)
 }
 
-// ---- the property -------------------------------------------------------
-
 fn xorshift(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;
@@ -119,13 +116,16 @@ fn xorshift(state: &mut u64) -> u64 {
     x
 }
 
+/// Random traffic against one combination.
+///
+/// A wheel two slots deep reaches four ticks; one 256 wide reaches hours. So
+/// deadlines are drawn against the wheel's own reach, inside it, around its
+/// edge and past it, and every layout is exercised across its whole range
+/// instead of overflowing immediately.
 fn exercise<L: Layout, R: Round, Q: Query, S: Spill>(seeds: u64) {
     let label = name::<L, R, Q, S>();
     type P<L, R, Q, S> = Combo<L, R, Q, S>;
 
-    // A wheel two slots deep reaches four ticks; one 256 wide reaches hours.
-    // Draw deadlines against the wheel's own reach so every layout is
-    // exercised across its whole range instead of overflowing immediately.
     let reach = L::RESOLUTION[L::RESOLUTION.len() - 1] * L::SLOTS[L::SLOTS.len() - 1] as u64;
 
     for seed in 1..=seeds {
@@ -138,7 +138,6 @@ fn exercise<L: Layout, R: Round, Q: Query, S: Spill>(seeds: u64) {
         for step in 0..200 {
             match xorshift(&mut rng) % 10 {
                 0..=4 => {
-                    // Inside the wheel, around its edge, and past it.
                     let micros = match xorshift(&mut rng) % 4 {
                         0 => xorshift(&mut rng) % 1_500,
                         1 => xorshift(&mut rng) % (reach * 1_000).max(2),
@@ -201,7 +200,6 @@ fn exercise<L: Layout, R: Round, Q: Query, S: Spill>(seeds: u64) {
             }
         }
 
-        // Everything still held is accounted for, and nothing leaked.
         assert_eq!(
             wheel.len(),
             live.len(),

@@ -2239,13 +2239,19 @@ fn queue_request_into_ring(
     }
 }
 
-/// Closes the descriptors `async_close` queued that never reached the ring.
+/// Closes the descriptors `async_close` queued that never reached a ring.
 impl Drop for Reactor {
     fn drop(&mut self) {
-        let queue = self.main_ring.get_mut().submission_queue();
-        for op in queue.borrow().submissions.iter() {
-            if let (UringOpDescriptor::Close, 0) = (&op.args, op.user_data) {
-                let _ = nix::unistd::close(op.fd);
+        let queues = [
+            self.main_ring.get_mut().submission_queue(),
+            self.latency_ring.get_mut().submission_queue(),
+            self.poll_ring.get_mut().submission_queue(),
+        ];
+        for queue in queues {
+            for op in queue.borrow().submissions.iter() {
+                if let (UringOpDescriptor::Close, 0) = (&op.args, op.user_data) {
+                    let _ = nix::unistd::close(op.fd);
+                }
             }
         }
     }
@@ -2428,6 +2434,46 @@ mod tests {
         if x.uring_buffer_id().is_some() {
             unreachable!("Expected non-uring buffer")
         }
+    }
+
+    /// A close still queued on any of the three rings is made when the
+    /// reactor drops.
+    #[test]
+    fn dropped_reactor_closes_queued_descriptors_on_every_ring() {
+        let dir = crate::test_utils::make_tmp_test_directory(
+            "dropped_reactor_closes_queued_descriptors_on_every_ring",
+        );
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let mut reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+
+        let queues = [
+            ("main", reactor.main_ring.get_mut().submission_queue()),
+            ("latency", reactor.latency_ring.get_mut().submission_queue()),
+            ("poll", reactor.poll_ring.get_mut().submission_queue()),
+        ];
+        let paths: Vec<_> = queues
+            .into_iter()
+            .map(|(ring, queue)| {
+                let path = dir.path.join(ring);
+                let fd = std::os::fd::IntoRawFd::into_raw_fd(std::fs::File::create(&path).unwrap());
+                queue.borrow_mut().submissions.push_back(UringDescriptor {
+                    args: UringOpDescriptor::Close,
+                    fd,
+                    flags: squeue::Flags::empty(),
+                    user_data: 0,
+                });
+                std::fs::canonicalize(path).unwrap()
+            })
+            .collect();
+        drop(reactor);
+
+        let open: Vec<_> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|f| std::fs::canonicalize(f.unwrap().path()).ok())
+            .filter(|f| paths.contains(f))
+            .collect();
+        assert!(open.is_empty(), "still open: {open:?}");
     }
 
     /// Enqueues three nops. The second is soft-linked to the third.

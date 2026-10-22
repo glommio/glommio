@@ -1514,7 +1514,23 @@ pub(crate) mod test {
             .dma_open(path)
             .await
             .expect("failed to create file");
+        fill_dma_file(new_file, bytes).await
+    }
 
+    /// An anonymous file the kernel removes once it is closed, so a test that
+    /// needs no name needs no directory of its own either.
+    async fn write_tmp_dma_file(bytes: usize) -> DmaFile {
+        let new_file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .tmpfile(true)
+            .dma_open(std::env::temp_dir())
+            .await
+            .expect("failed to create file");
+        fill_dma_file(new_file, bytes).await
+    }
+
+    async fn fill_dma_file(new_file: DmaFile, bytes: usize) -> DmaFile {
         let mut buf = new_file.alloc_dma_buffer(bytes);
         for x in 0..bytes {
             buf.as_bytes_mut()[x] = x as u8;
@@ -1711,9 +1727,8 @@ pub(crate) mod test {
     #[test]
     fn read_many_waits_for_a_pending_stream() {
         finishes_within(5, || {
-            let dir = make_test_directories("dma-read-many-pending").remove(0);
             test_executor!(async move {
-                let file = Rc::new(write_dma_file(dir.path.join("testfile"), 4096).await);
+                let file = Rc::new(write_tmp_dma_file(4096).await);
                 let (tx, rx) = crate::channels::local_channel::new_unbounded::<(u64, usize)>();
                 crate::spawn_local(async move {
                     sleep(Duration::from_millis(10)).await;
@@ -1740,9 +1755,8 @@ pub(crate) mod test {
     #[test]
     fn read_many_reads_before_the_next_request_arrives() {
         finishes_within(5, || {
-            let dir = make_test_directories("dma-read-many-in-turn").remove(0);
             test_executor!(async move {
-                let file = Rc::new(write_dma_file(dir.path.join("testfile"), 4096).await);
+                let file = Rc::new(write_tmp_dma_file(4096).await);
                 let (tx, rx) = crate::channels::local_channel::new_unbounded::<(u64, usize)>();
                 tx.try_send((0, 512)).unwrap();
                 let mut results = file.read_many(

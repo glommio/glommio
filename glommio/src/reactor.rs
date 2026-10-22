@@ -818,13 +818,16 @@ impl Reactor {
     }
 
     /// Processes new events, blocking until the first event or the timeout.
-    pub(crate) fn react(&self, timeout: impl Fn() -> Option<Duration>) -> io::Result<bool> {
+    pub(crate) fn react(
+        &self,
+        timeout: impl Fn() -> Option<Duration>,
+        may_sleep: bool,
+    ) -> io::Result<bool> {
         let (next_timer, woke) = self.process_external_events();
 
-        match self
-            .sys
-            .wait(timeout, next_timer, woke, || self.process_shared_channels())
-        {
+        match self.sys.wait(timeout, next_timer, may_sleep, woke, || {
+            self.process_shared_channels()
+        }) {
             Ok(true) => {
                 self.process_external_events();
                 Ok(true)

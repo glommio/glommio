@@ -14,12 +14,15 @@ use std::{
 use intrusive_collections::{
     container_of, linked_list::LinkOps, offset_of, Adapter, LinkedList, LinkedListLink, PointerOps,
 };
+use pin_project::{pin_project, pinned_drop};
 use std::{marker::PhantomPinned, ptr::NonNull, rc::Rc};
 
 type Result<T> = crate::error::Result<T, ()>;
 
+#[pin_project(PinnedDrop)]
 #[derive(Debug)]
 struct Waiter<'a> {
+    #[pin]
     node: WaiterNode,
     semaphore: &'a Semaphore,
 }
@@ -154,15 +157,14 @@ impl<'a> Waiter<'a> {
     }
 }
 
-impl Drop for Waiter<'_> {
-    fn drop(&mut self) {
-        if self.node.woken.get() {
-            process_wakes(self.semaphore, 0);
-        } else if self.node.link.is_linked() {
-            // If node is linked that is for sure is pinned so that is safe
-            // to make it pinned directly
-            let waiter_node = unsafe { Pin::new_unchecked(&mut self.node) };
-            Self::remove_from_waiting_queue(waiter_node, &mut self.semaphore.state.borrow_mut())
+#[pinned_drop]
+impl PinnedDrop for Waiter<'_> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if this.node.woken.get() {
+            process_wakes(this.semaphore, 0);
+        } else if this.node.link.is_linked() {
+            Waiter::remove_from_waiting_queue(this.node, &mut this.semaphore.state.borrow_mut())
         }
     }
 }
@@ -171,10 +173,9 @@ impl Future for Waiter<'_> {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut sem_state = self.semaphore.state.borrow_mut();
-        let future_mut = unsafe { self.get_unchecked_mut() };
-
-        let waiter_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
+        let this = self.project();
+        let mut sem_state = this.semaphore.state.borrow_mut();
+        let waiter_node = this.node;
 
         waiter_node.woken.set(false);
         let units = waiter_node.units;

@@ -315,6 +315,59 @@ impl BufRing {
     }
 }
 
+/// Rung 2b: speculate first, then let the ring do the read.
+///
+/// The shape a runtime would actually ship: `yolo_recv` still wins outright
+/// when data is already buffered (a streaming reader), and when it is not,
+/// the `PollAdd` and the second `recv` collapse into one `Recv`.
+fn run_hybrid() {
+    let peers = peers();
+    let mut ring: IoUring = IoUring::new(1024).unwrap();
+    let mut buffers = vec![[0u8; BUF_LEN]; CONNECTIONS];
+    let mut probe = [0u8; BUF_LEN];
+    let mut cpu = Duration::ZERO;
+
+    for round in 0..WARMUP + ROUNDS {
+        let counted = round >= WARMUP;
+        let cpu_start = thread_cpu();
+
+        let mut waiting = 0;
+        for (index, fd) in peers.server_fds.iter().enumerate() {
+            // Empty every time here, which is the regime under test; a
+            // streaming reader would take this branch and stop.
+            if recv_now(*fd, &mut probe).is_none() {
+                let recv = opcode::Recv::new(Fd(*fd), buffers[index].as_mut_ptr(), BUF_LEN as u32)
+                    .build()
+                    .user_data(index as u64);
+                unsafe { ring.submission().push(&recv).unwrap() };
+                waiting += 1;
+            }
+        }
+        ring.submit().unwrap();
+        if counted {
+            cpu += thread_cpu() - cpu_start;
+        }
+
+        peers.speak();
+
+        let cpu_start = thread_cpu();
+        let mut received = 0;
+        while received < waiting {
+            ring.submit_and_wait(1).unwrap();
+            for completion in ring.completion().collect::<Vec<cqueue::Entry>>() {
+                assert_eq!(completion.result(), MSG.len() as i32);
+                received += 1;
+            }
+        }
+        if counted {
+            cpu += thread_cpu() - cpu_start;
+        }
+    }
+
+    peers.finish();
+    report("speculate, then Recv (no second syscall)", cpu);
+}
+
 /// Rung 3: armed once per connection, then nothing but completions.
 fn run_multishot() {
     let peers = peers();
@@ -369,8 +422,18 @@ fn run_multishot() {
     report("multishot recv + provided buffers (0 syscalls)", cpu);
 }
 
-/// Rung 4: the library.
-fn run_glommio() {
+/// Rung 4: the library, on both of its read paths.
+///
+/// The unbuffered path speculates and falls back to readiness. The buffered
+/// path owns its receive buffer, which is what makes a completion read sound,
+/// so only it can take one.
+///
+/// One task per connection, all parked in `read` before the writer speaks --
+/// the same regime as the hand-written rungs. Reading the connections in a
+/// loop from a single task is *not* the same thing: by the time such a loop
+/// reaches connection 200 the data is already there, the speculation succeeds,
+/// and the rung silently measures the easy case.
+fn run_glommio(buffered: bool) {
     use futures_lite::io::AsyncReadExt;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -402,32 +465,157 @@ fn run_glommio() {
             let listener = glommio::net::TcpListener::bind(addr).unwrap();
             let mut streams = Vec::with_capacity(CONNECTIONS);
             for _ in 0..CONNECTIONS {
-                streams.push(listener.accept().await.unwrap());
+                let stream = listener.accept().await.unwrap();
+                streams.push(if buffered {
+                    Reader::Buffered(stream.buffered())
+                } else {
+                    Reader::Plain(stream)
+                });
             }
             armed_tx.send(()).unwrap();
 
+            // Each reader reports every message it takes, so the driver knows
+            // when all of them are parked again and it is safe to ask for the
+            // next round.
+            let (done, finished) = glommio::channels::local_channel::new_unbounded();
+            let done = std::rc::Rc::new(done);
+            let readers: Vec<_> = streams
+                .into_iter()
+                .map(|mut reader| {
+                    let done = done.clone();
+                    glommio::spawn_local(async move {
+                        let mut buf = [0u8; BUF_LEN];
+                        for _ in 0..WARMUP + ROUNDS {
+                            let read = match &mut reader {
+                                Reader::Plain(stream) => stream.read(&mut buf).await.unwrap(),
+                                Reader::Buffered(stream) => stream.read(&mut buf).await.unwrap(),
+                            };
+                            assert_eq!(read, MSG.len());
+                            done.try_send(()).unwrap();
+                        }
+                    })
+                    .detach()
+                })
+                .collect();
+            drop(done);
+
             let mut cpu = Duration::ZERO;
+            let mut counted_from = None;
             for round in 0..WARMUP + ROUNDS {
-                write_now.send(()).unwrap();
-                let cpu_start = thread_cpu();
-                let mut buf = [0u8; BUF_LEN];
-                for stream in streams.iter_mut() {
-                    let read = stream.read(&mut buf).await.unwrap();
-                    assert_eq!(read, MSG.len());
+                if round == WARMUP {
+                    counted_from = Some(thread_cpu());
                 }
-                if round >= WARMUP {
-                    cpu += thread_cpu() - cpu_start;
+                write_now.send(()).unwrap();
+                for _ in 0..CONNECTIONS {
+                    finished.recv().await.unwrap();
                 }
             }
+            cpu += thread_cpu() - counted_from.unwrap();
+
             drop(write_now);
+            for reader in readers {
+                reader.await;
+            }
             cpu
         })
+        .unwrap()
+        .join()
         .unwrap();
 
     armed.recv().unwrap();
-    let cpu = cpu.join().unwrap();
     let _ = writer.join();
-    report("glommio TcpStream::read", cpu);
+    report(
+        if buffered {
+            "glommio TcpStream::read, buffered"
+        } else {
+            "glommio TcpStream::read, unbuffered"
+        },
+        cpu,
+    );
+}
+
+enum Reader {
+    Plain(glommio::net::TcpStream),
+    Buffered(glommio::net::TcpStream<glommio::net::Preallocated>),
+}
+
+/// The other regime: one connection with data always waiting.
+///
+/// This is where speculation earns its keep, and where turning every read
+/// into a submission would be a regression. Reported per 64 KiB read rather
+/// than per message.
+fn run_glommio_streaming(buffered: bool) {
+    use futures_lite::io::AsyncReadExt;
+
+    const CHUNK: usize = 64 * 1024;
+    const CHUNKS: usize = 4096;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let writer = std::thread::spawn(move || {
+        pin(CPU_CLIENT);
+        let mut client = TcpStream::connect(addr).unwrap();
+        let payload = vec![b'x'; CHUNK];
+        for _ in 0..CHUNKS {
+            client.write_all(&payload).unwrap();
+        }
+    });
+
+    let (stream, _) = listener.accept().unwrap();
+    let fd = stream.as_raw_fd();
+    std::mem::forget(stream);
+
+    let cpu = glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(CPU_SERVER))
+        .spawn(move || async move {
+            let stream = unsafe {
+                <glommio::net::TcpStream as std::os::unix::io::FromRawFd>::from_raw_fd(fd)
+            };
+            let mut reader = if buffered {
+                Reader::Buffered(stream.buffered())
+            } else {
+                Reader::Plain(stream)
+            };
+
+            let mut buf = vec![0u8; CHUNK];
+            let mut taken = 0usize;
+            let mut cpu = Duration::ZERO;
+            let target = CHUNK * CHUNKS;
+            let mut counted_from = None;
+
+            while taken < target {
+                if counted_from.is_none() && taken > target / 8 {
+                    counted_from = Some(thread_cpu()); // warm-up discarded
+                }
+                let read = match &mut reader {
+                    Reader::Plain(stream) => stream.read(&mut buf).await.unwrap(),
+                    Reader::Buffered(stream) => stream.read(&mut buf).await.unwrap(),
+                };
+                if read == 0 {
+                    break;
+                }
+                taken += read;
+            }
+            if let Some(start) = counted_from {
+                cpu += thread_cpu() - start;
+            }
+            (cpu, taken)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let _ = writer.join();
+    let (cpu, taken) = cpu;
+    println!(
+        "{:<48} {:>8.0} ns cpu / 64KiB",
+        if buffered {
+            "streaming, buffered"
+        } else {
+            "streaming, unbuffered"
+        },
+        cpu.as_nanos() as f64 / (taken as f64 / CHUNK as f64)
+    );
 }
 
 fn main() {
@@ -435,6 +623,11 @@ fn main() {
     println!("{MESSAGES} messages across {CONNECTIONS} connections, data arriving after the read is posted\n");
     run_readiness();
     run_single_shot();
+    run_hybrid();
     run_multishot();
-    run_glommio();
+    run_glommio(false);
+    run_glommio(true);
+    println!();
+    run_glommio_streaming(false);
+    run_glommio_streaming(true);
 }

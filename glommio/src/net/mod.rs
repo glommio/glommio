@@ -136,11 +136,14 @@ fn yolo_sendmsg(
     }
 }
 
+#[cfg(test)]
+mod completion_read_tests;
 mod datagram;
 mod stream;
 mod tcp_socket;
 mod udp_socket;
 mod unix;
+pub(crate) use self::stream::OwnedRxBuf;
 pub use self::{
     stream::{Buffered, Preallocated},
     tcp_socket::{AcceptedTcpStream, TcpListener, TcpStream},

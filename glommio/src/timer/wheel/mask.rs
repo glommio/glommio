@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! Which slots of a level hold anything.
 //!
 //! Finding the next occupied slot is on the path a caller takes before every
@@ -36,16 +36,17 @@ impl SlotMask {
 
     /// How many slots ahead of `from` the first occupied one lies, wrapping
     /// once. `None` when the level is empty.
+    ///
+    /// One pass over the words from `from`, then the starting word once more,
+    /// which is where a search that wrapped ends up. That last visit needs no
+    /// mask of its own: reaching it means the first visit found nothing at or
+    /// above `from`, so only the bits below it can be set.
     pub(crate) fn distance_to_next(&self, from: usize) -> Option<usize> {
         debug_assert!(from < self.slots);
         let words = self.words.len();
         let first = from / 64;
         let bit = from % 64;
 
-        // One pass over the words from `from`, then the starting word once
-        // more, which is where a search that wrapped ends up. That last visit
-        // needs no mask of its own: reaching it means the first visit found
-        // nothing at or above `from`, so only the bits below it can be set.
         for step in 0..=words {
             let index = (first + step) % words;
             let mut word = self.words[index];

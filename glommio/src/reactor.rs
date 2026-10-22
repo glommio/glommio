@@ -747,11 +747,11 @@ impl Reactor {
     }
 
     /// Wakes everything that has come due, and says how many that was.
+    ///
+    /// The wakers are collected under the `timers` borrow and woken after it
+    /// ends, since one that arms or cancels a timer would otherwise re-enter
+    /// and panic on the second borrow.
     fn process_timers(&self) -> usize {
-        // Collect first, wake after. `timers` is a RefCell, so a waker that
-        // arms or cancels a timer while we still hold it re-enters and panics
-        // on the second borrow. The scratch buffer is kept across calls so a
-        // batch of expiries costs no allocation.
         let mut scratch = std::mem::take(&mut *self.timer_wakers.borrow_mut());
         debug_assert!(
             scratch.is_empty(),

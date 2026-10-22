@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! What a wheel is allowed to decide for itself, and what the caller decides.
 
 /// Where a deadline that falls between two ticks is placed.
@@ -92,6 +92,11 @@ impl Policy for Millis {
 
 /// Checked once when a wheel is built, so a layout that would be silently slow
 /// or silently wrong cannot produce a wheel at all.
+///
+/// Powers of two make the division by a resolution and the remainder by a slot
+/// count on every insertion a shift and a mask. Each level must span exactly
+/// what the one below it covers, or cascading either loses deadlines or visits
+/// them twice.
 pub(crate) fn validate<P: Policy>() {
     assert_eq!(
         P::SLOTS.len(),
@@ -102,10 +107,6 @@ pub(crate) fn validate<P: Policy>() {
     assert_eq!(P::RESOLUTION[0], 1, "the finest level spans one tick");
 
     for (level, (&slots, &resolution)) in P::SLOTS.iter().zip(P::RESOLUTION).enumerate() {
-        // Powers of two are not a style preference. The hot path divides by a
-        // resolution and takes a remainder by a slot count on every insertion;
-        // as powers of two those are a shift and a mask, and the layout can
-        // then be a runtime value without costing anything against constants.
         assert!(
             slots.is_power_of_two(),
             "level {level} has {slots} slots, which is not a power of two"
@@ -115,8 +116,6 @@ pub(crate) fn validate<P: Policy>() {
             "level {level} spans {resolution} ticks, which is not a power of two"
         );
         if level > 0 {
-            // Each level must span exactly what the one below it covers, or
-            // cascading either loses deadlines or visits them twice.
             let below = P::RESOLUTION[level - 1] * P::SLOTS[level - 1] as u64;
             assert_eq!(
                 resolution, below,

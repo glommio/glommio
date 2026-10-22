@@ -1,10 +1,10 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! The reactor's view of the timer wheel.
 //!
 //! Thin on purpose. The wheel owns its entries and knows where each one sits,
-//! so this layer holds no index of its own — an earlier version kept a
+//! so this layer holds no index of its own. An earlier version kept a
 //! parallel `HashMap` from timer to deadline and answered "when is the next
 //! timer" by scanning it, which made every poll cost the whole population.
 
@@ -92,7 +92,7 @@ impl Default for ReactorTimers {
 mod tests {
     use super::*;
 
-    // Helper: a waker that does nothing when woken.
+    /// A waker that does nothing when woken.
     fn dummy_waker() -> Waker {
         Waker::noop().clone()
     }
@@ -102,18 +102,15 @@ mod tests {
         let mut timers = ReactorTimers::new();
         let now = Instant::now();
 
-        // Insert a timer and get ID
         let _id = timers.insert(now + Duration::from_millis(100), dummy_waker());
         assert_eq!(timers.len(), 1);
 
-        // Process before expiry - should not wake
         let mut wakers = Vec::new();
         timers.process_timers(&mut wakers);
         assert_eq!(wakers.len(), 0);
         assert!(timers.next_timer().is_some());
         assert_eq!(timers.len(), 1);
 
-        // Wait and process after expiry
         std::thread::sleep(Duration::from_millis(150));
         wakers.clear();
         timers.process_timers(&mut wakers);
@@ -126,15 +123,12 @@ mod tests {
         let mut timers = ReactorTimers::new();
         let now = Instant::now();
 
-        // Insert and get ID
         let id = timers.insert(now + Duration::from_millis(100), dummy_waker());
         assert_eq!(timers.len(), 1);
 
-        // Remove the timer using ID
         assert!(timers.remove(id).is_some());
         assert_eq!(timers.len(), 0);
 
-        // Try to remove again with same ID - should return false
         assert!(timers.remove(id).is_none());
     }
 
@@ -162,19 +156,15 @@ mod tests {
         let mut timers = ReactorTimers::new();
         let now = Instant::now();
 
-        // Insert multiple timers
         let id1 = timers.insert(now + Duration::from_millis(100), dummy_waker());
         let id2 = timers.insert(now + Duration::from_millis(200), dummy_waker());
         let id3 = timers.insert(now + Duration::from_millis(300), dummy_waker());
 
         assert_eq!(timers.len(), 3);
 
-        // Remove one timer
         assert!(timers.remove(id2).is_some());
         assert_eq!(timers.len(), 2);
 
-        // The two that were not withdrawn are still withdrawable; the one
-        // that was is not.
         assert!(timers.remove(id2).is_none(), "already gone");
         assert!(timers.remove(id1).is_some());
         assert!(timers.remove(id3).is_some());

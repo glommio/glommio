@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! The wheel's contract, held under randomized traffic.
 //!
 //! Two halves, and only one is obvious. Under `Rounding::Up` an entry may
@@ -54,6 +54,12 @@ fn xorshift(state: &mut u64) -> u64 {
     x
 }
 
+/// Random traffic against one policy.
+///
+/// Deadlines come in three bands, since one modulus cannot reach both a
+/// millisecond and the far end of the wheel. Each expiry is held to the
+/// earliness its rounding promises: none rounding up, at most a tick rounding
+/// down, and half a tick to the nearest, for which a tick is a safe bound.
 fn contract_holds<P: Policy>(name: &str, seeds: u64) {
     for seed in 1..=seeds {
         let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -65,8 +71,6 @@ fn contract_holds<P: Policy>(name: &str, seeds: u64) {
         for step in 0..400 {
             match xorshift(&mut rng) % 10 {
                 0..=4 => {
-                    // Three bands: one modulus cannot reach both a millisecond
-                    // and the far end of the wheel.
                     let micros = match xorshift(&mut rng) % 3 {
                         0 => xorshift(&mut rng) % 4_000,
                         1 => xorshift(&mut rng) % 90_000_000,
@@ -102,16 +106,9 @@ fn contract_holds<P: Policy>(name: &str, seeds: u64) {
                     for (key, _) in drained {
                         if let Some(pos) = live.iter().position(|(k, _)| *k == key) {
                             let (_, deadline) = live.swap_remove(pos);
-                            // How early an entry may expire is exactly what
-                            // the rounding policy decides, so each one gets
-                            // the bound it promises rather than a shared one.
                             let allowed_early = match P::ROUNDING {
                                 Rounding::Up => Duration::ZERO,
-                                // A deadline moves down to the tick below it,
-                                // so at most one whole tick early.
                                 Rounding::Down => Duration::from_millis(1),
-                                // ...and to the nearer of the two, so at most
-                                // half a tick, but a tick is a safe bound.
                                 Rounding::Nearest => Duration::from_millis(1),
                             };
                             assert!(
@@ -168,7 +165,6 @@ fn rejecting_overflow_refuses_what_it_cannot_hold_and_nothing_else() {
     let start = Instant::now();
     let mut wheel: TimingWheel<u64, Bounded> = TimingWheel::starting_at(start);
 
-    // The wheel's reach is one revolution of its coarsest level.
     let reach = Duration::from_millis(
         Bounded::RESOLUTION[Bounded::RESOLUTION.len() - 1]
             * Bounded::SLOTS[Bounded::SLOTS.len() - 1] as u64,

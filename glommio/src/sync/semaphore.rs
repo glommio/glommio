@@ -5,7 +5,7 @@
 //!
 use crate::error::{GlommioError, ResourceType};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     future::Future,
     pin::Pin,
     task::{Context, Poll, Waker},
@@ -29,6 +29,8 @@ struct WaiterNode {
     link: LinkedListLink,
     units: u64,
     waker: RefCell<Option<Waker>>,
+    /// Woken by a release and unlinked, but not yet polled.
+    woken: Cell<bool>,
 
     // Waiter node can not be `Unpin` so its pointer could be used inside intrusive
     // collections, it also can not outlive the container which is guaranteed by the
@@ -109,6 +111,7 @@ impl<'a> Waiter<'a> {
                 link: LinkedListLink::new(),
                 units,
                 waker: RefCell::new(None),
+                woken: Cell::new(false),
                 _p: PhantomPinned,
             },
             semaphore,
@@ -153,7 +156,9 @@ impl<'a> Waiter<'a> {
 
 impl Drop for Waiter<'_> {
     fn drop(&mut self) {
-        if self.node.link.is_linked() {
+        if self.node.woken.get() {
+            process_wakes(self.semaphore, 0);
+        } else if self.node.link.is_linked() {
             // If node is linked that is for sure is pinned so that is safe
             // to make it pinned directly
             let waiter_node = unsafe { Pin::new_unchecked(&mut self.node) };
@@ -171,6 +176,7 @@ impl Future for Waiter<'_> {
 
         let waiter_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
 
+        waiter_node.woken.set(false);
         let units = waiter_node.units;
         match sem_state.try_acquire(units) {
             Err(x) => {
@@ -321,6 +327,7 @@ fn process_wakes(sem: &Semaphore, units: u64) {
                     panic!("Future was linked into the waiting list without a waker");
                 }
 
+                node.woken.set(true);
                 available_units -= node.units;
             }
         } else {
@@ -696,6 +703,11 @@ mod test {
     use std::{
         cell::Cell,
         rc::Rc,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        task::Wake,
         time::{Duration, Instant},
     };
 
@@ -947,6 +959,37 @@ mod test {
 
             semaphore.acquire(1).await.unwrap();
         });
+    }
+
+    #[derive(Default)]
+    struct WakeFlag(AtomicBool);
+
+    impl Wake for WakeFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn dropping_a_woken_waiter_wakes_the_next() {
+        let sem = Semaphore::new(0);
+        let mut first = Box::pin(sem.acquire(1));
+        let mut second = Box::pin(sem.acquire(1));
+        let flag = Arc::new(WakeFlag::default());
+        let waker = Waker::from(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut noop = Context::from_waker(Waker::noop());
+        assert!(first.as_mut().poll(&mut noop).is_pending());
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+
+        sem.signal(1);
+        drop(first);
+
+        assert!(
+            flag.0.load(Ordering::Relaxed),
+            "the second waiter was never woken"
+        );
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
     }
 
     #[test]

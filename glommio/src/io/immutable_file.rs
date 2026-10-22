@@ -531,6 +531,25 @@ mod test {
         stream.close().await.unwrap();
     });
 
+    immutable_file_test!(seal_after_cancelled_write, path, {
+        let fname = path.join("testfile");
+        let mut immutable = ImmutableFileBuilder::new(&fname)
+            .with_buffer_size(4096)
+            .with_sequential_concurrency(1)
+            .build_sink()
+            .await
+            .unwrap();
+
+        let data = [7u8; 3 * 4096];
+        {
+            let mut write = Box::pin(immutable.write_all(&data));
+            assert!(futures_lite::future::poll_once(&mut write).await.is_none());
+        }
+        let sealed = immutable.seal().await.unwrap();
+        assert_eq!(sealed.file_size(), 4096);
+        sealed.close().await.unwrap();
+    });
+
     immutable_file_test!(seal_and_random, path, {
         let fname = path.join("testfile");
         let mut immutable = ImmutableFileBuilder::new(fname).build_sink().await.unwrap();

@@ -384,10 +384,10 @@ mod tests {
         })
     }
 
-    #[test]
     /// Even if the task is immediately cancelled, the gate still closes and
     /// stays marked as closing; the test installs a waiter after the aborted
     /// cancel.
+    #[test]
     fn test_marked_closed_without_waiting() {
         LocalExecutor::default().run(async {
             let gate = Gate::new();

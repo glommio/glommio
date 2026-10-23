@@ -119,8 +119,7 @@ unsafe impl Adapter for WaiterAdapter {
         container_of!(link.as_ptr(), WaiterNode, link)
     }
 
-    /// The null check is performed above, so the unchecked `NonNull`
-    /// construction is sound.
+    #[allow(no_comments_allowed)]
     unsafe fn get_link(
         &self,
         value: *const <Self::PointerOps as PointerOps>::Value,
@@ -130,6 +129,7 @@ unsafe impl Adapter for WaiterAdapter {
         }
 
         let ptr = (value as *const u8).add(offset_of!(WaiterNode, link));
+        // The null check is performed above, so the unchecked construction is safe.
         core::ptr::NonNull::new_unchecked(ptr as *mut _)
     }
 
@@ -799,23 +799,33 @@ impl<T> RwLock<T> {
     ///
     /// All tasks are woken up in the fair order (in the order of acquiring
     /// of the lock) if that matters. That allows to avoid lock starvation
-    /// as much as possible. When both readers and a writer are queued, all
-    /// readers plus the first writer are woken: they will likely execute in
-    /// order, so all get a chance to proceed.
+    /// as much as possible.
+    #[allow(no_comments_allowed)]
     fn wake_up_fibers(rw: &mut State) {
         if rw.readers == 0 && rw.writers == 0 {
             if rw.queued_writers == 0 {
+                // Only readers are waiting in the queue and no one holding a lock
+                // wake up all of them
                 Self::wake_up_all_fibers(rw);
             } else {
+                // There are some writers waiting into the queue so wake up all readers and
+                // single writer no one holding the lock, so likely they will be
+                // executed in order so all will have a chance to proceed
                 Self::wake_up_readers_and_first_writer(rw);
             }
         } else if rw.writers == 0 {
             if rw.queued_writers == 0 {
+                // Only readers in the waiting queue and some readers holding the lock
+                // wake up all of them
                 Self::wake_up_all_fibers(rw);
             } else {
+                // There are both readers and writers in the queue
+                // so only readers are awakened
                 Self::wake_up_all_readers_till_first_writer(rw);
             }
         }
+        // The only option left that some writers still holding the lock
+        // so no reason to try to wake up anyone.
     }
 
     fn wake_up_all_readers_till_first_writer(rw: &mut State) {

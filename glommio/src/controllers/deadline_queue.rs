@@ -386,18 +386,14 @@ impl<T: 'static> DeadlineQueue<T> {
     ///     DeadlineQueue::<usize>::new("example", Duration::from_millis(250));
     /// });
     /// ```
-    ///
-    /// We could always dispatch into the latency queue, but since that
-    /// effectively means putting requests in a different io_uring we'll
-    /// avoid doing that unless the process is very sensitive. Because of
-    /// dead time it wouldn't be a bad idea to even have a minimum here. But
-    /// we'll just document it and leave it to the user.
-    ///
-    /// Internally, a spawned task executes each queued action and then pops
-    /// it from the queue, regardless of whether it succeeded.
     #[allow(no_comments_allowed)]
     pub fn new(name: &'static str, adjustment_period: Duration) -> DeadlineQueue<T> {
         let queue = Rc::new(InnerQueue::new(adjustment_period));
+        // We could always dispatch into the latency queue, but since that effectively
+        // means putting requests in a different io_uring we'll avoid doing that
+        // unless the process is very sensitive. Because of dead time it
+        // wouldn't be a bad idea to even have a minimum here. But we'll just
+        // document it and leave it to the user.
         let lat = {
             if adjustment_period < Duration::from_millis(100) {
                 Latency::Matters(adjustment_period)
@@ -421,14 +417,19 @@ impl<T: 'static> DeadlineQueue<T> {
                 let mut stream = receiver.stream();
                 while let Some(request) = stream.next().await {
                     let res = request.action().await;
+                    // now that we have executed the action, pop it from
+                    // the queue. We must do it regardless of whether we succeeded.
+                    //
+                    // It is legal for the queue not to be present anymore in
+                    // case the DeadlineQueue itself was destroyed after the action
+                    // was done. But if it does exist we expect to be able to pop
+                    // the element: so we unwrap() pop_front().
+                    //
+                    // Note that because this is a queue with concurrency of one we
+                    // can safely pop_front(). If we ever do this with higher concurrency
+                    // (very unlikely), then we need to move to a more complex data structure.
                     if let Some(queue) = queue_weak.upgrade() {
                         let mut queue = queue.queue.borrow_mut();
-                        // The queue is expected to be present here unless the
-                        // `DeadlineQueue` itself was destroyed after the action
-                        // was done; because this is a queue with concurrency of
-                        // one we can safely `pop_front()`: if we ever do this
-                        // with higher concurrency (very unlikely), we need to
-                        // move to a more complex data structure.
                         queue.pop_front().unwrap();
                     }
                     if response.send(res).await.is_err() {

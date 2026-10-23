@@ -227,24 +227,23 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// [`WouldBlock`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.WouldBlock
     /// [`Other`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.Other
     /// [`GlommioError`]: ../../struct.GlommioError.html
-    ///
-    /// This is a shared channel, so state can change under our noses. We
-    /// test if the buffer is disconnected before sending to avoid sending a
-    /// value that will not be received (otherwise we would only receive
-    /// `WouldBlock` when the buffer capacity fills).
-    ///
-    /// However after we `try_push()`, we can still fail because the buffer
-    /// disconnected between now and then. That's okay, as all we're trying
-    /// to do here is prevent unnecessary sends.
-    ///
-    /// Note that we check `producer_disconnected` because:
-    ///
-    /// 1. senders can be referenced by multiple tasks simultaneously;
-    /// 2. senders can be closed at any time using `Self::close` (which does
-    ///    not automatically cause the receiver / consumer to drop);
-    /// 3. `Self::try_send` is used by async `Self::send`, which will not
-    ///    unblock correctly if the channel was closed in another task.
+    #[allow(no_comments_allowed)]
     pub fn try_send(&self, item: T) -> Result<(), T> {
+        // This is a shared channel, so state can change under our noses.
+        // We test if the buffer is disconnected before sending to avoid
+        // sending a value that will not be received (otherwise we would only
+        // receive `WouldBlock` when the buffer capacity fills).
+        //
+        // However after we `try_push()`, we can still fail because the buffer
+        // disconnected between now and then. That's okay, as all we're trying
+        // to do here is prevent unnecessary sends.
+        //
+        // Note that we check `producer_disconnected` because:
+        // (1) senders can be referenced by multiple tasks simultaneously
+        // (2) senders can be closed at any time using `Self::close` (which does not
+        // automatically cause the receiver / consumer to drop)
+        // (3) `Self::try_send` is used by async `Self::send`, which will not
+        // unblock correctly if the channel was closed in another task
         if self.state.buffer.consumer_disconnected()
             || self.state.buffer.buffer.producer_disconnected()
         {
@@ -321,10 +320,15 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// sender is closed; we don't `unregister_shared_channel` here because
     /// another task could still be `await`ing this sender, in which case we
     /// need to be able to `wake` it.
+    #[allow(no_comments_allowed)]
     pub fn close(&self) {
         if !self.state.buffer.disconnect() {
             if let Some(r) = self.reactor.upgrade() {
                 self.notifier.notify(false);
+                // wake other tasks `awaiting` the same sender letting them know sender is
+                // closed; we don't `unregister_shared_channel` here because
+                // another task could still be `await`ing this sender, in which
+                // case we need to be able to `wake` it
                 r.process_shared_channels_by_id(self.id);
             }
         }
@@ -416,6 +420,9 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
                 if disconnected {
                     Poll::Ready(None)
                 } else if self.state.buffer.producer_disconnected() {
+                    #[allow(no_comments_allowed)]
+                    // Double check in case the producer sent the last message and
+                    // disconnected right after a `None` is returned from `try_pop`
                     self.do_recv_one(cx, true)
                 } else {
                     self.reactor
@@ -893,9 +900,7 @@ mod test {
     }
 
     #[test]
-    /// Both endpoints must be connected before destroying the sender's
-    /// executor. Otherwise the receiver can observe its peer ID after the
-    /// sender's reactor has already removed the corresponding notifier.
+    #[allow(no_comments_allowed)]
     fn shared_drop_cascade_drop_executor() {
         let (sender, receiver) = new_bounded(100);
 
@@ -931,6 +936,7 @@ mod test {
     }
 
     #[test]
+    #[allow(no_comments_allowed)]
     fn shared_drop_cascade_drop_executor_reverse() {
         let (sender, receiver) = new_bounded(100);
         let (connected_tx, connected_rx) = mpsc::channel();
@@ -963,6 +969,9 @@ mod test {
             })
             .unwrap();
 
+        // Both endpoints must be connected before destroying the sender's
+        // executor. Otherwise the receiver can observe its peer ID after the
+        // sender's reactor has already removed the corresponding notifier.
         connected_rx.recv().unwrap();
         connected_rx.recv().unwrap();
         drop(ex1);

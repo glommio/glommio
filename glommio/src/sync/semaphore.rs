@@ -77,7 +77,7 @@ unsafe impl Adapter for WaiterAdapter {
         container_of!(link.as_ptr(), WaiterNode, link)
     }
 
-    /// The unchecked call is safe because of the null check above.
+    #[allow(no_comments_allowed)]
     unsafe fn get_link(
         &self,
         value: *const <Self::PointerOps as PointerOps>::Value,
@@ -87,6 +87,7 @@ unsafe impl Adapter for WaiterAdapter {
         }
 
         let ptr = (value as *const u8).add(offset_of!(WaiterNode, link));
+        // The unchecked call is safe because of the null check above.
         core::ptr::NonNull::new_unchecked(ptr as *mut _)
     }
 
@@ -707,6 +708,7 @@ mod test {
     }
 
     #[test]
+    #[allow(no_comments_allowed)]
     fn permit_raii_works() {
         test_executor!(async move {
             let sem = Rc::new(Semaphore::new(0));
@@ -721,6 +723,7 @@ mod test {
                 let _g = sem.acquire_permit(1).await.unwrap();
             }});
 
+            // For this last one, use the static version. Move around and sleep a bit first
             let t3 = crate::spawn_local(enclose! { (sem, exec) async move {
                 exec.set(exec.get() + 1);
                 let g = sem.acquire_static_permit(1).await.unwrap();
@@ -730,6 +733,7 @@ mod test {
                 }).await
             }});
 
+            // Wait for all permits to try and acquire, then unleash the gates.
             while exec.get() != 3 {
                 crate::executor().yield_task_queue_now().await;
             }
@@ -744,9 +748,6 @@ mod test {
     }
 
     #[test]
-    /// For this last one, use the static version. Move around and sleep a
-    /// bit first; then wait for all permits to try and acquire, and unleash
-    /// the gates.
     fn explicit_signal_unblocks_waiting_semaphore() {
         make_shared_var!(Semaphore::new(0), sem1, sem2);
         make_shared_var_mut!(0, exec1, exec2);
@@ -902,10 +903,10 @@ mod test {
         );
     }
 
-    #[test]
-    #[should_panic]
     /// In this test, for the acquire to happen first, we need to block on
     /// the acquisition, so the semaphore starts at 0.
+    #[test]
+    #[should_panic]
     fn broken_semaphore_if_acquire_happens_first() {
         make_shared_var!(Semaphore::new(0), sem1, sem2);
         make_shared_var_mut!(0, exec1, exec2);

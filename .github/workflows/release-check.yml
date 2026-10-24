@@ -47,6 +47,11 @@ jobs:
       - name: Check API compatibility
         run: cargo test --package glommio --features version-compatibility public_api
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2.87.10
+        with:
+          tool: nextest@0.9.143
+
       - name: Run all tests
         run: .github/scripts/run-tests.sh
 

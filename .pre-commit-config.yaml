@@ -1,0 +1,47 @@
+# Pre-commit configuration for Glommio
+# See https://pre-commit.com/ for more information
+
+repos:
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0.1
+    hooks:
+      - id: fmt
+      - id: cargo-clippy
+        args: ['--workspace', '--all-targets', '--all-features', '--locked', '--', '-D', 'warnings']
+      - id: cargo-check
+        args: ['--workspace', '--all-targets', '--all-features', '--locked']
+
+  - repo: https://github.com/compilerla/conventional-commit-pre-commit-hook
+    rev: v3.4.0
+    hooks:
+      - id: conventional-commit
+        stages: [commit-msg]
+        args: [--type, 'fix,feat,docs,style,refactor,test,chore,perf,ci,build,security']
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: cargo-sort
+        name: Check Cargo.toml ordering
+        entry: cargo sort --workspace --check
+        language: system
+        files: Cargo\.toml$
+        pass_filenames: false
+
+      - id: todo-finder
+        name: Find TODO/FIXME comments
+        entry: grep -nE '(TODO|FIXME|XXX):' --include='*.rs' -R .
+        language: system
+        files: \.rs$
+        pass_filenames: false
+
+# The conventional-commit hook only runs at the commit-msg stage, which is not
+# installed by `pre-commit install`.  Install it with:
+#   pre-commit install --hook-type commit-msg
+default_stages: [pre-commit]

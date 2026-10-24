@@ -1,0 +1,56 @@
+name: Release Compatibility Check
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+env:
+  PUBLIC_API_NIGHTLY: nightly-2026-06-11
+
+jobs:
+  release-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Install cargo-semver-checks
+        run: which cargo-semver-checks || cargo install --locked cargo-semver-checks
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Run semantic versioning checks
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          echo "Checking compatibility for version ${VERSION}"
+          cargo semver-checks --package glommio --baseline-rev origin/main
+
+      - name: Install public API nightly toolchain
+        run: rustup toolchain install "$PUBLIC_API_NIGHTLY" --profile minimal --component rust-docs
+
+      - name: Check API compatibility
+        run: cargo test --package glommio --features version-compatibility public_api
+
+      - name: Run all tests
+        run: .github/scripts/run-tests.sh
+
+      - name: Install cargo-deadlinks
+        run: which cargo-deadlinks || cargo install --locked cargo-deadlinks
+
+      - name: Verify documentation
+        run: |
+          cargo doc --workspace --all-features --locked
+          cargo deadlinks --dir target/doc/glommio

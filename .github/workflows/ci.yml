@@ -195,3 +195,49 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: .github/scripts/run-tests.sh "${TARGET}"
+
+  conventional-commit-check:
+    name: Conventional commit check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate changelog can be generated
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --strip header
+        env:
+          OUTPUT: /dev/null
+
+  semver-check:
+    name: Semantic versioning check
+    runs-on: ubuntu-latest
+
+    env:
+      PUBLIC_API_NIGHTLY: nightly-2026-06-11
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Install cargo-semver-checks
+        run: which cargo-semver-checks || cargo install --locked cargo-semver-checks
+
+      - name: Run semver checks
+        run: cargo semver-checks --workspace --baseline-rev origin/main
+
+      - name: Install public API nightly toolchain
+        run: rustup toolchain install "$PUBLIC_API_NIGHTLY" --profile minimal --component rust-docs
+
+      - name: Run public API compatibility test
+        run: cargo test --package glommio --features version-compatibility public_api

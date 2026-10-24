@@ -273,9 +273,9 @@ impl<T> Buffer<T> {
 
 /// Handles deallocation of heap memory when the buffer is dropped
 impl<T> Drop for Buffer<T> {
+    /// Pops the rest of the values off the queue: by moving them into this
+    /// scope, we implicitly call their destructor.
     fn drop(&mut self) {
-        // Pop the rest of the values off the queue. By moving them into this scope,
-        // we implicitly call their destructor
         while self.try_pop().is_some() {}
     }
 }
@@ -374,7 +374,6 @@ impl<T> BufferHalf for Producer<T> {
     }
 
     fn disconnect_peer(&self) {
-        // We are the producer, so the peer is the consumer.
         self.buffer.disconnect_consumer();
     }
 }
@@ -434,7 +433,6 @@ impl<T> BufferHalf for Consumer<T> {
     }
 
     fn disconnect_peer(&self) {
-        // We are the consumer, so the peer is the producer.
         self.buffer.disconnect_producer();
     }
 }

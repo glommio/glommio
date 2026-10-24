@@ -53,22 +53,27 @@ cargo install git-cliff
 
 As of today (September 2021), this is the set of rules that materialize the principles above:
 
-1. **Test your changes.** Unless what you are doing is _absolutely_ trivial, add unit tests. Good unit tests come in
+1. **Target `main`.** The default branch is `main`; the old `master` branch is no longer used.
+2. **Required reviews.** Most PRs need at least one approving review from a member of
+   `@glommio/contributors`. PRs that touch CI, GitHub settings, or tooling configuration
+   require approval from a member of `@glommio/maintainers` because those files are owned
+   by the maintainers team.
+3. **All CI checks must pass.** This includes formatting, Clippy, custom dylint lints, documentation, commit-policy checks, and the glibc and musl test matrices.
+4. **Keep history linear.** Merge commits are not allowed; use squash or rebase merges only.
+5. **Sign your commits.** The repository requires signed and verified commits on `main`.
+6. **Test your changes.** Unless what you are doing is _absolutely_ trivial, add unit tests. Good unit tests come in
    bundles, and should test for both the expected and unexpected cases.
-
-2. **Discuss your architecture first.** If you are making changes that add new components, new data structures, or
+7. **Discuss your architecture first.** If you are making changes that add new components, new data structures, or
    reorganize an existing flow, it is helpful to plan how best to achieve that. A GitHub issue is the place to have this
    conversation.
-
-3. **Invest in your git log.** If you fix a bug, tell us more about how you found it, in which circumstances it appears,
+8. **Invest in your git log.** If you fix a bug, tell us more about how you found it, in which circumstances it appears,
    etc. This is important for others as well as for _future you_. Split significant changes in smaller, self-contained
    commits, so it is easier to follow what you have done. `git add -p` is a powerful tool, and you should use it.
 
    At the end, if the result is too hard to follow and the change is simple and limited in complexity, **squashing your
    commits is okay**. Otherwise, if the diff is complex or has a large surface area, we will ask you to rewrite history
    to preserve the individual commits of your branch.
-
-4. **AI-generated contributions are your responsibility.** See [AI-generated contributions](#ai-generated-contributions)
+9. **AI-generated contributions are your responsibility.** See [AI-generated contributions](#ai-generated-contributions)
    below.
 
 ## AI-generated contributions

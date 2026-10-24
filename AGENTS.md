@@ -137,6 +137,30 @@ Below we summarise conventions that agents should follow when they edit Rust sou
 -   If a crate is only used for dev‑time or tests, it belongs under `[dev-dependencies]`.
 -   Run `cargo deny check licenses` regularly; the project already allows MIT/Apache‑2.0/etc. Avoid any disallowed licenses.
 
+## Repository settings and maintenance
+
+The repository uses GitHub rulesets (not legacy branch protection rules) to enforce the following policy on `main`:
+
+- Pull requests are required; direct pushes to `main` are blocked.
+- At least one approving review is required.
+- CODEOWNERS review is required for files owned by `@glommio/maintainers` (CI settings, GitHub configuration, and tooling configuration).
+- All review threads must be resolved before merging.
+- Stale reviews are dismissed when new commits are pushed.
+- The last push must be approved by someone other than the pusher.
+- A linear history is enforced; only squash and rebase merges are allowed.
+- Commits must be signed and verified.
+- The following status checks are required to pass:
+  - `Build and Test (glibc)`
+  - `Build and Test (musl)`
+  - `Commit policy`
+  - `Custom lints`
+  - `Documentation`
+  - `Lint`
+- Version tags matching `[0-9]+.[0-9]+.[0-9]+` are protected and can only be created by `@glommio/maintainers`.
+- The default branch is `main`; the old `master` branch is retired.
+
+When modifying workflows or CI configuration, keep the principle of least privilege: grant `GITHUB_TOKEN` only the permissions the job actually needs (`contents: read` for checkout, `actions: write` for jobs that save caches, `contents: write` for release creation).
+
 ## Cursor and Copilot rules
 The repository contains **no** `.cursor/rules`, `/ .cursorrules`, or `.github/copilot-instructions.md`. If such files are added later, agents should follow the provided YAML format; until then standard Rust conventions apply.
 

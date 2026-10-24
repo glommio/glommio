@@ -1,0 +1,20 @@
+# Global fallback — any code change needs a contributor review
+*                              @glommio/contributors
+
+# Documentation
+/docs/                         @glommio/contributors
+*.md                           @glommio/contributors
+
+# Tooling / release configuration — maintainers gate
+*.toml                         @glommio/maintainers
+/cliff.toml                    @glommio/maintainers
+/dylint.toml                   @glommio/maintainers
+/deny.toml                     @glommio/maintainers
+/rust-toolchain.toml           @glommio/maintainers
+
+# CI / GitHub settings — maintainers only (strictest)
+/.github/                      @glommio/maintainers
+/.github/CODEOWNERS            @glommio/maintainers
+/.github/workflows/            @glommio/maintainers
+/.github/actions/              @glommio/maintainers
+/.githooks/                    @glommio/maintainers

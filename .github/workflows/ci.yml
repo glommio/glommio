@@ -1,6 +1,7 @@
 name: Rust
 
-permissions: write-all
+permissions:
+  contents: read
 
 on:
   pull_request:
@@ -13,6 +14,9 @@ jobs:
   doc:
     name: Documentation
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
 
     steps:
       - name: Checkout
@@ -43,6 +47,9 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
 
     steps:
       - name: Checkout
@@ -66,6 +73,9 @@ jobs:
   dylint:
     name: Custom lints
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
 
     env:
       DYLINT_NIGHTLY: nightly-2026-06-11
@@ -102,6 +112,8 @@ jobs:
   commit-policy:
     name: Commit policy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -138,6 +150,9 @@ jobs:
   build-and-test:
     name: Build and Test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
 
     strategy:
       fail-fast: false

@@ -1,6 +1,7 @@
 name: Third-party licences
 
-permissions: write-all
+permissions:
+  contents: read
 
 on:
   pull_request:

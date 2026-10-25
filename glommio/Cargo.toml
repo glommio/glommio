@@ -34,6 +34,7 @@ crossbeam             = "0.8"
 enclose               = "1.2"
 flume                 = { version = "0.12", features = ["async"] }
 futures-lite          = "2.6"
+glommio-idle          = { path = "../glommio-idle" }
 glommio-macros        = { path = "../glommio-macros", optional = true }
 intrusive-collections = "0.10"
 io-uring              = "0.7.14"

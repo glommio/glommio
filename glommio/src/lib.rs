@@ -300,6 +300,8 @@ macro_rules! wake {
 
 mod free_list;
 
+mod idle;
+
 mod reactor;
 mod sys;
 pub mod task;
@@ -462,6 +464,7 @@ pub use crate::{
         LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
         PoolThreadHandles, ScopedTask, Task, TaskQueueHandle, TaskQueueStats,
     },
+    idle::{BeforeParkCapacityError, BeforeParkHandle},
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,
 };

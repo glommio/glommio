@@ -1,5 +1,5 @@
 [workspace]
-members  = ["examples", "glommio", "glommio-macros"]
+members  = ["examples", "glommio", "glommio-dense-registry", "glommio-macros"]
 resolver = "2"
 
 [workspace.package]

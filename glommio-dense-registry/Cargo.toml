@@ -1,0 +1,14 @@
+[package]
+description = "A dense registry with drop-based removal and deferred batch mutations."
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+name = "glommio-dense-registry"
+repository = "https://github.com/glommio/glommio"
+rust-version = "1.92"
+version.workspace = true
+
+[dependencies]
+fastrand = "2.5"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

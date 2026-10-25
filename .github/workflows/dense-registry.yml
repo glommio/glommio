@@ -1,0 +1,35 @@
+name: Dense registry
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'glommio-dense-registry/**'
+  push:
+    branches: [main]
+    paths:
+      - 'glommio-dense-registry/**'
+
+jobs:
+  kani:
+    name: Registry proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Verify the dense registry
+        uses: model-checking/kani-github-action@v1
+        with:
+          kani-version: '0.68.0'
+          args: >-
+            -p glommio-dense-registry
+            -Z stubbing --output-format terse --jobs 2

@@ -151,6 +151,10 @@ name    = "echo"
 harness = false
 name    = "competing_io"
 
+[[bench]]
+harness = false
+name = "cross_wake_completion"
+
 [[example]]
 name = "pingpong_ladder"
 path = "examples/pingpong_ladder.rs"

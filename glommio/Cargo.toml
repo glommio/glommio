@@ -14,8 +14,7 @@ name = "glommio"
 readme = "../README.md"
 repository = "https://github.com/glommio/glommio"
 version.workspace = true
-# This is also documented in the README.md under "Supported Rust Versions"
-rust-version = "1.92"
+rust-version.workspace = true
 
 [features]
 bench                 = []
@@ -34,7 +33,7 @@ crossbeam             = "0.8"
 enclose               = "1.2"
 flume                 = { version = "0.12", features = ["async"] }
 futures-lite          = "2.6"
-glommio-macros        = { path = "../glommio-macros", version = "0.11.0", optional = true }
+glommio-macros        = { workspace = true, optional = true }
 intrusive-collections = "0.10"
 io-uring              = "0.7.14"
 lazy_static           = "1.5"

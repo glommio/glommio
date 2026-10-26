@@ -84,6 +84,10 @@ name    = "spawn"
 
 [[bench]]
 harness = false
+name    = "timer"
+
+[[bench]]
+harness = false
 name    = "executor"
 
 [[bench]]
@@ -128,6 +132,11 @@ name              = "nop"
 required-features = ["bench"]
 
 [[bench]]
+harness           = false
+name              = "wheel"
+required-features = ["bench"]
+
+[[bench]]
 harness = false
 name    = "sharding"
 
@@ -150,6 +159,10 @@ name    = "echo"
 [[bench]]
 harness = false
 name    = "competing_io"
+
+[[bench]]
+harness = false
+name    = "timer_burst"
 
 [[example]]
 name = "pingpong_ladder"

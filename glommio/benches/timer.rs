@@ -39,7 +39,7 @@ const EXPIRING_POPULATIONS: &[usize] = &[4_096, 65_536, 262_144, 1_048_576];
 /// Far enough out that nothing in these cases reaches it.
 const PARKED: Duration = Duration::from_secs(3_600);
 
-/// Registering a timer that will not fire.
+/// Registering a timer that will not fire, which is what its first poll does.
 fn arm(c: &mut Criterion) {
     let ex = Glommio::default();
     let mut group = c.benchmark_group("timer/arm");
@@ -55,7 +55,6 @@ fn arm(c: &mut Criterion) {
 
                         let started = Instant::now();
                         for timer in timers.iter_mut() {
-                            // The first poll is what registers it.
                             black_box(poll_once(timer).await);
                         }
                         total += started.elapsed();
@@ -141,9 +140,12 @@ fn sleep_under_population(c: &mut Criterion) {
 /// same near deadline all land together, which is what a burst of connections
 /// sharing a read timeout produces. Answering "what is due next" by scanning
 /// that slot grows with the population; the wheel is meant not to.
+///
+/// The cluster is rebuilt for each batch, outside the timed region, because it
+/// would otherwise come due mid-measurement.
 fn sleep_under_clustered_population(c: &mut Criterion) {
-    // Inside the finest level, so the whole population shares one slot, and far
-    // enough out that nothing fires while a batch is measured.
+    /// Inside the finest level, so the whole population shares one slot, and
+    /// far enough out that nothing fires while a batch is measured.
     const CLUSTER: Duration = Duration::from_millis(200);
     const SLEEPS_PER_BATCH: usize = 400;
 
@@ -158,8 +160,6 @@ fn sleep_under_clustered_population(c: &mut Criterion) {
                     let mut remaining = iters;
                     while remaining > 0 {
                         let this_batch = remaining.min(SLEEPS_PER_BATCH as u64);
-                        // Rebuilt per batch, outside the timed region, because
-                        // the cluster would otherwise come due mid-measurement.
                         let mut cluster: Vec<Timer> = (0..n).map(|_| Timer::new(CLUSTER)).collect();
                         for timer in cluster.iter_mut() {
                             black_box(poll_once(timer).await);
@@ -237,18 +237,19 @@ fn sleep_under_coarse_clustered_population(c: &mut Criterion) {
 /// population is armed outside the timed region and the idle wait is subtracted
 /// exactly, which leaves the firing and nothing else. Staggering the deadlines
 /// instead would spread most of the work across the wait being subtracted.
+///
+/// A level-0 deadline has to be under 256ms, and the population has to be
+/// armed before it arrives, which is what bounds the populations here rather
+/// than anything structural.
 fn expire(c: &mut Criterion) {
-    // Inside the finest level, so the population shares one slot and nothing
-    // cascades on the way to firing.
+    /// Inside the finest level, so the population shares one slot and nothing
+    /// cascades on the way to firing.
     const WAIT: Duration = Duration::from_millis(250);
 
     let ex = Glommio::default();
     let mut group = c.benchmark_group("timer/expire");
     group.sample_size(10).warm_up_time(Duration::from_secs(1));
 
-    // A level-0 deadline has to be under 256ms, and the population has to be
-    // armed before it arrives, which is what bounds this case rather than
-    // anything structural.
     for &n in EXPIRING_POPULATIONS.iter().filter(|n| **n <= 262_144) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_custom(|iters| {
@@ -296,15 +297,15 @@ fn expire_after_cascade(c: &mut Criterion) {
 
 /// Arms `n` timers at `wait`, waits for all of them, and returns the time spent
 /// on everything but the waiting.
+///
+/// `Timer::new` is relative and reads the clock itself, so shrinking the
+/// duration as the loop runs is what gives the whole population one shared
+/// deadline. Registering is what the first poll does, and `arm` measures it.
 async fn fire_all(n: usize, wait: Duration) -> Duration {
-    // `Timer::new` is relative and reads the clock itself, so shrinking the
-    // duration as the loop runs is what gives the whole population one shared
-    // deadline.
     let target = Instant::now() + wait;
     let mut timers: Vec<Timer> = (0..n)
         .map(|_| Timer::new(target.saturating_duration_since(Instant::now())))
         .collect();
-    // Registering is what the first poll does, and it is measured by `arm`.
     for timer in timers.iter_mut() {
         black_box(poll_once(timer).await);
     }

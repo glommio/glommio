@@ -877,6 +877,67 @@ mod tests {
         });
     }
 
+    /// Nothing has been sent when the reader starts, so the read completes
+    /// through the kernel rather than the speculative `recv`.
+    #[test]
+    fn a_buffered_read_completes_when_data_arrives_later() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let reader = crate::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap().buffered();
+                let mut buf = [0u8; 16];
+                let read = stream.read(&mut buf).await.unwrap();
+                buf[..read].to_vec()
+            })
+            .detach();
+
+            let mut writer = TcpStream::connect(addr).await.unwrap();
+            Timer::new(Duration::from_millis(50)).await;
+            writer.write_all(b"late").await.unwrap();
+
+            assert_eq!(reader.await.unwrap(), b"late".to_vec());
+        });
+    }
+
+    /// The kernel still owns the buffer when the stream drops; repeated
+    /// because a use-after-free here would be a race.
+    #[test]
+    fn dropping_a_stream_with_a_read_in_flight_is_safe() {
+        test_executor!(async move {
+            for _ in 0..50 {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                let reader = crate::spawn_local(async move {
+                    let mut stream = listener.accept().await.unwrap().buffered();
+                    let mut buf = [0u8; 16];
+                    let _ = futures_lite::future::poll_once(stream.read(&mut buf)).await;
+                })
+                .detach();
+
+                let mut writer = TcpStream::connect(addr).await.unwrap();
+                reader.await.unwrap();
+                let _ = writer.write_all(b"after the drop").await;
+            }
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let echo = crate::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap().buffered();
+                let mut buf = [0u8; 8];
+                let read = stream.read(&mut buf).await.unwrap();
+                buf[..read].to_vec()
+            })
+            .detach();
+
+            let mut writer = TcpStream::connect(addr).await.unwrap();
+            writer.write_all(b"alive").await.unwrap();
+            assert_eq!(echo.await.unwrap(), b"alive".to_vec());
+        });
+    }
+
     /// The futures-io default writes the first slice and returns, so without a
     /// `poll_write_vectored` of our own a caller pays a syscall per buffer.
     #[test]
@@ -1337,6 +1398,64 @@ mod tests {
             });
 
             let _s = TcpStream::connect(addr).await.unwrap();
+            ltask.await.unwrap();
+        });
+    }
+
+    /// A buffered read times out too, though it waits on a completion.
+    #[test]
+    fn tcp_buffered_read_timeout() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let ltask = crate::spawn_local(async move {
+                let mut stream = listener.accept().await?.buffered();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut buf = [0u8; 64];
+                let now = Instant::now();
+                let read = crate::timer::timeout(Duration::from_secs(5), async {
+                    Ok(stream.read(&mut buf).await)
+                })
+                .await
+                .expect("the read timeout never fired");
+                assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+                assert!(now.elapsed() < Duration::from_secs(2));
+                io::Result::Ok(0)
+            });
+
+            let _s = TcpStream::connect(addr).await.unwrap();
+            ltask.await.unwrap();
+        });
+    }
+
+    /// Data sent after a buffered read timed out is delivered by the next read.
+    #[test]
+    fn tcp_buffered_read_after_timeout_gets_late_data() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (tx, rx) = crate::channels::local_channel::new_bounded(1);
+
+            let ltask = crate::spawn_local(async move {
+                let mut stream = listener.accept().await?.buffered();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let mut buf = [0u8; 64];
+                let err = stream.read(&mut buf).await.unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+                tx.send(()).await.unwrap();
+                let n = stream.read(&mut buf).await?;
+                assert_eq!(&buf[..n], b"late");
+                io::Result::Ok(0)
+            });
+
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            rx.recv().await.unwrap();
+            client.write_all(b"late").await.unwrap();
             ltask.await.unwrap();
         });
     }

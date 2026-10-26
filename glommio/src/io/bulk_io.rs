@@ -137,7 +137,7 @@ impl<V: IoVec> IOVecMerger<V> {
             }
             Some(cur) => {
                 if let Some(gap) = self.max_read_amp {
-                    if u64::saturating_sub(cur.pos(), pos) > gap as u64
+                    if u64::saturating_sub(cur.pos(), pos + size as u64) > gap as u64
                         || u64::saturating_sub(pos, cur.pos() + cur.size() as u64) > gap as u64
                     {
                         let (pos, size) = self.current.replace((pos, size)).unwrap();
@@ -645,32 +645,62 @@ mod tests {
             assert_eq!(
                 merged,
                 [
-                    ((128, 128), (128, 128)),
-                    ((128, 1), (128, 128)),
-                    ((160, 96), (128, 128)),
-                    ((96, 160), (96, 160)),
-                    ((64, 192), (64, 192)),
+                    ((128, 128), (0, 256)),
+                    ((128, 1), (0, 256)),
+                    ((160, 96), (0, 256)),
+                    ((96, 160), (0, 256)),
+                    ((64, 192), (0, 256)),
                     ((0, 256), (0, 256)),
                 ]
             );
+        });
+    }
 
-            let merged = collect_iovecs(CoalescedReads::new(
-                4096,
-                Some(32),
-                None,
-                stream::iter(reads.iter().copied()),
-            ))
-            .await;
+    /// The gap is the same whichever side of the merged span a read lands on.
+    #[test]
+    fn read_amplification_limit_in_either_order() {
+        test_executor!(async move {
+            let merge = |reads: Vec<(u64, usize)>, limit| {
+                collect_iovecs(CoalescedReads::new(
+                    4096,
+                    Some(limit),
+                    None,
+                    stream::iter(reads),
+                ))
+            };
+            let ascending = vec![(100, 60), (200, 40), (256, 64)];
+            let descending = vec![(256, 64), (200, 40), (100, 60)];
 
             assert_eq!(
-                merged,
+                merge(ascending.clone(), 0).await,
                 [
-                    ((128, 128), (64, 192)),
-                    ((128, 1), (64, 192)),
-                    ((160, 96), (64, 192)),
-                    ((96, 160), (64, 192)),
-                    ((64, 192), (64, 192)),
-                    ((0, 256), (0, 256)),
+                    ((100, 60), (100, 60)),
+                    ((200, 40), (200, 40)),
+                    ((256, 64), (256, 64)),
+                ]
+            );
+            assert_eq!(
+                merge(descending.clone(), 0).await,
+                [
+                    ((256, 64), (256, 64)),
+                    ((200, 40), (200, 40)),
+                    ((100, 60), (100, 60)),
+                ]
+            );
+            assert_eq!(
+                merge(ascending, 32).await,
+                [
+                    ((100, 60), (100, 60)),
+                    ((200, 40), (200, 120)),
+                    ((256, 64), (200, 120)),
+                ]
+            );
+            assert_eq!(
+                merge(descending, 32).await,
+                [
+                    ((256, 64), (200, 120)),
+                    ((200, 40), (200, 120)),
+                    ((100, 60), (100, 60)),
                 ]
             );
         });

@@ -279,6 +279,7 @@ extern crate lazy_static;
 #[macro_use(defer)]
 extern crate scopeguard;
 
+#[cfg(test)]
 /// `#[glommio::test]` expands to `::glommio::…`, which does not resolve inside
 /// the crate that defines it. Aliasing the crate to its own name makes the one
 /// expansion work everywhere, rather than the macro having to guess where it is

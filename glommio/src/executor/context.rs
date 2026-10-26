@@ -8,7 +8,9 @@ use std::{
 
 use crate::{task::registry::TaskRegistry, GlommioError, IoRequirements, Latency, Reactor, Shares};
 
-use super::{multitask, ExecutorQueues, Result, TaskQueue, TaskQueueHandle, LOCAL_EX};
+use super::{
+    multitask, ExecutorQueues, Result, TaskQueue, TaskQueueHandle, UnobservedPanic, LOCAL_EX,
+};
 
 /// Shared resources used by the executor and retained independently during cleanup.
 #[derive(Debug)]
@@ -17,6 +19,8 @@ pub(crate) struct ExecutorContext {
     pub(super) tasks: Rc<TaskRegistry>,
     pub(super) id: usize,
     pub(super) reactor: Rc<Reactor>,
+    /// What a blocking closure's panic does when nobody awaits it.
+    pub(super) on_unobserved_panic: UnobservedPanic,
 }
 
 impl ExecutorContext {
@@ -222,6 +226,7 @@ pub(crate) struct WeakExecutorContext {
     queues: Weak<RefCell<ExecutorQueues>>,
     id: usize,
     reactor: Weak<Reactor>,
+    on_unobserved_panic: UnobservedPanic,
 }
 
 impl WeakExecutorContext {
@@ -229,11 +234,13 @@ impl WeakExecutorContext {
         id: usize,
         queues: &Rc<RefCell<ExecutorQueues>>,
         reactor: &Rc<Reactor>,
+        on_unobserved_panic: UnobservedPanic,
     ) -> Self {
         Self {
             queues: Rc::downgrade(queues),
             id,
             reactor: Rc::downgrade(reactor),
+            on_unobserved_panic,
         }
     }
 
@@ -243,6 +250,7 @@ impl WeakExecutorContext {
             tasks: tasks.clone(),
             id: self.id,
             reactor: self.reactor.upgrade()?,
+            on_unobserved_panic: self.on_unobserved_panic.clone(),
         })
     }
 }

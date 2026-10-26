@@ -3,10 +3,7 @@
 macro_rules! fatal_assert {
     ($cond:expr) => {
         if !$cond {
-            #[allow(unused_unsafe)]
-            unsafe {
-                libc::abort();
-            }
+            std::process::abort();
         }
     };
 }

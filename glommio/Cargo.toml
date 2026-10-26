@@ -40,7 +40,7 @@ io-uring              = "0.7.14"
 lazy_static           = "1.5"
 libc                  = "0.2"
 log                   = "0.4"
-nix                   = { version = "0.30", features = ["event", "fs", "ioctl", "mman", "net", "poll", "sched", "time"] }
+nix                   = { version = "0.30", features = ["event", "fs", "ioctl", "mman", "net", "poll", "pthread", "sched", "time", "uio"] }
 pin-project-lite      = "0.2"
 rlimit                = "0.10"
 scopeguard            = "1.2"
@@ -58,6 +58,7 @@ criterion = { version = "0.8.2", default-features = false, features = ["async", 
 fastrand = "2.3"
 futures = "0.3"
 hdrhistogram = "7.5"
+nix = { version = "0.30", features = ["resource"] }
 pretty_env_logger = "0.5"
 public-api       = "0.51.0"
 rand             = "0.9"

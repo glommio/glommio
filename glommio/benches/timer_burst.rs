@@ -50,7 +50,11 @@ fn lateness(n: usize) -> Vec<Duration> {
             let out = Rc::clone(&out);
             tasks.push(glommio::spawn_local(async move {
                 let now = Instant::now();
-                assert!(now < target, "spawning outran the cluster deadline");
+                assert!(
+                    now < target,
+                    "spawning {n} tasks outlasted the {CLUSTER:?} cluster deadline, so they \
+                     no longer share one; rerun on a quieter machine"
+                );
                 sleep(target - now).await;
                 out.borrow_mut()
                     .push(Instant::now().saturating_duration_since(target));

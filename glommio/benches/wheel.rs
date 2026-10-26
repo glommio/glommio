@@ -1,6 +1,6 @@
-// Unless explicitly stated otherwise all files in this repository are licensed
-// under the MIT/Apache-2.0 License, at your convenience
-//
+//! Unless explicitly stated otherwise all files in this repository are licensed
+//! under the MIT/Apache-2.0 License, at your convenience
+//!
 //! What the wheel costs, and whether making it configurable cost anything.
 //!
 //! The layout is a runtime value rather than a set of constants, so that a
@@ -37,13 +37,12 @@ impl Policy for Exact {
     const COARSE_QUERY: CoarseQuery = CoarseQuery::ExactMinimum;
 }
 
+/// A wheel holding `n` parked entries, spread a nanosecond apart within their
+/// slot so they are not all one deadline.
 fn filled<P: Policy>(start: Instant, n: usize) -> (TimingWheel<usize, P>, Vec<Key>) {
     let mut wheel = TimingWheel::starting_at(start);
     let keys = (0..n)
-        .map(|i| {
-            // Spread within the slot so entries are not all one deadline.
-            wheel.insert(start + PARKED + Duration::from_nanos(i as u64), i)
-        })
+        .map(|i| wheel.insert(start + PARKED + Duration::from_nanos(i as u64), i))
         .collect();
     (wheel, keys)
 }
@@ -149,11 +148,12 @@ fn idle_gap(c: &mut Criterion) {
 /// asks, and the other never disturbs the answer. A caller that arms a timeout
 /// per operation and cancels it on completion does both, continuously, and
 /// withdrawing the entry that supplied a slot's minimum is what invalidates it.
+///
+/// Deliberately smaller than the other cases. Every entry here shares one
+/// slot, so a policy that rescans it on each query is quadratic, and at a
+/// million entries this case does not finish. That it does not finish is the
+/// finding; the sizes here are enough to show the shape.
 fn churn<P: Policy>(group: &mut BenchmarkGroup<'_, WallTime>, label: &str) {
-    // Deliberately smaller than the other cases. Every entry here shares one
-    // slot, so a policy that rescans it on each query is quadratic, and at a
-    // million entries this case does not finish. That it does not finish is
-    // the finding; the sizes below are enough to show the shape.
     for &n in &[64usize, 512, 4_096] {
         group.bench_with_input(BenchmarkId::new(label, n), &n, |b, &n| {
             b.iter_custom(|iters| {
@@ -180,14 +180,13 @@ fn cancel_with_query(c: &mut Criterion) {
     group.finish();
 }
 
-// ---- the matrix ---------------------------------------------------------
-//
-// Six layouts and five policy choices is seventy-two combinations, and
-// measuring all of them at several populations would run for hours. Most axes
-// should not affect cost at all, so each is varied on its own: the question
-// for rounding and overflow is whether they are free, and a sweep answers that
-// as well as a cross product would.
-
+/// One axis of the policy matrix.
+///
+/// Six layouts and five policy choices is seventy-two combinations, and
+/// measuring all of them at several populations would run for hours. Most axes
+/// should not affect cost at all, so each is varied on its own: the question
+/// for rounding and overflow is whether they are free, and a sweep answers that
+/// as well as a cross product would.
 trait Layout {
     const NAME: &'static str;
     const SLOTS: &'static [usize];

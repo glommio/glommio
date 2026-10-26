@@ -66,29 +66,14 @@ mod test {
         future::Future,
         pin::Pin,
         rc::Rc,
-        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+        task::{Context, Poll, Waker},
     };
 
     const EXECUTOR_ID: usize = 0;
     const QUEUE_INDEX: usize = 0;
 
-    /// A waker that does nothing, for polling a `JoinHandle` whose task has
-    /// already been run to completion.
-    ///
-    /// Every function in the vtable is a no-op and ignores its data pointer,
-    /// so the null pointer handed to `Waker::from_raw` is never dereferenced.
-    fn noop_waker() -> Waker {
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        fn noop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
-    }
-
     fn poll_once<R>(handle: &mut JoinHandle<R>) -> Poll<Option<R>> {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         Pin::new(handle).poll(&mut cx)
     }
 

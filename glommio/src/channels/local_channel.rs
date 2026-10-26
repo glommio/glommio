@@ -16,6 +16,7 @@ use intrusive_collections::{
     container_of, linked_list::LinkOps, offset_of, Adapter, LinkedList, LinkedListLink, PointerOps,
 };
 
+use pin_project::{pin_project, pinned_drop};
 use std::{collections::VecDeque, marker::PhantomPinned, ptr::NonNull};
 
 #[derive(Debug)]
@@ -66,8 +67,10 @@ enum WaiterKind {
     Receiver,
 }
 
+#[pin_project(PinnedDrop)]
 #[derive(Debug)]
 struct Waiter<'a, T, F> {
+    #[pin]
     node: WaiterNode,
     channel: &'a LocalChannel<T>,
 
@@ -107,26 +110,20 @@ where
     type Output = R;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let future_mut = unsafe { self.get_unchecked_mut() };
-        let pinned_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
+        let this = self.project();
+        let pinned_node = this.node;
 
-        let result = (future_mut.poll_fn)();
+        let result = (this.poll_fn)();
         match result {
             PollResult::Pending(kind) => {
                 *pinned_node.kind.borrow_mut() = Some(kind);
                 *pinned_node.waker.borrow_mut() = Some(cx.waker().clone());
 
-                register_into_waiting_queue(
-                    pinned_node,
-                    &mut future_mut.channel.state.borrow_mut(),
-                );
+                register_into_waiting_queue(pinned_node, &mut this.channel.state.borrow_mut());
                 Poll::Pending
             }
             PollResult::Ready(result) => {
-                remove_from_the_waiting_queue(
-                    pinned_node,
-                    &mut future_mut.channel.state.borrow_mut(),
-                );
+                remove_from_the_waiting_queue(pinned_node, &mut this.channel.state.borrow_mut());
                 Poll::Ready(result)
             }
         }
@@ -187,17 +184,18 @@ fn remove_from_the_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut Stat
         .expect("Future has to be queue into the waiting queue");
 }
 
-impl<T, F> Drop for Waiter<'_, T, F> {
-    fn drop(&mut self) {
-        if self.node.link.is_linked() {
-            //if future is linked into the waiting queue then it is already pinned
-            let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
+#[pinned_drop]
+impl<T, F> PinnedDrop for Waiter<'_, T, F> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if this.node.link.is_linked() {
+            let pinned_node = this.node;
             let kind = pinned_node
                 .kind
                 .borrow()
                 .expect("If Future is queued type of the queue has to be specified");
 
-            let mut state = self.channel.state.borrow_mut();
+            let mut state = this.channel.state.borrow_mut();
             let waiters = match kind {
                 WaiterKind::Sender => state
                     .send_waiters
@@ -653,7 +651,7 @@ impl<T> Stream for ChannelStream<'_, T> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let result = self.channel.state.borrow_mut().recv_one();
 
-        let this = unsafe { self.get_unchecked_mut() };
+        let this = self.get_mut();
 
         match result {
             PollResult::Pending(kind) => {

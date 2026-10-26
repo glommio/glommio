@@ -44,6 +44,7 @@ use intrusive_collections::{
 };
 
 use crate::{GlommioError, ResourceType};
+use pin_project::{pin_project, pinned_drop};
 use std::{marker::PhantomPinned, ptr::NonNull};
 
 /// A type alias for the result of a lock method which can be suspended.
@@ -52,8 +53,10 @@ pub type LockResult<T> = Result<T, GlommioError<()>>;
 /// A type alias for the result of a non-suspending locking method.
 pub type TryLockResult<T> = Result<T, GlommioError<()>>;
 
+#[pin_project(PinnedDrop)]
 #[derive(Debug)]
 struct Waiter<'a, T> {
+    #[pin]
     node: WaiterNode,
     rw: &'a RwLock<T>,
 }
@@ -267,9 +270,9 @@ impl<T> Future for Waiter<'_, T> {
     type Output = LockResult<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut rw = self.rw.state.borrow_mut();
-        let future_mut = unsafe { self.get_unchecked_mut() };
-        let pinned_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
+        let this = self.project();
+        let mut rw = this.rw.state.borrow_mut();
+        let pinned_node = this.node;
 
         match pinned_node.kind {
             WaiterKind::Writer => {
@@ -305,12 +308,12 @@ impl<T> Future for Waiter<'_, T> {
     }
 }
 
-impl<T> Drop for Waiter<'_, T> {
-    fn drop(&mut self) {
-        if self.node.link.is_linked() {
-            // If node is lined them future is already pinned
-            let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
-            Self::remove_from_waiting_queue(pinned_node, &mut self.rw.state.borrow_mut())
+#[pinned_drop]
+impl<T> PinnedDrop for Waiter<'_, T> {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+        if this.node.link.is_linked() {
+            Waiter::<T>::remove_from_waiting_queue(this.node, &mut this.rw.state.borrow_mut())
         }
     }
 }

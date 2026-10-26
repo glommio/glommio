@@ -345,7 +345,9 @@ impl<T, P: Policy> TimingWheel<T, P> {
     /// `expect` is the entry being detached. Nothing verifies a recorded
     /// position as it is written, and a wrong one does not merely miss: the
     /// slab mints a removal handle from whatever index it finds, so a stale
-    /// position detaches whichever entry occupies that place now.
+    /// position detaches whichever entry occupies that place now. So every
+    /// branch checks it, in release builds as well: a cancel pays one
+    /// comparison, and the alternative is cancelling another caller's timer.
     fn unlink(&mut self, at: Position, expect: SlotIndex) {
         let (moved, corrected) = match at {
             Position::Unplaced => return,
@@ -354,7 +356,7 @@ impl<T, P: Policy> TimingWheel<T, P> {
                 if index >= bucket.len() {
                     return;
                 }
-                debug_assert_eq!(bucket.get(index).copied(), Some(expect));
+                assert_eq!(bucket.get(index).copied(), Some(expect));
                 bucket.swap_remove(index);
                 let moved = bucket.get(index).copied();
                 if bucket.is_empty() {
@@ -369,7 +371,7 @@ impl<T, P: Policy> TimingWheel<T, P> {
                 if index >= self.expired.len() {
                     return;
                 }
-                debug_assert_eq!(self.expired.get(index).copied(), Some(expect));
+                assert_eq!(self.expired.get(index).copied(), Some(expect));
                 self.expired.swap_remove(index);
                 (
                     self.expired.get(index).copied(),
@@ -383,6 +385,7 @@ impl<T, P: Policy> TimingWheel<T, P> {
                 if index >= bucket.len() {
                     return;
                 }
+                assert_eq!(bucket.get(index).copied(), Some(expect));
                 bucket.swap_remove(index);
                 let moved = bucket.get(index).copied();
                 if bucket.is_empty() {
@@ -403,9 +406,11 @@ impl<T, P: Policy> TimingWheel<T, P> {
 impl<T, P: Policy> TimingWheel<T, P> {
     /// The earliest deadline held, if any.
     ///
-    /// Never later than the truth. A caller that sleeps on this answer must be
-    /// able to trust that bound in one direction only: waking early costs one
-    /// wasted poll, waking late is a missed deadline. Under
+    /// Never later than the earliest deadline as it was asked for, which under
+    /// [`Rounding::Down`] or [`Rounding::Nearest`] can be up to a tick after
+    /// the entry is due. A caller that sleeps on this answer must be able to
+    /// trust that bound in one direction only: waking early costs one wasted
+    /// poll, waking late is a missed deadline. Under
     /// [`CoarseQuery::BucketBound`] the answer for a coarse level is the
     /// earliest time anything in it *could* be due, which is deliberately
     /// early rather than exact.

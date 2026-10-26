@@ -26,6 +26,7 @@ use nix::sys::socket::{MsgFlags, SockaddrLike, SockaddrStorage};
 use smallvec::SmallVec;
 
 use crate::{
+    idle::IdleWorkers,
     io::{FileScheduler, IoScheduler, ScheduledSource},
     sys::SockAddrStorage,
     sys::{
@@ -138,6 +139,7 @@ impl Timers {
 /// There is only one global instance of this type, accessible by
 /// [`Local::get_reactor()`].
 pub(crate) struct Reactor {
+    pub(crate) idle_workers: IdleWorkers,
     /// Raw bindings to `epoll`/`kqueue`/`wepoll`.
     pub(crate) sys: sys::Reactor,
 
@@ -164,6 +166,7 @@ impl Reactor {
         let sys = sys::Reactor::new(notifier, io_memory, ring_depth, blocking_thread)?;
         let preempt_status = sys.preempt_status();
         Ok(Reactor {
+            idle_workers: IdleWorkers::default(),
             sys,
             timers: RefCell::new(Timers::new()),
             shared_channels: RefCell::new(SharedChannels::new()),

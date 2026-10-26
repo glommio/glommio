@@ -1,5 +1,5 @@
 .gdb_history
 .idea
 *.iml
-/target
+target/
 Cargo.lock

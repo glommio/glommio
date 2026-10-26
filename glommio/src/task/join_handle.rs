@@ -49,6 +49,18 @@ impl<R> JoinHandle<R> {
             }
         });
     }
+
+    /// Cancels the task and drops its future before returning, unless the
+    /// future is being polled right now.
+    pub(crate) fn cancel_in_place(&self) {
+        let ptr = self.raw_task.as_ptr();
+        dbg_context!(ptr, "cancel_in_place", {
+            let header = ptr as *const Header;
+            unsafe {
+                ((*header).vtable.cancel_in_place)(ptr);
+            }
+        });
+    }
 }
 
 impl<R> Drop for JoinHandle<R> {

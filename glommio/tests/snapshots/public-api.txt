@@ -3281,6 +3281,8 @@ pub fn glommio::ScopedTask<'a, T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) 
 impl<T> core::future::future::Future for glommio::ScopedTask<'_, T>
 pub type glommio::ScopedTask<'_, T>::Output = T
 pub fn glommio::ScopedTask<'_, T>::poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+impl<T> core::ops::drop::Drop for glommio::ScopedTask<'_, T>
+pub fn glommio::ScopedTask<'_, T>::drop(&mut self)
 impl<'a, T> core::marker::Freeze for glommio::ScopedTask<'a, T>
 impl<'a, T> !core::marker::Send for glommio::ScopedTask<'a, T>
 impl<'a, T> !core::marker::Sync for glommio::ScopedTask<'a, T>
@@ -6071,6 +6073,8 @@ pub fn glommio::ScopedTask<'a, T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) 
 impl<T> core::future::future::Future for glommio::ScopedTask<'_, T>
 pub type glommio::ScopedTask<'_, T>::Output = T
 pub fn glommio::ScopedTask<'_, T>::poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+impl<T> core::ops::drop::Drop for glommio::ScopedTask<'_, T>
+pub fn glommio::ScopedTask<'_, T>::drop(&mut self)
 impl<'a, T> core::marker::Freeze for glommio::ScopedTask<'a, T>
 impl<'a, T> !core::marker::Send for glommio::ScopedTask<'a, T>
 impl<'a, T> !core::marker::Sync for glommio::ScopedTask<'a, T>

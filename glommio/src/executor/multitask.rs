@@ -61,6 +61,19 @@ impl<T> Task<T> {
         self.0.take().unwrap()
     }
 
+    /// Moves the handle out, leaving a task whose drop does nothing.
+    pub(crate) fn take(&mut self) -> Self {
+        Self(self.0.take())
+    }
+
+    /// Cancels the task and drops its future before returning, unless the
+    /// future is being polled right now.
+    pub(crate) fn cancel_in_place(&self) {
+        if let Some(handle) = &self.0 {
+            handle.cancel_in_place();
+        }
+    }
+
     /// Cancels the task and waits for it to stop running.
     pub(crate) async fn cancel(self) -> Option<T> {
         let mut task = self;

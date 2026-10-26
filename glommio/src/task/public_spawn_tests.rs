@@ -174,6 +174,79 @@ fn completed_output_after_shutdown<const N: usize>() {
     }
 }
 
+/// Dropping a `ScopedTask` must drop its future before `drop` returns: the
+/// future may borrow from the scope that is ending.
+fn dropped_scoped_task_drops_its_future<const N: usize>(queued: bool) {
+    executor().run(async {
+        let future_drops = DropProbe::new();
+        let future = PendingFuture::<N>::new(future_drops.guard());
+        let saved_waker = future.waker.clone();
+        let polls = future.polls.clone();
+        let task = unsafe {
+            if queued {
+                crate::spawn_scoped_local_into(future, crate::executor().current_task_queue())
+                    .unwrap()
+            } else {
+                crate::spawn_scoped_local(future)
+            }
+        };
+        let polled = usize::from(!queued);
+        assert_eq!(polls.get(), polled);
+
+        drop(task);
+        future_drops.assert_dropped_once();
+        if let Some(waker) = saved_waker.borrow_mut().take() {
+            waker.wake();
+        }
+        futures_lite::future::yield_now().await;
+        future_drops.assert_dropped_once();
+        assert_eq!(polls.get(), polled);
+    });
+}
+
+/// `cancel()` must not return before the future is dropped, nor leave it
+/// behind if the `cancel()` future is itself dropped.
+#[test]
+fn cancelled_scoped_task_drops_its_future() {
+    executor().run(async {
+        let future_drops = DropProbe::new();
+        let task =
+            unsafe { crate::spawn_scoped_local(PendingFuture::<0>::new(future_drops.guard())) };
+        let output = futures_lite::future::poll_once(task.cancel()).await;
+        future_drops.assert_dropped_once();
+        assert_eq!(output, Some(None));
+    });
+}
+
+/// A future cannot be dropped while it is being polled, so a task that drops
+/// its own `ScopedTask` has its future dropped once that poll returns.
+#[test]
+fn scoped_task_dropped_by_its_own_future() {
+    executor().run(async {
+        let future_drops = DropProbe::new();
+        let guard = future_drops.guard();
+        let probe = future_drops.clone();
+        let slot: Rc<RefCell<Option<crate::ScopedTask<'_, ()>>>> = Rc::default();
+        let inner = slot.clone();
+        let task = unsafe {
+            crate::spawn_scoped_local_into(
+                async move {
+                    let _guard = guard;
+                    drop(inner.borrow_mut().take());
+                    probe.assert_not_dropped();
+                    std::future::pending::<()>().await;
+                },
+                crate::executor().current_task_queue(),
+            )
+            .unwrap()
+        };
+        *slot.borrow_mut() = Some(task);
+        futures_lite::future::yield_now().await;
+        assert!(slot.borrow().is_none(), "the task did not run");
+        future_drops.assert_dropped_once();
+    });
+}
+
 macro_rules! test_sizes {
     ($inline:ident, $boxed:ident, $body:ident $(, $arg:expr)*) => {
         #[test]
@@ -234,4 +307,16 @@ test_sizes!(
     completed_output_after_shutdown_inline,
     completed_output_after_shutdown_boxed,
     completed_output_after_shutdown
+);
+test_sizes!(
+    dropped_polled_scoped_task_inline,
+    dropped_polled_scoped_task_boxed,
+    dropped_scoped_task_drops_its_future,
+    false
+);
+test_sizes!(
+    dropped_queued_scoped_task_inline,
+    dropped_queued_scoped_task_boxed,
+    dropped_scoped_task_drops_its_future,
+    true
 );

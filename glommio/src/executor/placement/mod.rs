@@ -157,7 +157,8 @@ pub enum PoolPlacement {
     /// return `Result:: Err`.
     MaxPack(usize, Option<CpuSet>),
     /// One [`LocalExecutor`] is bound to each of the [`CpuSet`]s specified by
-    /// `Custom`. The number of `CpuSet`s in the `Vec` should match the
+    /// `Custom`, in order: the first executor the pool spawns gets the first
+    /// `CpuSet`. The number of `CpuSet`s in the `Vec` should match the
     /// number of shards requested from the pool builder.
     ///
     /// #### Errors
@@ -611,13 +612,10 @@ impl CpuSetGenerator {
             Self::Fenced(cpus) => CpuIter::from_vec(cpus.clone().into_iter().collect()),
             Self::MaxSpread(it) => CpuIter::from_option(it.next()),
             Self::MaxPack(it) => CpuIter::from_option(it.next()),
-            Self::Custom(cpu_sets) => CpuIter::Multi(
-                cpu_sets
-                    .pop()
-                    .expect("insufficient cpu sets")
-                    .into_iter()
-                    .collect(),
-            ),
+            Self::Custom(cpu_sets) => {
+                assert!(!cpu_sets.is_empty(), "insufficient cpu sets");
+                CpuIter::Multi(cpu_sets.remove(0).into_iter().collect())
+            }
         }
     }
 }
@@ -1205,8 +1203,8 @@ mod test {
         assert_eq!(
             bindings,
             vec![
-                HashSet::from_iter(vec![1, 4, 0, 5]),
-                HashSet::from_iter(vec![1, 3, 0, 2])
+                HashSet::from_iter(vec![1, 3, 0, 2]),
+                HashSet::from_iter(vec![1, 4, 0, 5])
             ]
         );
     }

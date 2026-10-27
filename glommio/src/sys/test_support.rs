@@ -1,7 +1,9 @@
-//! Test-only synchronization for foreign wake submission.
+//! Test-only hooks: synchronization for foreign wake submission, and
+//! injected ring submission failures.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    io,
     sync::mpsc::{Receiver, Sender},
     time::Duration,
 };
@@ -13,6 +15,7 @@ struct ForeignWakePause {
 
 thread_local! {
     static FOREIGN_WAKE_PAUSE: RefCell<Option<ForeignWakePause>> = const { RefCell::new(None) };
+    static SUBMIT_FAILURE: Cell<Option<(&'static str, i32)>> = const { Cell::new(None) };
 }
 
 /// Pauses this thread's next submission after enqueueing and releasing the queue lock.
@@ -38,4 +41,22 @@ pub(crate) fn after_foreign_wake_queued() {
             .recv_timeout(Duration::from_secs(10))
             .expect("owner did not resume the foreign submission");
     }
+}
+
+/// Fails this thread's next submission to the ring named `ring` with `errno`.
+pub(crate) fn fail_next_submit(ring: &'static str, errno: i32) {
+    assert!(SUBMIT_FAILURE
+        .with(|f| f.replace(Some((ring, errno))))
+        .is_none());
+}
+
+/// Takes the failure armed for the ring named `ring`, if any.
+pub(crate) fn take_submit_failure(ring: &str) -> Option<io::Error> {
+    SUBMIT_FAILURE.with(|f| match f.get() {
+        Some((name, errno)) if name == ring => {
+            f.set(None);
+            Some(io::Error::from_raw_os_error(errno))
+        }
+        _ => None,
+    })
 }

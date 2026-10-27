@@ -1355,6 +1355,10 @@ impl UringCommon for SleepableRing {
     }
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(err) = sys::test_support::take_submit_failure(self.name) {
+            return Err(err);
+        }
         let x = self.ring.submit()?;
         self.in_kernel += x;
         Ok(x)
@@ -2005,7 +2009,9 @@ impl Reactor {
     /// When sleeping:
     ///
     /// * It's ok to sleep, but if there is a timer set, we need to make sure
-    ///   we wake up to handle it.
+    ///   we wake up to handle it. If the kernel does not take that timer
+    ///   (`flush_rings!` lets `EBUSY`, `EAGAIN` and `EINTR` through as no
+    ///   submissions), we don't sleep this time.
     /// * From this moment on the remote executors are aware that we are
     ///   sleeping. We have to sweep the remote channels function once more
     ///   because since last time until now it could be that something
@@ -2061,7 +2067,7 @@ impl Reactor {
         flush_rings!(lat_ring, poll_ring, main_ring)?;
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        let should_sleep = preempt_timer().is_none()
+        let mut should_sleep = preempt_timer().is_none()
             && (woke == 0)
             && poll_ring.can_sleep()
             && main_ring.can_sleep()
@@ -2071,8 +2077,11 @@ impl Reactor {
             if let Some(dur) = user_timer {
                 self.latency_preemption_timeout_src
                     .set(Some(lat_ring.prepare_latency_preemption_timer(dur)));
-                assert!(flush_rings!(lat_ring)? > 0);
+                should_sleep = flush_rings!(lat_ring)? > 0;
             }
+        }
+
+        if should_sleep {
             self.notifier.prepare_to_sleep();
             membarrier::heavy();
             drop((poll_ring, main_ring, lat_ring));
@@ -2305,6 +2314,26 @@ mod tests {
             _ => "seccomp",
         };
         assert!(err.contains(expected), "{err}");
+    }
+
+    /// A timer the kernel did not take cannot end the sleep, so the reactor
+    /// must not sleep on it. A transient `EBUSY` used to panic here.
+    #[test]
+    fn unsubmitted_sleep_timer_skips_the_sleep() {
+        let (done, slept) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let notifier = sys::new_sleep_notifier().unwrap();
+            let pool =
+                BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+            let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+            reactor.install_eventfd();
+            sys::test_support::fail_next_submit("latency", libc::EBUSY);
+            let _ = done.send(reactor.wait(|| None, Some(Duration::from_secs(60)), 0, || 0));
+        });
+        let slept = slept
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reactor panicked, or slept without its timer");
+        assert!(!slept.unwrap());
     }
 
     /// Dropping the in-flight `slow` timer mid-test cancels it.

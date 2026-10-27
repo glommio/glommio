@@ -653,16 +653,24 @@ fn records_latency(src: &InnerSource) -> bool {
 }
 
 /// Extract a chain of events from the queue.
-/// The chain be empty if the sources were cancelled
+///
+/// Whatever follows a cancelled operation in its chain goes with it: a link
+/// timeout points into the cancelled source's memory, and the eventfd write
+/// behind a throughput timer would fire with no timer to wait for.
 fn extract_one_chain(
     source_map: &mut SourceMap,
     queue: &mut VecDeque<UringDescriptor>,
     chain: Range<usize>,
     now: &mut Option<Instant>,
 ) -> SmallVec<[UringDescriptor; 1]> {
+    let mut cancelled = false;
     queue
         .drain(chain)
         .filter(move |op| {
+            if cancelled {
+                debug_assert_eq!(op.user_data, 0, "a source linked behind a cancelled one");
+                return false;
+            }
             if op.user_data > 0 {
                 let id = from_user_data(op.user_data);
                 let status = source_map.peek_source_mut(from_user_data(op.user_data), |mut x| {
@@ -681,6 +689,7 @@ fn extract_one_chain(
                 });
                 if status == EnqueuedStatus::Canceled {
                     source_map.consume_source(id);
+                    cancelled = true;
                     return false;
                 }
             }
@@ -2451,6 +2460,79 @@ mod tests {
         ring.submit_one_event(&mut queue.submissions);
         assert_eq!(2, ring.submit_sqes().unwrap());
         assert_eq!(2, ring.consume_completion_queue(&mut 0));
+    }
+
+    fn ring_with_map() -> (SleepableRing, Rc<RefCell<SourceMap>>) {
+        let allocator = Rc::new(UringBufferAllocator::new(65536));
+        let source_map = Rc::new(RefCell::new(SourceMap::default()));
+        let ring = SleepableRing::new(4, "main", allocator, source_map.clone()).unwrap();
+        (ring, source_map)
+    }
+
+    fn timed_nop(ring: &mut SleepableRing, source_map: &RefCell<SourceMap>) -> Source {
+        let source = Source::new(
+            IoRequirements::default(),
+            -1,
+            SourceType::Invalid,
+            None,
+            None,
+        );
+        source.set_timeout(Duration::from_secs(60));
+        queue_request_into_ring(
+            ring,
+            &source,
+            UringOpDescriptor::Nop,
+            &mut source_map.borrow_mut(),
+        );
+        source
+    }
+
+    /// The link timeout is queued right behind its operation.
+    #[test]
+    fn timed_source_submits_with_its_link_timeout() {
+        let (mut ring, source_map) = ring_with_map();
+        let _source = timed_nop(&mut ring, &source_map);
+
+        let q = ring.submission_queue();
+        assert_eq!(
+            Some(true),
+            ring.submit_one_event(&mut q.borrow_mut().submissions)
+        );
+        assert_eq!(2, ring.submit_sqes().unwrap());
+    }
+
+    /// The link timeout points into the source, so it cannot be submitted
+    /// once the source is gone.
+    #[test]
+    fn dropped_timed_source_takes_its_link_timeout_along() {
+        let (mut ring, source_map) = ring_with_map();
+        drop(timed_nop(&mut ring, &source_map));
+
+        let q = ring.submission_queue();
+        assert_eq!(
+            Some(false),
+            ring.submit_one_event(&mut q.borrow_mut().submissions)
+        );
+        assert_eq!(0, ring.submit_sqes().unwrap());
+    }
+
+    /// Without its timer, the eventfd write would run at once and preempt.
+    #[test]
+    fn dropped_throughput_timer_takes_its_eventfd_write_along() {
+        use nix::sys::eventfd::{EfdFlags, EventFd};
+        use std::os::fd::AsRawFd;
+
+        let (mut ring, _source_map) = ring_with_map();
+        let eventfd = EventFd::from_flags(EfdFlags::EFD_NONBLOCK).unwrap();
+        drop(ring.prepare_throughput_preemption_timer(1, eventfd.as_raw_fd()));
+
+        let q = ring.submission_queue();
+        assert_eq!(
+            Some(false),
+            ring.submit_one_event(&mut q.borrow_mut().submissions)
+        );
+        assert_eq!(0, ring.submit_sqes().unwrap());
+        assert_eq!(Err(nix::errno::Errno::EAGAIN), eventfd.read());
     }
 
     #[test]

@@ -1,0 +1,40 @@
+name: Stale approvals
+
+# Approvals survive a push by a maintainer and are dismissed after anyone
+# else pushes. Runs in the base repository so it can dismiss reviews on pull
+# requests from forks; it never checks out or runs the pull request's code.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [synchronize]
+
+permissions: {}
+
+jobs:
+  dismiss:
+    name: Dismiss approvals after a non-maintainer push
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+
+    steps:
+      - name: Dismiss approvals unless a maintainer pushed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PUSHER: ${{ github.event.sender.login }}
+        run: |
+          role=$(gh api "repos/$REPO/collaborators/$PUSHER/permission" --jq .role_name || echo none)
+          case "$role" in
+            admin|maintain)
+              echo "$PUSHER has the $role role, approvals kept"
+              exit 0
+              ;;
+          esac
+          gh api --paginate "repos/$REPO/pulls/$PR/reviews" --jq '.[] | select(.state == "APPROVED") | .id' |
+            while read -r id; do
+              gh api --method PUT "repos/$REPO/pulls/$PR/reviews/$id/dismissals" \
+                -f event=DISMISS \
+                -f message="New commits pushed by $PUSHER after this approval."
+            done

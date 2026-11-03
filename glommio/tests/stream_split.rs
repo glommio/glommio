@@ -164,12 +164,26 @@ fn read_timeout_lives_on_the_read_half() {
 fn write_half_shutdown_reaches_the_peer() {
     LocalExecutor::default().run(async {
         let (server, mut client) = tcp_pair().await;
-        let (_rx, tx) = server.split();
-        tx.shutdown(std::net::Shutdown::Write).await.unwrap();
+        let (mut rx, tx) = server.split();
+        tx.shutdown().await.unwrap();
 
         let mut buf = [0u8; 1];
         assert_eq!(client.read(&mut buf).await.unwrap(), 0);
+
+        // Only the write direction went: the read half still receives.
+        client.write_all(b"x").await.unwrap();
+        rx.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"x");
     });
+}
+
+#[test]
+fn split_and_reunite_work_once_the_executor_is_gone() {
+    let ex = LocalExecutor::default();
+    let (a, _b) = ex.run(async { UnixStream::pair().unwrap() });
+    drop(ex);
+    let (rx, tx) = a.split();
+    UnixStream::reunite(rx, tx).unwrap();
 }
 
 #[test]

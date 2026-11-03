@@ -890,10 +890,12 @@ impl TcpWriteHalf {
         self.stream.write_timeout()
     }
 
-    /// Shuts down the read, write, or both halves of the connection, as
-    /// [`TcpStream::shutdown`] does.
-    pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
-        poll_fn(|cx| self.stream.poll_shutdown(cx, how))
+    /// Shuts down the write direction, so the peer reads end of file.
+    ///
+    /// Only this direction: the read half's stream is not this half's to end.
+    /// [`TcpStream::shutdown`] on the reunited stream takes a [`Shutdown`].
+    pub async fn shutdown(&self) -> Result<()> {
+        poll_fn(|cx| self.stream.poll_shutdown(cx, Shutdown::Write))
             .await
             .map_err(Into::into)
     }
@@ -906,6 +908,17 @@ impl TcpWriteHalf {
     /// Returns whether `TCP_NODELAY` is set.
     pub fn nodelay(&self) -> Result<bool> {
         self.stream.stream().nodelay().map_err(Into::into)
+    }
+
+    /// Sets `IP_TTL` for packets this half sends, as [`TcpStream::set_ttl`]
+    /// does.
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        self.stream.stream().set_ttl(ttl).map_err(Into::into)
+    }
+
+    /// Returns `IP_TTL`.
+    pub fn ttl(&self) -> Result<u32> {
+        self.stream.stream().ttl().map_err(Into::into)
     }
 
     /// Returns the socket address of the remote peer.

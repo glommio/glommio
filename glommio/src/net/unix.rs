@@ -490,10 +490,12 @@ impl<B: RxBuf> UnixReadHalf<B> {
 }
 
 impl UnixWriteHalf {
-    /// Shuts down the read, write, or both halves of the connection, as
-    /// [`UnixStream::shutdown`] does.
-    pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
-        poll_fn(|cx| self.stream.poll_shutdown(cx, how))
+    /// Shuts down the write direction, so the peer reads end of file.
+    ///
+    /// Only this direction: the read half's stream is not this half's to end.
+    /// [`UnixStream::shutdown`] on the reunited stream takes a [`Shutdown`].
+    pub async fn shutdown(&self) -> Result<()> {
+        poll_fn(|cx| self.stream.poll_shutdown(cx, Shutdown::Write))
             .await
             .map_err(Into::into)
     }

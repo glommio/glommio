@@ -545,17 +545,19 @@ impl<S: AsRawFd> NonBufferedStream<S> {
     ///
     /// The receiving side keeps the read readiness source and the read
     /// timeout, the sending side keeps the write readiness source and the
-    /// write timeout. Each side gets a fresh, unused timer slot for the
-    /// direction it does not own, so both remain complete streams.
+    /// write timeout. Each side gets a fresh timer id for the direction it
+    /// does not own, so both remain complete streams; that id is never armed,
+    /// so it may be anything, including 0 once the executor is gone.
     fn split(self) -> (NonBufferedStream<Rc<S>>, NonBufferedStream<Rc<S>>) {
-        let reactor = self.reactor.upgrade().unwrap();
+        let spare_id = || self.reactor.upgrade().map_or(0, |r| r.register_timer());
+        let (rx_spare, tx_spare) = (spare_id(), spare_id());
         let stream = Rc::new(self.stream);
         let rx = NonBufferedStream {
             reactor: self.reactor.clone(),
             stream: stream.clone(),
             source_tx: None,
             source_rx: self.source_rx,
-            write_timeout: Timeout::new(reactor.register_timer()),
+            write_timeout: Timeout::new(rx_spare),
             read_timeout: self.read_timeout,
         };
         let tx = NonBufferedStream {
@@ -564,20 +566,21 @@ impl<S: AsRawFd> NonBufferedStream<S> {
             source_tx: self.source_tx,
             source_rx: None,
             write_timeout: self.write_timeout,
-            read_timeout: Timeout::new(reactor.register_timer()),
+            read_timeout: Timeout::new(tx_spare),
         };
         (rx, tx)
     }
 }
 
 impl<S: AsRawFd> NonBufferedStream<Rc<S>> {
-    /// Whether two halves came from the same [`split`](Self::split).
+    /// Whether two halves came from the same [`split`](Self::split) and are
+    /// the socket's only owners, which is what `unsplit` needs.
     fn is_pair(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.stream, &other.stream)
+        Rc::ptr_eq(&self.stream, &other.stream) && Rc::strong_count(&self.stream) == 2
     }
 
     /// Reassembles the stream `split` took apart. The caller has checked
-    /// [`is_pair`](Self::is_pair), so the socket has no other owner.
+    /// [`is_pair`](Self::is_pair).
     fn unsplit(rx: Self, tx: Self) -> NonBufferedStream<S> {
         if let Some(reactor) = rx.reactor.upgrade() {
             rx.write_timeout.cancel_timer(&reactor);

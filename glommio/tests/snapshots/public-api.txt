@@ -2559,8 +2559,10 @@ pub fn glommio::net::TcpWriteHalf::local_addr(&self) -> glommio::Result<core::ne
 pub fn glommio::net::TcpWriteHalf::nodelay(&self) -> glommio::Result<bool>
 pub fn glommio::net::TcpWriteHalf::peer_addr(&self) -> glommio::Result<core::net::socket_addr::SocketAddr>
 pub fn glommio::net::TcpWriteHalf::set_nodelay(&self, value: bool) -> glommio::Result<()>
+pub fn glommio::net::TcpWriteHalf::set_ttl(&self, ttl: u32) -> glommio::Result<()>
 pub fn glommio::net::TcpWriteHalf::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
-pub async fn glommio::net::TcpWriteHalf::shutdown(&self, how: std::net::Shutdown) -> glommio::Result<()>
+pub async fn glommio::net::TcpWriteHalf::shutdown(&self) -> glommio::Result<()>
+pub fn glommio::net::TcpWriteHalf::ttl(&self) -> glommio::Result<u32>
 pub fn glommio::net::TcpWriteHalf::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl core::fmt::Debug for glommio::net::TcpWriteHalf
 pub fn glommio::net::TcpWriteHalf::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2900,7 +2902,7 @@ pub struct glommio::net::UnixWriteHalf
 impl glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub fn glommio::net::UnixWriteHalf::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
-pub async fn glommio::net::UnixWriteHalf::shutdown(&self, how: std::net::Shutdown) -> glommio::Result<()>
+pub async fn glommio::net::UnixWriteHalf::shutdown(&self) -> glommio::Result<()>
 impl core::fmt::Debug for glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl futures_io::if_std::AsyncWrite for glommio::net::UnixWriteHalf

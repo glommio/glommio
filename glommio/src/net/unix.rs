@@ -406,6 +406,159 @@ impl<B: RxBuf> UnixStream<B> {
     }
 }
 
+impl<B: RxBuf> UnixStream<B> {
+    /// Splits the stream into a read half and a write half that share the
+    /// socket, so one task can read while another writes. See
+    /// [`TcpStream::split`](crate::net::TcpStream::split).
+    pub fn split(self) -> (UnixReadHalf<B>, UnixWriteHalf) {
+        let (rx, tx) = self.stream.split();
+        (UnixReadHalf { stream: rx }, UnixWriteHalf { stream: tx })
+    }
+
+    /// Puts the two halves of a [`split`](Self::split) stream back together.
+    ///
+    /// Fails, returning both halves, if they come from different streams.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the halves go back to the caller, who still owns the socket through them"
+    )]
+    pub fn reunite(
+        rx: UnixReadHalf<B>,
+        tx: UnixWriteHalf,
+    ) -> std::result::Result<Self, (UnixReadHalf<B>, UnixWriteHalf)> {
+        match GlommioStream::unsplit(rx.stream, tx.stream) {
+            Ok(stream) => Ok(Self { stream }),
+            Err((rx, tx)) => Err((UnixReadHalf { stream: rx }, UnixWriteHalf { stream: tx })),
+        }
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    /// The reading half of a [`UnixStream`], from [`UnixStream::split`].
+    ///
+    /// Implements [`AsyncRead`], and [`AsyncBufRead`] when the stream was
+    /// buffered. `peek` lives here.
+    ///
+    /// [`AsyncRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncRead.html
+    /// [`AsyncBufRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncBufRead.html
+    pub struct UnixReadHalf<B: RxBuf = NonBuffered> {
+        stream: GlommioStream<Rc<net::UnixStream>, B>
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    /// The writing half of a [`UnixStream`], from [`UnixStream::split`].
+    ///
+    /// Implements [`AsyncWrite`]. `shutdown` lives here.
+    ///
+    /// [`AsyncWrite`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncWrite.html
+    pub struct UnixWriteHalf {
+        stream: GlommioStream<Rc<net::UnixStream>, NonBuffered>
+    }
+}
+
+impl<B: RxBuf> AsRawFd for UnixReadHalf<B> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.stream().as_raw_fd()
+    }
+}
+
+impl AsRawFd for UnixWriteHalf {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.stream().as_raw_fd()
+    }
+}
+
+impl<B: RxBuf> UnixReadHalf<B> {
+    /// Receives data without removing it from the queue, as
+    /// [`UnixStream::peek`] does.
+    pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
+        self.stream.peek(buf).await.map_err(Into::into)
+    }
+
+    /// Returns the socket address of the remote peer.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().peer_addr().map_err(Into::into)
+    }
+
+    /// Returns the socket address of the local half of this connection.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().local_addr().map_err(Into::into)
+    }
+}
+
+impl UnixWriteHalf {
+    /// Shuts down the read, write, or both halves of the connection, as
+    /// [`UnixStream::shutdown`] does.
+    pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
+        poll_fn(|cx| self.stream.poll_shutdown(cx, how))
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Returns the socket address of the remote peer.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().peer_addr().map_err(Into::into)
+    }
+
+    /// Returns the socket address of the local half of this connection.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().local_addr().map_err(Into::into)
+    }
+}
+
+impl<B: Buffered + Unpin> AsyncBufRead for UnixReadHalf<B> {
+    fn poll_fill_buf<'a>(
+        self: Pin<&'a mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<&'a [u8]>> {
+        let this = self.project();
+        this.stream.poll_fill_buf(cx)
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        self.stream.consume(amt);
+    }
+}
+
+impl<B: RxBuf + Unpin> AsyncRead for UnixReadHalf<B> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for UnixWriteHalf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_close(cx)
+    }
+}
+
 impl<B: Buffered + Unpin> AsyncBufRead for UnixStream<B> {
     fn poll_fill_buf<'a>(
         self: Pin<&'a mut Self>,

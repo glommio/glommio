@@ -143,7 +143,9 @@ mod udp_socket;
 mod unix;
 pub use self::{
     stream::{Buffered, Preallocated},
-    tcp_socket::{AcceptedTcpStream, TcpListener, TcpStream},
+    tcp_socket::{AcceptedTcpStream, TcpListener, TcpReadHalf, TcpStream, TcpWriteHalf},
     udp_socket::UdpSocket,
-    unix::{AcceptedUnixStream, UnixDatagram, UnixListener, UnixStream},
+    unix::{
+        AcceptedUnixStream, UnixDatagram, UnixListener, UnixReadHalf, UnixStream, UnixWriteHalf,
+    },
 };

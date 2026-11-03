@@ -1,12 +1,15 @@
-//! What a split connection costs, per round trip, against the two
-//! alternatives: no split at all, and `futures_lite::io::split`, which wraps
-//! the stream in an `Arc<Mutex>` and locks it on every poll.
+//! What a split connection costs, per round trip, against the alternative:
+//! `futures_lite::io::split`, which wraps the stream in an `Arc<Mutex>` and
+//! locks it on every poll.
 //!
-//! Each arm runs `CONNECTIONS` echo clients on one executor and reports the
-//! executor thread's **CPU time** per round trip: wall clock on loopback is
-//! mostly waiting for the peer, and waiting is not the thing being measured.
-//! The server side is the same unsplit echo loop in every arm, so the arms
-//! differ only in how the client reads and writes.
+//! Each arm runs `CONNECTIONS` pipelined echo clients on one executor and
+//! reports the executor thread's **CPU time** per round trip: wall clock on
+//! loopback is mostly waiting for the peer, and waiting is not the thing being
+//! measured. The server side is the same unsplit echo loop in both arms, and
+//! because the clients write ahead it echoes several messages per read in
+//! both, so the arms differ only in how the client reads and writes. A
+//! lockstep client, one message in flight, is a different workload, with one
+//! server read per round trip, and is not a comparison for either arm.
 //!
 //! ```bash
 //! cargo bench --bench stream_split
@@ -71,8 +74,6 @@ where
 /// Which way the client side reads and writes.
 #[derive(Clone, Copy)]
 enum Arm {
-    /// One task writes a message then reads the echo.
-    Lockstep,
     /// `futures_lite::io::split`: an `Arc<Mutex>` around the stream.
     MutexSplit,
     /// `TcpStream::split`.
@@ -100,14 +101,6 @@ fn run(arm: Arm, rounds: u64) -> Duration {
             for client in clients {
                 tasks.push(glommio::spawn_local(async move {
                     match arm {
-                        Arm::Lockstep => {
-                            let mut client = client;
-                            let mut buf = [0u8; MSG.len()];
-                            for _ in 0..rounds {
-                                client.write_all(MSG).await.unwrap();
-                                client.read_exact(&mut buf).await.unwrap();
-                            }
-                        }
                         Arm::MutexSplit => {
                             let (rx, tx) = futures_lite::io::split(client);
                             pump(rx, tx, rounds).await;
@@ -137,9 +130,6 @@ fn run(arm: Arm, rounds: u64) -> Duration {
 fn stream_split(c: &mut Criterion) {
     let mut group = c.benchmark_group("stream_split");
     group.throughput(Throughput::Elements(CONNECTIONS as u64));
-    group.bench_function("lockstep", |b| {
-        b.iter_custom(|iters| run(Arm::Lockstep, iters))
-    });
     group.bench_function("futures-lite split", |b| {
         b.iter_custom(|iters| run(Arm::MutexSplit, iters))
     });

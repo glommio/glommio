@@ -739,6 +739,18 @@ mod tests {
         };
     }
 
+    unix_socket_test!(send_to_through_the_ring_sends_the_whole_datagram, dir, {
+        let path = dir.join("rx");
+        let receiver = UnixDatagram::bind(&path).unwrap();
+        let sender = UnixDatagram::unbound().unwrap();
+        sender.socket.tx_yolo.set(false);
+        let sent = sender.send_to(&[7u8; 100], &path).await.unwrap();
+        assert_eq!(sent, 100);
+        let mut buf = [0u8; 256];
+        let n = receiver.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[7u8; 100]);
+    });
+
     unix_socket_test!(write_vectored_writes_every_slice, dir, {
         let mut file = dir.clone();
         file.push("name");

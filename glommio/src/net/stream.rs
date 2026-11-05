@@ -218,17 +218,22 @@ impl RxBuf for Preallocated {
 
 #[derive(Debug)]
 struct Timeout {
-    id: u64,
+    /// Handle to the registered timer, minted by the reactor rather than by
+    /// the caller. Present exactly while a timer is registered, and the only
+    /// record that one is: a separate deadline would be a second copy of the
+    /// same fact, free to disagree with this one.
+    handle: Cell<Option<crate::timer::TimerId>>,
+
+    /// What the caller asked for, independent of whether a timer is currently
+    /// registered for it.
     timeout: Cell<Option<Duration>>,
-    timer: Cell<Option<Instant>>,
 }
 
 impl Timeout {
-    fn new(id: u64) -> Self {
+    fn new() -> Self {
         Self {
-            id,
+            handle: Cell::new(None),
             timeout: Cell::new(None),
-            timer: Cell::new(None),
         }
     }
 
@@ -248,25 +253,25 @@ impl Timeout {
 
     fn maybe_set_timer(&self, reactor: &Reactor, waker: &Waker) {
         if let Some(timeout) = self.timeout.get() {
-            if self.timer.get().is_none() {
+            if self.handle.get().is_none() {
                 let deadline = Instant::now() + timeout;
-                reactor.insert_timer(self.id, deadline, waker.clone());
-                self.timer.set(Some(deadline));
+                self.handle
+                    .set(Some(reactor.insert_timer(deadline, waker.clone())));
             }
         }
     }
 
     fn cancel_timer(&self, reactor: &Reactor) {
-        if self.timer.take().is_some() {
-            reactor.remove_timer(self.id);
+        if let Some(handle) = self.handle.take() {
+            reactor.remove_timer(handle);
         }
     }
 
     fn check(&self, reactor: &Reactor) -> io::Result<()> {
-        if let Some(deadline) = self.timer.get() {
-            if !reactor.timer_exists(&(deadline, self.id)) {
-                reactor.remove_timer(self.id);
-                self.timer.take();
+        if let Some(handle) = self.handle.get() {
+            if !reactor.timer_exists(handle) {
+                reactor.remove_timer(handle);
+                self.handle.take();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "Operation timed out",
@@ -456,8 +461,8 @@ where
             stream: socket.into(),
             source_tx: None,
             source_rx: None,
-            write_timeout: Timeout::new(reactor.register_timer()),
-            read_timeout: Timeout::new(reactor.register_timer()),
+            write_timeout: Timeout::new(),
+            read_timeout: Timeout::new(),
         };
         stream.init();
         GlommioStream {
@@ -676,19 +681,16 @@ impl<S: AsRawFd> NonBufferedStream<S> {
     ///
     /// The receiving side keeps the read readiness source and the read
     /// timeout, the sending side keeps the write readiness source and the
-    /// write timeout. Each side gets a fresh timer id for the direction it
-    /// does not own, so both remain complete streams; that id is never armed,
-    /// so it may be anything, including 0 once the executor is gone.
+    /// write timeout. Each side gets an unarmed timeout for the direction it
+    /// does not own, so both remain complete streams.
     fn split(self) -> (NonBufferedStream<Rc<S>>, NonBufferedStream<Rc<S>>) {
-        let spare_id = || self.reactor.upgrade().map_or(0, |r| r.register_timer());
-        let (rx_spare, tx_spare) = (spare_id(), spare_id());
         let stream = Rc::new(self.stream);
         let rx = NonBufferedStream {
             reactor: self.reactor.clone(),
             stream: stream.clone(),
             source_tx: None,
             source_rx: self.source_rx,
-            write_timeout: Timeout::new(rx_spare),
+            write_timeout: Timeout::new(),
             read_timeout: self.read_timeout,
         };
         let tx = NonBufferedStream {
@@ -697,7 +699,7 @@ impl<S: AsRawFd> NonBufferedStream<S> {
             source_tx: self.source_tx,
             source_rx: None,
             write_timeout: self.write_timeout,
-            read_timeout: Timeout::new(tx_spare),
+            read_timeout: Timeout::new(),
         };
         (rx, tx)
     }

@@ -18,13 +18,48 @@ use std::{
     ffi::CString,
     fmt,
     mem::MaybeUninit,
-    os::unix::io::RawFd,
-    path::PathBuf,
+    os::unix::{ffi::OsStrExt, io::RawFd},
+    path::Path,
     pin::Pin,
     rc::Rc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
+
+/// A path in the form this platform's syscalls take it.
+///
+/// On Unix that is a NUL-terminated byte string. Windows would want a
+/// NUL-terminated `Vec<u16>`, which is why this is a type of its own rather
+/// than a `CString` spelled out at every call site: the conversion from
+/// `Path` happens once, here, and the rest of the runtime holds whatever the
+/// kernel wants.
+///
+/// It is kept rather than converted at submission because io_uring is handed
+/// a pointer and reads it when it runs the operation, which is after the call
+/// that submitted it has returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativePath(CString);
+
+impl NativePath {
+    pub(crate) fn as_ptr(&self) -> *const libc::c_char {
+        self.0.as_ptr()
+    }
+}
+
+impl TryFrom<&Path> for NativePath {
+    type Error = io::Error;
+
+    /// Fails for a path holding an interior NUL, which cannot name a file.
+    ///
+    /// `EFAULT` is what the blocking pool answered for this before there was
+    /// a conversion here at all, so the answer does not change with the path
+    /// an operation takes.
+    fn try_from(path: &Path) -> io::Result<Self> {
+        CString::new(path.as_os_str().as_bytes())
+            .map(NativePath)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EFAULT))
+    }
+}
 
 #[derive(Debug)]
 /// Clippy is unhappy with some of the fields on these enums never being read,
@@ -59,9 +94,9 @@ pub(crate) enum SourceType {
     Timeout(TimeSpec64, u32),
     Connect(nix::sys::socket::SockaddrStorage),
     Accept(SockAddrStorage),
-    Rename(PathBuf, PathBuf),
-    CreateDir(PathBuf),
-    Remove(PathBuf),
+    Rename(NativePath, NativePath),
+    CreateDir(NativePath),
+    Remove(NativePath),
     BlockingFn,
     Invalid,
     CopyFileRange(RawFd, u64, usize),

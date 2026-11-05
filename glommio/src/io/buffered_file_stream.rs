@@ -14,6 +14,7 @@ use futures_lite::{
 };
 use pin_project_lite::pin_project;
 use std::{
+    borrow::Borrow,
     convert::TryInto,
     io,
     os::unix::io::AsRawFd,
@@ -23,6 +24,20 @@ use std::{
 };
 
 use crate::Result;
+
+/// Takes the source out of `slot` once its operation has completed. Until
+/// then the source stays where it is and `cx` is registered to hear when it
+/// does.
+fn take_completed<S: Borrow<Source>>(slot: &mut Option<S>, cx: &Context<'_>) -> Poll<Option<S>> {
+    if let Some(source) = slot.as_ref() {
+        let source: &Source = source.borrow();
+        if source.result().is_none() {
+            source.add_waiter_single(cx.waker());
+            return Poll::Pending;
+        }
+    }
+    Poll::Ready(slot.take())
+}
 
 pin_project! {
     #[derive(Debug)]
@@ -411,7 +426,7 @@ impl StreamWriter {
         if !self.sync_on_close {
             Poll::Ready(Ok(()))
         } else {
-            match self.source.take() {
+            match ready!(take_completed(&mut self.source, cx)) {
                 None => {
                     let source = self
                         .reactor
@@ -431,7 +446,7 @@ impl StreamWriter {
     }
 
     fn poll_inner_close(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
-        match self.source.take() {
+        match ready!(take_completed(&mut self.source, cx)) {
             None => {
                 let source = self
                     .reactor
@@ -454,7 +469,7 @@ impl StreamWriter {
     }
 
     fn do_poll_flush(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
-        match self.source.take() {
+        match ready!(take_completed(&mut self.source, cx)) {
             None => match self.flush_write_buffer(cx.waker()) {
                 true => Poll::Pending,
                 false => Poll::Ready(Ok(())),
@@ -502,7 +517,7 @@ macro_rules! do_seek {
                 $self.file_pos = ($self.file_pos as i64 + pos) as u64;
                 Poll::Ready(Ok($self.file_pos))
             }
-            SeekFrom::End(pos) => match $source.take() {
+            SeekFrom::End(pos) => match ready!(take_completed(&mut $source, $cx)) {
                 None => {
                     let source = $self.reactor.upgrade().unwrap().statx($fileobj.as_raw_fd());
                     source.add_waiter_single($cx.waker());
@@ -563,7 +578,7 @@ impl AsyncBufRead for StreamReader {
         mut self: Pin<&'a mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<&'a [u8]>> {
-        match self.io_source.take() {
+        match ready!(take_completed(&mut self.io_source, cx)) {
             Some(source) => {
                 let res = source.result().unwrap();
                 match res {
@@ -612,7 +627,7 @@ impl AsyncWrite for StreamWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if let Some(source) = self.source.take() {
+        if let Some(source) = ready!(take_completed(&mut self.source, cx)) {
             if let Err(x) = self.consume_flush_result(source) {
                 return Poll::Ready(Err(x));
             }
@@ -655,14 +670,9 @@ impl AsyncBufRead for Stdin {
         mut self: Pin<&'a mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<&'a [u8]>> {
-        match self.source.take() {
+        match ready!(take_completed(&mut self.source, cx)) {
             Some(source) => {
-                let res = match source.result() {
-                    Some(res) => res,
-                    None => {
-                        return Poll::Pending;
-                    }
-                };
+                let res = source.result().unwrap();
                 match res {
                     Err(x) => Poll::Ready(Err(x)),
                     Ok(sz) => {
@@ -699,6 +709,44 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn polling_before_the_io_completes_waits_for_it() {
+        let dir = make_test_directories("poll-before-completion").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("f");
+            std::fs::write(&path, (0..8192u32).map(|i| i as u8).collect::<Vec<_>>()).unwrap();
+
+            let mut reader =
+                StreamReaderBuilder::new(BufferedFile::open(&path).await.unwrap()).build();
+            let mut buf = [0u8; 16];
+            let mut read = reader.read(&mut buf);
+            assert!(futures::poll!(&mut read).is_pending());
+            assert!(futures::poll!(&mut read).is_pending());
+            assert_eq!(read.await.unwrap(), 16);
+            assert_eq!(buf[15], 15);
+
+            let mut end = reader.seek(SeekFrom::End(0));
+            assert!(futures::poll!(&mut end).is_pending());
+            assert!(futures::poll!(&mut end).is_pending());
+            assert_eq!(end.await.unwrap(), 8192);
+            reader.close().await.unwrap();
+
+            let out = dir.path.join("out");
+            let mut writer =
+                StreamWriterBuilder::new(BufferedFile::create(&out).await.unwrap()).build();
+            writer.write_all(b"abc").await.unwrap();
+            let mut flush = writer.flush();
+            assert!(futures::poll!(&mut flush).is_pending());
+            assert!(futures::poll!(&mut flush).is_pending());
+            flush.await.unwrap();
+            let mut close = writer.close();
+            assert!(futures::poll!(&mut close).is_pending());
+            assert!(futures::poll!(&mut close).is_pending());
+            close.await.unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), b"abc");
+        });
+    }
     use crate::{test_utils::make_test_directories, GlommioError};
     use futures_lite::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt};
     use std::{io::ErrorKind, time::Duration};

@@ -758,6 +758,230 @@ impl<B: RxBuf> TcpStream<B> {
     }
 }
 
+impl<B: RxBuf> TcpStream<B> {
+    /// Splits the stream into a read half and a write half that share the
+    /// socket, so one task can read while another writes.
+    ///
+    /// Each half owns its direction outright: the read half keeps the receive
+    /// buffer and the read timeout, the write half keeps the write timeout.
+    /// Dropping one half leaves the other working; the socket closes when
+    /// both are gone. [`reunite`](Self::reunite) puts the pair back together.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+    /// use glommio::{net::TcpStream, LocalExecutor};
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async move {
+    ///     let stream = TcpStream::connect("127.0.0.1:10000").await.unwrap();
+    ///     let (mut rx, mut tx) = stream.split();
+    ///     let reader = glommio::spawn_local(async move {
+    ///         let mut buf = [0u8; 1024];
+    ///         while let Ok(n) = rx.read(&mut buf).await {
+    ///             if n == 0 {
+    ///                 break;
+    ///             }
+    ///         }
+    ///     });
+    ///     tx.write_all(b"hello").await.unwrap();
+    ///     tx.close().await.unwrap();
+    ///     reader.await;
+    /// })
+    /// ```
+    pub fn split(self) -> (TcpReadHalf<B>, TcpWriteHalf) {
+        let (rx, tx) = self.stream.split();
+        (TcpReadHalf { stream: rx }, TcpWriteHalf { stream: tx })
+    }
+
+    /// Puts the two halves of a [`split`](Self::split) stream back together.
+    ///
+    /// Fails, returning both halves, if they come from different streams.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the halves go back to the caller, who still owns the socket through them"
+    )]
+    pub fn reunite(
+        rx: TcpReadHalf<B>,
+        tx: TcpWriteHalf,
+    ) -> std::result::Result<Self, (TcpReadHalf<B>, TcpWriteHalf)> {
+        match GlommioStream::unsplit(rx.stream, tx.stream) {
+            Ok(stream) => Ok(Self { stream }),
+            Err((rx, tx)) => Err((TcpReadHalf { stream: rx }, TcpWriteHalf { stream: tx })),
+        }
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    /// The reading half of a [`TcpStream`], from [`TcpStream::split`].
+    ///
+    /// Implements [`AsyncRead`], and [`AsyncBufRead`] when the stream was
+    /// buffered. The read timeout and `peek` live here.
+    ///
+    /// [`AsyncRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncRead.html
+    /// [`AsyncBufRead`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncBufRead.html
+    pub struct TcpReadHalf<B: RxBuf = NonBuffered> {
+        stream: GlommioStream<Rc<net::TcpStream>, B>
+    }
+}
+
+pin_project! {
+    #[derive(Debug)]
+    /// The writing half of a [`TcpStream`], from [`TcpStream::split`].
+    ///
+    /// Implements [`AsyncWrite`]. The write timeout and `shutdown` live here.
+    ///
+    /// [`AsyncWrite`]: https://docs.rs/futures-io/0.3.8/futures_io/trait.AsyncWrite.html
+    pub struct TcpWriteHalf {
+        stream: GlommioStream<Rc<net::TcpStream>, NonBuffered>
+    }
+}
+
+impl<B: RxBuf> AsRawFd for TcpReadHalf<B> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.stream().as_raw_fd()
+    }
+}
+
+impl AsRawFd for TcpWriteHalf {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.stream().as_raw_fd()
+    }
+}
+
+impl<B: RxBuf> TcpReadHalf<B> {
+    /// Sets the read timeout, as [`TcpStream::set_read_timeout`] does.
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.stream.set_read_timeout(dur)
+    }
+
+    /// Returns the read timeout.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.stream.read_timeout()
+    }
+
+    /// Receives data without removing it from the queue, as
+    /// [`TcpStream::peek`] does.
+    pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
+        self.stream.peek(buf).await.map_err(Into::into)
+    }
+
+    /// Returns the socket address of the remote peer.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().peer_addr().map_err(Into::into)
+    }
+
+    /// Returns the socket address of the local half of this connection.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().local_addr().map_err(Into::into)
+    }
+}
+
+impl TcpWriteHalf {
+    /// Sets the write timeout, as [`TcpStream::set_write_timeout`] does.
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.stream.set_write_timeout(dur)
+    }
+
+    /// Returns the write timeout.
+    pub fn write_timeout(&self) -> Option<Duration> {
+        self.stream.write_timeout()
+    }
+
+    /// Shuts down the write direction, so the peer reads end of file.
+    ///
+    /// Only this direction: the read half's stream is not this half's to end.
+    /// [`TcpStream::shutdown`] on the reunited stream takes a [`Shutdown`].
+    pub async fn shutdown(&self) -> Result<()> {
+        poll_fn(|cx| self.stream.poll_shutdown(cx, Shutdown::Write))
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Sets `TCP_NODELAY`, as [`TcpStream::set_nodelay`] does.
+    pub fn set_nodelay(&self, value: bool) -> Result<()> {
+        self.stream.stream().set_nodelay(value).map_err(Into::into)
+    }
+
+    /// Returns whether `TCP_NODELAY` is set.
+    pub fn nodelay(&self) -> Result<bool> {
+        self.stream.stream().nodelay().map_err(Into::into)
+    }
+
+    /// Sets `IP_TTL` for packets this half sends, as [`TcpStream::set_ttl`]
+    /// does.
+    pub fn set_ttl(&self, ttl: u32) -> Result<()> {
+        self.stream.stream().set_ttl(ttl).map_err(Into::into)
+    }
+
+    /// Returns `IP_TTL`.
+    pub fn ttl(&self) -> Result<u32> {
+        self.stream.stream().ttl().map_err(Into::into)
+    }
+
+    /// Returns the socket address of the remote peer.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().peer_addr().map_err(Into::into)
+    }
+
+    /// Returns the socket address of the local half of this connection.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.stream.stream().local_addr().map_err(Into::into)
+    }
+}
+
+impl<B: Buffered + Unpin> AsyncBufRead for TcpReadHalf<B> {
+    fn poll_fill_buf<'a>(
+        self: Pin<&'a mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<&'a [u8]>> {
+        let this = self.project();
+        this.stream.poll_fill_buf(cx)
+    }
+
+    fn consume(mut self: Pin<&mut Self>, amt: usize) {
+        self.stream.consume(amt);
+    }
+}
+
+impl<B: RxBuf + Unpin> AsyncRead for TcpReadHalf<B> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for TcpWriteHalf {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_close(cx)
+    }
+}
+
 impl<B: Buffered + Unpin> AsyncBufRead for TcpStream<B> {
     fn poll_fill_buf<'a>(
         self: Pin<&'a mut Self>,

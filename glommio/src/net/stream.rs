@@ -540,6 +540,112 @@ impl<S: AsRawFd, B: Buffered> GlommioStream<S, B> {
     }
 }
 
+impl<S: AsRawFd> NonBufferedStream<S> {
+    /// Splits into a receiving and a sending stream over one shared socket.
+    ///
+    /// The receiving side keeps the read readiness source and the read
+    /// timeout, the sending side keeps the write readiness source and the
+    /// write timeout. Each side gets a fresh timer id for the direction it
+    /// does not own, so both remain complete streams; that id is never armed,
+    /// so it may be anything, including 0 once the executor is gone.
+    fn split(self) -> (NonBufferedStream<Rc<S>>, NonBufferedStream<Rc<S>>) {
+        let spare_id = || self.reactor.upgrade().map_or(0, |r| r.register_timer());
+        let (rx_spare, tx_spare) = (spare_id(), spare_id());
+        let stream = Rc::new(self.stream);
+        let rx = NonBufferedStream {
+            reactor: self.reactor.clone(),
+            stream: stream.clone(),
+            source_tx: None,
+            source_rx: self.source_rx,
+            write_timeout: Timeout::new(rx_spare),
+            read_timeout: self.read_timeout,
+        };
+        let tx = NonBufferedStream {
+            reactor: self.reactor,
+            stream,
+            source_tx: self.source_tx,
+            source_rx: None,
+            write_timeout: self.write_timeout,
+            read_timeout: Timeout::new(tx_spare),
+        };
+        (rx, tx)
+    }
+}
+
+impl<S: AsRawFd> NonBufferedStream<Rc<S>> {
+    /// Whether two halves came from the same [`split`](Self::split) and are
+    /// the socket's only owners, which is what `unsplit` needs.
+    fn is_pair(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.stream, &other.stream) && Rc::strong_count(&self.stream) == 2
+    }
+
+    /// Reassembles the stream `split` took apart. The caller has checked
+    /// [`is_pair`](Self::is_pair).
+    fn unsplit(rx: Self, tx: Self) -> NonBufferedStream<S> {
+        if let Some(reactor) = rx.reactor.upgrade() {
+            rx.write_timeout.cancel_timer(&reactor);
+            tx.read_timeout.cancel_timer(&reactor);
+        }
+        drop(tx.stream);
+        let stream = Rc::try_unwrap(rx.stream)
+            .unwrap_or_else(|_| unreachable!("a split pair has exactly two owners"));
+        NonBufferedStream {
+            reactor: rx.reactor,
+            stream,
+            source_tx: tx.source_tx,
+            source_rx: rx.source_rx,
+            write_timeout: tx.write_timeout,
+            read_timeout: rx.read_timeout,
+        }
+    }
+}
+
+/// The two halves [`GlommioStream::split`] produces: the read half keeps the
+/// receive buffer, the write half never has one.
+pub(crate) type SplitPair<S, B> = (GlommioStream<Rc<S>, B>, GlommioStream<Rc<S>, NonBuffered>);
+
+impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
+    /// Splits into a read half, which keeps the receive buffer, and a write
+    /// half over the same socket.
+    pub(crate) fn split(self) -> SplitPair<S, B> {
+        let (rx, tx) = self.stream.split();
+        (
+            GlommioStream {
+                stream: rx,
+                rx_buf: self.rx_buf,
+                rx_done: self.rx_done,
+            },
+            GlommioStream {
+                stream: tx,
+                rx_buf: NonBuffered,
+                rx_done: Cell::new(false),
+            },
+        )
+    }
+}
+
+impl<S: AsRawFd, B: RxBuf> GlommioStream<Rc<S>, B> {
+    /// Puts a split pair back together, or hands both halves back when they
+    /// do not belong to the same stream.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the halves go back to the caller, who still owns the socket through them"
+    )]
+    pub(crate) fn unsplit(
+        rx: Self,
+        tx: GlommioStream<Rc<S>, NonBuffered>,
+    ) -> std::result::Result<GlommioStream<S, B>, SplitPair<S, B>> {
+        if !rx.stream.is_pair(&tx.stream) {
+            return Err((rx, tx));
+        }
+        Ok(GlommioStream {
+            stream: NonBufferedStream::unsplit(rx.stream, tx.stream),
+            rx_buf: rx.rx_buf,
+            rx_done: rx.rx_done,
+        })
+    }
+}
+
 impl<S: AsRawFd + IntoRawFd> NonBufferedStream<S> {
     /// Extracts the raw file descriptor, cleaning up glommio state
     /// but keeping the fd open.

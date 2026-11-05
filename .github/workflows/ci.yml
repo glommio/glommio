@@ -248,8 +248,12 @@ jobs:
       - name: Install cargo-semver-checks
         run: which cargo-semver-checks || cargo install --locked cargo-semver-checks
 
+      # The baseline is the last release, so a breaking change fails until the
+      # version is bumped for it. Crates added since then have no baseline.
       - name: Run semver checks
-        run: cargo semver-checks --workspace --baseline-rev origin/main
+        run: |
+          baseline=$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' HEAD)
+          cargo semver-checks --package glommio --baseline-rev "$baseline"
 
       - name: Install public API nightly toolchain
         run: rustup toolchain install "$PUBLIC_API_NIGHTLY" --profile minimal --component rust-docs

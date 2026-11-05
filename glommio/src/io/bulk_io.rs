@@ -431,7 +431,7 @@ pub struct ReadManyResult<
     S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Unpin,
 > {
     pub(crate) inner: OrderedBulkIo<ReadManyArgs<V>, S>,
-    pub(crate) current: Option<(ScheduledSource, ReadManyArgs<V>)>,
+    pub(crate) current: Option<(ScheduledSource, ReadManyArgs<V>, usize)>,
 }
 
 impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Unpin>
@@ -483,16 +483,13 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
     type Item = super::Result<(V, ReadResult)>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if let Some((source, args)) = &mut self.current {
+        if let Some((source, args, read)) = &mut self.current {
             if let Some(io) = args.user_reads.pop_front() {
-                let (pos, size) = (io.pos(), io.size());
+                let offset = (io.pos() - args.system_read.pos()) as usize;
+                let len = read.saturating_sub(offset).min(io.size());
                 return Poll::Ready(Some(Ok((
                     io,
-                    ReadResult::from_sliced_buffer(
-                        source.clone(),
-                        (pos - args.system_read.pos()) as usize,
-                        size,
-                    ),
+                    ReadResult::from_sliced_buffer(source.clone(), offset, len),
                 ))));
             }
         }
@@ -500,8 +497,9 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
         match ready!(self.inner.poll_next(cx)) {
             None => Poll::Ready(None),
             Some((source, args)) => {
-                enhanced_try!(source.result().unwrap(), "Reading", self.inner.file)?;
-                self.current = Some((source, args));
+                let read = enhanced_try!(source.result().unwrap(), "Reading", self.inner.file)?;
+                let read = source.bytes_in_range(read);
+                self.current = Some((source, args, read));
                 self.poll_next(cx)
             }
         }

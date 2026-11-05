@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v5
         with:
           # pull the fork's HEAD instead of the main repo's
           repository: ${{ github.event.pull_request.head.repo.full_name }}

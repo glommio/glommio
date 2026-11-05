@@ -4374,6 +4374,43 @@ mod test {
     }
 
     #[test]
+    fn custom_pool_placement_binds_shards_in_order() {
+        let pid = nix::unistd::Pid::from_raw(0);
+        let affinity = nix::sched::sched_getaffinity(pid).unwrap();
+        let cpus: Vec<usize> = (0..nix::sched::CpuSet::count())
+            .filter(|&cpu| affinity.is_set(cpu).unwrap())
+            .take(3)
+            .collect();
+        if cpus.len() < 2 {
+            eprintln!(
+                "Insufficient CPUs available to test custom_pool_placement_binds_shards_in_order (affinity only allows for {})",
+                cpus.len(),
+            );
+            return;
+        }
+
+        let online = CpuSet::online().unwrap();
+        let sets = cpus
+            .iter()
+            .map(|&cpu| online.clone().filter(|l| l.cpu == cpu))
+            .collect();
+        let bound: Vec<usize> = LocalExecutorPoolBuilder::new(PoolPlacement::Custom(sets))
+            .on_all_shards(move || async move {
+                let affinity = nix::sched::sched_getaffinity(pid).unwrap();
+                (0..nix::sched::CpuSet::count())
+                    .find(|&cpu| affinity.is_set(cpu).unwrap())
+                    .unwrap()
+            })
+            .unwrap()
+            .join_all()
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(bound, cpus);
+    }
+
+    #[test]
     fn blocking_function_placement_independent_of_executor_placement() {
         let affinity = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
         let num_cpus_accessible_by_default = (0..nix::sched::CpuSet::count())

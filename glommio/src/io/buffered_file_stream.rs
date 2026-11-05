@@ -618,7 +618,7 @@ impl AsyncWrite for StreamWriter {
             }
         }
 
-        if !self.buffer.data.is_empty() {
+        if self.buffer.data.len() >= self.buffer.max_buffer_size {
             let x = self.flush_write_buffer(cx.waker());
             assert!(x);
             Poll::Pending
@@ -699,6 +699,35 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn small_writes_are_batched() {
+        let dir = make_test_directories("small-writes-batched").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("out");
+            let mut writer = StreamWriterBuilder::new(BufferedFile::create(&path).await.unwrap())
+                .with_buffer_size(4096)
+                .build();
+            let before = crate::executor()
+                .io_stats()
+                .all_rings()
+                .file_buffered_writes()
+                .0;
+            let data: Vec<u8> = (0..10_000u32).map(|i| i as u8).collect();
+            for byte in &data {
+                writer.write_all(std::slice::from_ref(byte)).await.unwrap();
+            }
+            writer.close().await.unwrap();
+            let writes = crate::executor()
+                .io_stats()
+                .all_rings()
+                .file_buffered_writes()
+                .0
+                - before;
+            assert_eq!(writes, 3);
+            assert_eq!(std::fs::read(&path).unwrap(), data);
+        });
+    }
     use crate::{test_utils::make_test_directories, GlommioError};
     use futures_lite::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, StreamExt};
     use std::{io::ErrorKind, time::Duration};

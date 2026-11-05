@@ -1,0 +1,45 @@
+name: Idle callbacks
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/idle.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - 'glommio-idle/**'
+      - 'glommio-dense-registry/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/idle.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain*'
+      - 'glommio-idle/**'
+      - 'glommio-dense-registry/**'
+
+jobs:
+  kani:
+    name: Idle callback proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Verify idle callback control flow
+        uses: model-checking/kani-github-action@v1
+        with:
+          kani-version: '0.68.0'
+          args: -p glommio-idle --output-format terse --jobs 2

@@ -39,7 +39,8 @@ use crate::{
     reactor,
     sys::{self, blocking::BlockingThreadPool},
     task::{self, registry::TaskRegistry, waker_fn::dummy_waker},
-    GlommioError, IoRequirements, IoStats, Latency, Shares,
+    BeforeParkCapacityError, BeforeParkHandle, GlommioError, IoRequirements, IoStats, Latency,
+    Shares,
 };
 use ahash::AHashMap;
 use futures_lite::pin;
@@ -1542,15 +1543,26 @@ impl LocalExecutor {
                     } else {
                         while !this.context.reactor.spin_poll_io().unwrap() {
                             if pre_time.elapsed() > spin_before_park {
-                                debug_assert!(
-                                    this.context.queues.borrow().active_executors.is_empty(),
-                                    "parking with {} runnable task queues: nothing will wake us",
-                                    this.context.queues.borrow().active_executors.len()
+                                crate::idle::park_if_idle(
+                                    || {
+                                        this.context.with_cleanup(None, || {
+                                            this.context.reactor.idle_workers.run();
+                                        });
+                                    },
+                                    || !this.context.queues.borrow().active_executors.is_empty(),
+                                    || this.context.reactor.spin_poll_io().unwrap(),
+                                    || {
+                                        debug_assert!(
+                                            this.context.queues.borrow().active_executors.is_empty(),
+                                            "parking with {} runnable task queues: nothing will wake us",
+                                            this.context.queues.borrow().active_executors.len()
+                                        );
+                                        this.context
+                                            .reactor
+                                            .react(|| None)
+                                            .expect("Failed to park! This is actually pretty bad!");
+                                    },
                                 );
-                                this.context
-                                    .reactor
-                                    .react(|| None)
-                                    .expect("Failed to park! This is actually pretty bad!");
                                 break;
                             }
                         }
@@ -1575,6 +1587,7 @@ impl Drop for LocalExecutor {
                 .expect("executor's sleep notifier disappeared before shutdown")
                 .close_foreign_wakes();
             self.context.tasks.request_shutdown();
+            self.context.reactor.idle_workers.shutdown();
         };
 
         self.context.with_cleanup(None, shutdown);
@@ -2129,6 +2142,55 @@ pub unsafe fn spawn_scoped_local_into<'a, T>(
 pub struct ExecutorProxy {}
 
 impl ExecutorProxy {
+    /// Registers a synchronous callback to run before the reactor attempts to park.
+    /// Callbacks run in an unspecified order.
+    ///
+    /// Callbacks may spawn futures which will prevent the reactor from going idle.
+    /// However, all the callbacks that were present at the start of the park attempt
+    /// are invoked. Adding/removing callbacks won't take effect until the next time
+    /// the reactor goes to try to sleep and any spawned tasks within the callback
+    /// will only execute once all registered callbacks have been invoked.
+    ///
+    /// Dropping the returned handle unregisters the callback. Callbacks are
+    /// also released when the executor is dropped, even if their handles
+    /// survive. A callback panic unwinds out of [`LocalExecutor::run`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no executor running on this thread.
+    ///
+    /// # Errors
+    ///
+    /// If an attempt is made to register more callbacks than is supported.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glommio::{channels::local_channel, executor, LocalExecutor};
+    ///
+    /// LocalExecutor::default().run(async {
+    ///     let (sender, receiver) = local_channel::new_bounded(1);
+    ///     let worker = executor().register_before_park(move || {
+    ///         sender.try_send(()).unwrap();
+    ///     }).unwrap();
+    ///     receiver.recv().await.unwrap();
+    ///     drop(worker);
+    /// });
+    /// ```
+    pub fn register_before_park(
+        &self,
+        callback: impl FnMut() + 'static,
+    ) -> std::result::Result<BeforeParkHandle, BeforeParkCapacityError> {
+        with_executor_context(|context| {
+            let context = context.expect("this thread doesn't have a LocalExecutor running");
+            context
+                .reactor
+                .idle_workers
+                .register(callback)
+                .map(|registration| BeforeParkHandle::new(registration, &context.tasks))
+        })
+    }
+
     /// Checks if this task has run for too long and need to be preempted. This
     /// is useful for situations where we can't call .await, for instance,
     /// if a [`RefMut`] is held. If this tests true, then the user is

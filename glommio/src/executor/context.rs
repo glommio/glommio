@@ -60,7 +60,7 @@ impl ExecutorContext {
     }
 
     /// Provides queue and I/O context without retaining the public executor.
-    pub(super) fn with_cleanup<T>(
+    pub(crate) fn with_cleanup<T>(
         &self,
         queue: Option<Rc<RefCell<TaskQueue>>>,
         f: impl FnOnce() -> T,
@@ -195,7 +195,11 @@ impl ExecutorContext {
             .unwrap();
 
         let scheduler = tq.borrow().scheduler.clone();
-        scheduler.spawn_and_run(&self.tasks, tq, future)
+        self.reactor.idle_workers.dispatch_spawn(
+            (scheduler, tq, future),
+            |(scheduler, tq, future)| scheduler.spawn_and_schedule(&self.tasks, tq, future),
+            |(scheduler, tq, future)| scheduler.spawn_and_run(&self.tasks, tq, future),
+        )
     }
 
     pub(super) fn spawn_into<T, F>(

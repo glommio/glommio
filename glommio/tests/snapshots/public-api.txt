@@ -1,4 +1,5 @@
 pub mod glommio
+pub use glommio::BeforeParkCapacityError
 pub use glommio::defer
 pub use glommio::enclose
 pub use glommio::main
@@ -2982,6 +2983,7 @@ pub fn glommio::ExecutorProxy::executor_stats(&self) -> glommio::ExecutorStats
 pub fn glommio::ExecutorProxy::id(&self) -> usize
 pub fn glommio::ExecutorProxy::io_stats(&self) -> glommio::IoStats
 pub fn glommio::ExecutorProxy::need_preempt(&self) -> bool
+pub fn glommio::ExecutorProxy::register_before_park(&self, callback: impl core::ops::function::FnMut() + 'static) -> core::result::Result<glommio::BeforeParkHandle, glommio_idle::BeforeParkCapacityError>
 pub fn glommio::ExecutorProxy::spawn_blocking<F, R>(&self, func: F) -> impl core::future::future::Future<Output = R> where F: core::ops::function::FnOnce() -> R + core::marker::Send + 'static, R: core::marker::Send + 'static
 pub fn glommio::ExecutorProxy::spawn_local<T>(&self, future: impl core::future::future::Future<Output = T> + 'static) -> glommio::Task<T> where T: 'static
 pub fn glommio::ExecutorProxy::spawn_local_into<T>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::Task<T>> where T: 'static
@@ -3791,6 +3793,7 @@ pub fn glommio::ExecutorProxy::executor_stats(&self) -> glommio::ExecutorStats
 pub fn glommio::ExecutorProxy::id(&self) -> usize
 pub fn glommio::ExecutorProxy::io_stats(&self) -> glommio::IoStats
 pub fn glommio::ExecutorProxy::need_preempt(&self) -> bool
+pub fn glommio::ExecutorProxy::register_before_park(&self, callback: impl core::ops::function::FnMut() + 'static) -> core::result::Result<glommio::BeforeParkHandle, glommio_idle::BeforeParkCapacityError>
 pub fn glommio::ExecutorProxy::spawn_blocking<F, R>(&self, func: F) -> impl core::future::future::Future<Output = R> where F: core::ops::function::FnOnce() -> R + core::marker::Send + 'static, R: core::marker::Send + 'static
 pub fn glommio::ExecutorProxy::spawn_local<T>(&self, future: impl core::future::future::Future<Output = T> + 'static) -> glommio::Task<T> where T: 'static
 pub fn glommio::ExecutorProxy::spawn_local_into<T>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::Task<T>> where T: 'static
@@ -5442,6 +5445,46 @@ pub unsafe fn glommio::Shares::init(init: <T as crossbeam_epoch::atomic::Pointab
 impl<T> tracing::instrument::Instrument for glommio::Shares
 impl<T> tracing::instrument::WithSubscriber for glommio::Shares
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::Shares where T: ?core::marker::Sized
+pub struct glommio::BeforeParkHandle
+impl core::fmt::Debug for glommio::BeforeParkHandle
+pub fn glommio::BeforeParkHandle::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::ops::drop::Drop for glommio::BeforeParkHandle
+pub fn glommio::BeforeParkHandle::drop(&mut self)
+impl core::marker::Freeze for glommio::BeforeParkHandle
+impl !core::marker::Send for glommio::BeforeParkHandle
+impl !core::marker::Sync for glommio::BeforeParkHandle
+impl core::marker::Unpin for glommio::BeforeParkHandle
+impl core::marker::UnsafeUnpin for glommio::BeforeParkHandle
+impl !core::panic::unwind_safe::RefUnwindSafe for glommio::BeforeParkHandle
+impl !core::panic::unwind_safe::UnwindSafe for glommio::BeforeParkHandle
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::BeforeParkHandle where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::BeforeParkHandle where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::BeforeParkHandle where U: core::convert::From<T>
+pub fn glommio::BeforeParkHandle::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::BeforeParkHandle where U: core::convert::Into<T>
+pub type glommio::BeforeParkHandle::Error = core::convert::Infallible
+pub fn glommio::BeforeParkHandle::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::BeforeParkHandle where U: core::convert::TryFrom<T>
+pub type glommio::BeforeParkHandle::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::BeforeParkHandle::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for glommio::BeforeParkHandle where T: 'static + ?core::marker::Sized
+pub fn glommio::BeforeParkHandle::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::BeforeParkHandle where T: ?core::marker::Sized
+pub fn glommio::BeforeParkHandle::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::BeforeParkHandle where T: ?core::marker::Sized
+pub fn glommio::BeforeParkHandle::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for glommio::BeforeParkHandle
+pub fn glommio::BeforeParkHandle::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::BeforeParkHandle
+pub type glommio::BeforeParkHandle::Init = T
+pub const glommio::BeforeParkHandle::ALIGN: usize
+pub unsafe fn glommio::BeforeParkHandle::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::BeforeParkHandle::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::BeforeParkHandle::drop(ptr: usize)
+pub unsafe fn glommio::BeforeParkHandle::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::BeforeParkHandle
+impl<T> tracing::instrument::WithSubscriber for glommio::BeforeParkHandle
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::BeforeParkHandle where T: ?core::marker::Sized
 pub struct glommio::CpuLocation
 pub glommio::CpuLocation::cache_domain: usize
 pub glommio::CpuLocation::core: usize
@@ -5668,6 +5711,7 @@ pub fn glommio::ExecutorProxy::executor_stats(&self) -> glommio::ExecutorStats
 pub fn glommio::ExecutorProxy::id(&self) -> usize
 pub fn glommio::ExecutorProxy::io_stats(&self) -> glommio::IoStats
 pub fn glommio::ExecutorProxy::need_preempt(&self) -> bool
+pub fn glommio::ExecutorProxy::register_before_park(&self, callback: impl core::ops::function::FnMut() + 'static) -> core::result::Result<glommio::BeforeParkHandle, glommio_idle::BeforeParkCapacityError>
 pub fn glommio::ExecutorProxy::spawn_blocking<F, R>(&self, func: F) -> impl core::future::future::Future<Output = R> where F: core::ops::function::FnOnce() -> R + core::marker::Send + 'static, R: core::marker::Send + 'static
 pub fn glommio::ExecutorProxy::spawn_local<T>(&self, future: impl core::future::future::Future<Output = T> + 'static) -> glommio::Task<T> where T: 'static
 pub fn glommio::ExecutorProxy::spawn_local_into<T>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::Task<T>> where T: 'static

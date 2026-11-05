@@ -1,0 +1,15 @@
+[package]
+description = "Idle callback batches and parking decisions for Glommio."
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+name = "glommio-idle"
+repository = "https://github.com/glommio/glommio"
+rust-version = "1.92"
+version.workspace = true
+
+[dependencies]
+glommio-dense-registry = { path = "../glommio-dense-registry", version = "0.11.0" }
+scopeguard = "1.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

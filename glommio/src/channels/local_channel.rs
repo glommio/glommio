@@ -133,6 +133,8 @@ where
     }
 }
 
+/// It is safe to use the unchecked calls below because we convert from a
+/// reference, which cannot be null.
 fn register_into_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut State<T>) {
     if node.link.is_linked() {
         return;
@@ -145,7 +147,6 @@ fn register_into_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut State<
                 .send_waiters
                 .as_mut()
                 .expect("There should be active sender instance for the channel")
-                //it is safe to use unchecked call here because we convert from reference
                 .push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
         }
         WaiterKind::Receiver => {
@@ -153,7 +154,6 @@ fn register_into_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut State<
                 .recv_waiters
                 .as_mut()
                 .expect("There should be active receiver instance for the channel")
-                //it is safe to use unchecked call here because we convert from reference
                 .push_back(unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) });
         }
     }
@@ -188,9 +188,10 @@ fn remove_from_the_waiting_queue<T>(node: Pin<&mut WaiterNode>, state: &mut Stat
 }
 
 impl<T, F> Drop for Waiter<'_, T, F> {
+    /// If the future is linked into the waiting queue then it is already
+    /// pinned.
     fn drop(&mut self) {
         if self.node.link.is_linked() {
-            //if future is linked into the waiting queue then it is already pinned
             let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
             let kind = pinned_node
                 .kind
@@ -575,17 +576,17 @@ impl<T> LocalSender<T> {
         self.channel.state.borrow().channel.len()
     }
 
+    /// NOTE: it is important that the borrow is dropped if
+    /// [`Poll::Pending`] is returned.
     fn wait_for_room(&self) -> PollResult<()> {
-        // NOTE: it is important that the borrow is dropped
-        // if Poll::Pending is returned
         self.channel.state.borrow_mut().wait_for_room()
     }
 }
 
+/// We assume here that wakes don't try to acquire a borrow on the
+/// `channel.state`.
 fn wake_up_all(ws: &mut Option<LinkedList<WaiterAdapter>>) {
     if let Some(ref mut waiters) = ws {
-        // we assume here that wakes don't try to acquire a borrow on
-        // the channel.state
         let mut cursor = waiters.front_mut();
         while !cursor.is_null() {
             {
@@ -605,10 +606,10 @@ fn wake_up_all(ws: &mut Option<LinkedList<WaiterAdapter>>) {
 }
 
 impl<T> Drop for LocalSender<T> {
+    /// Will not wake up senders, but we are dropping the sender so nobody
+    /// wants to wake up anyway.
     fn drop(&mut self) {
         let mut state = self.channel.state.borrow_mut();
-        // Will not wake up senders, but we are dropping the sender so nobody
-        // wants to wake up anyway.
         state.send_waiters.take();
         wake_up_all(&mut state.recv_waiters);
     }
@@ -624,10 +625,11 @@ impl<T> Drop for LocalReceiver<T> {
 
 struct ChannelStream<'a, T> {
     channel: &'a LocalChannel<T>,
-    //if do not use Box stream becomes !Unpin which will force users to pin it
-    //while using StreamExt which is not user friendly. Creation of stream is relatively
-    //rare operation and happens once during the routine so we can afford to perform
-    //memory allocation here
+    /// If we do not use `Box`, the stream becomes `!Unpin`, which will force
+    /// users to pin it while using `StreamExt`, which is not user friendly.
+    /// Creation of a stream is a relatively rare operation and happens once
+    /// during the routine, so we can afford to perform a memory allocation
+    /// here.
     node: Pin<Box<WaiterNode>>,
 }
 

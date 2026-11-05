@@ -187,6 +187,23 @@ impl<T> SharesManager for InnerQueue<T> {
     /// the  last output, and not how much the shares should be. It also
     /// eliminates any  dependency on time when calculating the error which
     /// increases resiliency.
+    ///
+    /// How did we pick our constants:
+    ///
+    ///  * As with any stable PI controller we want the bulk of our gain to
+    ///    come from P.
+    ///  * As we normalize the maximum error to 1 we know that the gain
+    ///    should be at most 1000.
+    ///  * Physically, Ki can be expressed as Kp / Tau where Tau is a time
+    ///    constant, roughly equivalent to how many periods need to pass for
+    ///    the integral term to generate the same gain as the proportional
+    ///    term. We set that to 6 so the controller is not too sluggish,
+    ///    which is around 1.5 seconds on the default 250ms adjustment
+    ///    period.
+    ///
+    /// We can then write X + X/6 = 1000, and solving for X we have the
+    /// constants below. If so little time has passed we can't really make
+    /// any useful prediction, so the last shares are returned.
     fn shares(&self) -> usize {
         if let ControllerStatus::Disabled(shares) = self.state.get() {
             return shares;
@@ -206,7 +223,6 @@ impl<T> SharesManager for InnerQueue<T> {
             let time_fraction =
                 1.0 - (remaining_time.as_secs_f64() / source.expected_duration().as_secs_f64());
             if remaining_time.as_nanos() == 0 && now.saturating_duration_since(*exp).as_secs() > 5 {
-                // already too late, bump it up hard
                 self.last_shares.set(1000);
                 return 1000;
             }
@@ -214,7 +230,6 @@ impl<T> SharesManager for InnerQueue<T> {
             processed += source.processed_units() as f64;
         }
 
-        // so little time has passed we can't really make any useful prediction
         if expected < 0.01 {
             return self.last_shares.get();
         }
@@ -226,19 +241,6 @@ impl<T> SharesManager for InnerQueue<T> {
         let delta_error = error - self.last_error.get();
         self.last_error.set(error);
 
-        // How did we pick our constants:
-        //  * As with any stable PI controller we want the bulk of our gain to come from
-        //    P.
-        //  * As we normalize the maximum error to 1 we know that the gain should be at
-        //    most 1000
-        //  * physically, Ki can be expressed as Kp / Tau where Tau is a time constant,
-        //    roughly equivalent to how many periods need to pass for the integral term
-        //    to generate the same gain as the proportional term. We set that to 6 so
-        //    the controller is not too sluggish, which is around 1.5 seconds on the
-        //    default 250ms adjustment period.
-        //
-        //  We can then write X + X/6 = 1000, and solving for X we have the constants
-        // below
         let kp = 850.0;
         let ki = kp / 6.0;
         let dshares = ki * error + kp * delta_error;
@@ -384,6 +386,7 @@ impl<T: 'static> DeadlineQueue<T> {
     ///     DeadlineQueue::<usize>::new("example", Duration::from_millis(250));
     /// });
     /// ```
+    #[allow(no_comments_allowed)]
     pub fn new(name: &'static str, adjustment_period: Duration) -> DeadlineQueue<T> {
         let queue = Rc::new(InnerQueue::new(adjustment_period));
         // We could always dispatch into the latency queue, but since that effectively
@@ -750,8 +753,10 @@ mod test {
 
             Timer::new(Duration::from_millis(2)).await;
             let shares_second = queue.queue.shares();
-            // The second element that we push should rush the first.
-            assert!(shares_second > shares_first);
+            assert!(
+                shares_second > shares_first,
+                "the second element that we push should rush the first"
+            );
             tq.await;
             tq2.await;
         });

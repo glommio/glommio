@@ -300,7 +300,10 @@ impl<T: Send + Sized> ConnectedSender<T> {
     }
 
     fn wait_for_room(&self, cx: &Context<'_>) -> Poll<()> {
-        match self.state.buffer.free_space() > 0 || self.state.buffer.producer_disconnected() {
+        match self.state.buffer.free_space() > 0
+            || self.state.buffer.producer_disconnected()
+            || self.state.buffer.consumer_disconnected()
+        {
             true => Poll::Ready(()),
             false => {
                 self.reactor
@@ -492,6 +495,36 @@ impl<T: Send + Sized> Drop for ConnectedSender<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn send_to_a_full_channel_fails_once_the_receiver_is_gone() {
+        let (tx, rx) = new_bounded::<u32>(1);
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel::<()>();
+        let (filled_tx, filled_rx) = std::sync::mpsc::channel::<()>();
+        let receiver = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let rx = rx.connect().await;
+                filled_rx.recv().unwrap();
+                drop(rx);
+                dropped_tx.send(()).unwrap();
+            })
+            .unwrap();
+        let sender = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let tx = tx.connect().await;
+                tx.try_send(1).unwrap();
+                filled_tx.send(()).unwrap();
+                dropped_rx.recv().unwrap();
+                let sent =
+                    crate::timer::timeout(Duration::from_secs(5), async { Ok(tx.send(2).await) })
+                        .await
+                        .expect("send did not return");
+                assert!(matches!(sent, Err(GlommioError::Closed(_))));
+            })
+            .unwrap();
+        receiver.join().unwrap();
+        sender.join().unwrap();
+    }
     use crate::LocalExecutor;
     use crate::{
         timer::{sleep, Timer},

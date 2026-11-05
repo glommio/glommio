@@ -123,8 +123,7 @@ impl TcpListener {
     /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
         let addr = addr
-            .to_socket_addrs()
-            .unwrap()
+            .to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::other("empty address"))?;
 
@@ -482,7 +481,10 @@ impl TcpStream {
     /// })
     /// ```
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> Result<TcpStream> {
-        let addr = addr.to_socket_addrs()?.next().unwrap();
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other("empty address"))?;
         let socket = make_tcp_socket(&addr)?;
         let reactor = crate::executor().reactor();
         let source = reactor.connect(socket.as_raw_fd(), SockaddrStorage::from(addr));
@@ -526,7 +528,10 @@ impl TcpStream {
             .into());
         }
 
-        let addr = addr.to_socket_addrs()?.next().unwrap();
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other("empty address"))?;
         let socket = make_tcp_socket(&addr)?;
         let reactor = crate::executor().reactor();
         let source =
@@ -824,6 +829,21 @@ mod tests {
         },
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn unresolvable_addresses_are_errors() {
+        test_executor!(async move {
+            assert!(TcpListener::bind("no port here").is_err());
+            assert!(crate::net::UdpSocket::bind("no port here").is_err());
+            let udp = crate::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            assert!(udp.send_to(b"x", "no port here").await.is_err());
+            let empty: &[SocketAddr] = &[];
+            assert!(TcpStream::connect(empty).await.is_err());
+            assert!(TcpStream::connect_timeout(empty, Duration::from_secs(1))
+                .await
+                .is_err());
+        });
+    }
 
     #[test]
     fn tcp_listener_ttl() {

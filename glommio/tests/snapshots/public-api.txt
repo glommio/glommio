@@ -781,11 +781,11 @@ pub fn glommio::controllers::DeadlineQueue<T>::status(&self) -> glommio::control
 pub fn glommio::controllers::DeadlineQueue<T>::task_queue(&self) -> glommio::TaskQueueHandle
 impl<T: core::fmt::Debug> core::fmt::Debug for glommio::controllers::DeadlineQueue<T>
 pub fn glommio::controllers::DeadlineQueue<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<T> !core::marker::Freeze for glommio::controllers::DeadlineQueue<T>
+impl<T> core::marker::Freeze for glommio::controllers::DeadlineQueue<T>
 impl<T> !core::marker::Send for glommio::controllers::DeadlineQueue<T>
 impl<T> !core::marker::Sync for glommio::controllers::DeadlineQueue<T>
-impl<T> !core::marker::Unpin for glommio::controllers::DeadlineQueue<T>
-impl<T> !core::marker::UnsafeUnpin for glommio::controllers::DeadlineQueue<T>
+impl<T> core::marker::Unpin for glommio::controllers::DeadlineQueue<T>
+impl<T> core::marker::UnsafeUnpin for glommio::controllers::DeadlineQueue<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for glommio::controllers::DeadlineQueue<T>
 impl<T> !core::panic::unwind_safe::UnwindSafe for glommio::controllers::DeadlineQueue<T>
 impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::controllers::DeadlineQueue<T> where ST: ?core::marker::Sized, DT: ?core::marker::Sized

@@ -835,3 +835,17 @@ mod test {
         });
     }
 }
+
+#[cfg(test)]
+mod auto_traits {
+    fn unpin<T: Unpin>() {}
+
+    /// The public API snapshot lists `DeadlineQueue<T>` as `!Unpin` since
+    /// the reply channel went into the request: rustdoc synthesises auto
+    /// trait impls heuristically and gives up on a channel type nested in
+    /// another's parameter. The compiler does not, and this is what it says.
+    #[test]
+    fn deadline_queue_is_unpin() {
+        unpin::<super::DeadlineQueue<u32>>();
+    }
+}

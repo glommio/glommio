@@ -724,6 +724,27 @@ impl UnixDatagram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recv_from_an_unnamed_peer_that_had_not_sent_yet() {
+        test_executor!(async move {
+            let (a, b) = UnixDatagram::pair().unwrap();
+            let b = Rc::new(b);
+            let receiving = crate::spawn_local({
+                let b = b.clone();
+                async move {
+                    let mut buf = [0u8; 16];
+                    let (n, addr) = b.recv_from(&mut buf).await.unwrap();
+                    assert_eq!(&buf[..n], b"hi");
+                    assert!(addr.path().is_none());
+                }
+            })
+            .detach();
+            crate::timer::sleep(std::time::Duration::from_millis(20)).await;
+            a.send(b"hi").await.unwrap();
+            receiving.await.unwrap();
+        });
+    }
     use crate::{enclose, test_utils::*};
     use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use std::cell::Cell;

@@ -681,19 +681,16 @@ impl<S: AsRawFd> NonBufferedStream<S> {
     ///
     /// The receiving side keeps the read readiness source and the read
     /// timeout, the sending side keeps the write readiness source and the
-    /// write timeout. Each side gets a fresh timer id for the direction it
-    /// does not own, so both remain complete streams; that id is never armed,
-    /// so it may be anything, including 0 once the executor is gone.
+    /// write timeout. Each side gets an unarmed timeout for the direction it
+    /// does not own, so both remain complete streams.
     fn split(self) -> (NonBufferedStream<Rc<S>>, NonBufferedStream<Rc<S>>) {
-        let spare_id = || self.reactor.upgrade().map_or(0, |r| r.register_timer());
-        let (rx_spare, tx_spare) = (spare_id(), spare_id());
         let stream = Rc::new(self.stream);
         let rx = NonBufferedStream {
             reactor: self.reactor.clone(),
             stream: stream.clone(),
             source_tx: None,
             source_rx: self.source_rx,
-            write_timeout: Timeout::new(rx_spare),
+            write_timeout: Timeout::new(),
             read_timeout: self.read_timeout,
         };
         let tx = NonBufferedStream {
@@ -702,7 +699,7 @@ impl<S: AsRawFd> NonBufferedStream<S> {
             source_tx: self.source_tx,
             source_rx: None,
             write_timeout: self.write_timeout,
-            read_timeout: Timeout::new(tx_spare),
+            read_timeout: Timeout::new(),
         };
         (rx, tx)
     }

@@ -5,18 +5,24 @@
 //!
 //! This module provides glommio's networking support.
 use crate::sys;
-use nix::sys::socket::{MsgFlags, SockaddrLike};
+use nix::sys::socket::{self, MsgFlags, SockaddrLike};
 use std::{
-    io,
+    io::{self, IoSlice},
     os::{
         fd::AsRawFd,
         unix::io::{BorrowedFd, RawFd},
     },
 };
 
+/// `None` when the call would block, so the caller falls back to the ring.
+fn unless_would_block<T>(res: nix::Result<T>) -> Option<io::Result<T>> {
+    match res {
+        Err(nix::errno::Errno::EAGAIN) => None,
+        res => Some(res.map_err(io::Error::from)),
+    }
+}
+
 fn yolo_accept(fd: BorrowedFd<'_>) -> Option<io::Result<RawFd>> {
-    // Listeners are non-blocking from construction, so this returns EAGAIN
-    // rather than parking the executor when the backlog is empty.
     debug_assert!(
         {
             let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).unwrap();
@@ -24,54 +30,23 @@ fn yolo_accept(fd: BorrowedFd<'_>) -> Option<io::Result<RawFd>> {
         },
         "listener is blocking; accept would park the executor"
     );
-
-    match sys::accept_syscall(fd.as_raw_fd()) {
-        Ok(x) => Some(Ok(x)),
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => Some(Err(err)),
-        },
-    }
+    unless_would_block(socket::accept(fd.as_raw_fd()))
 }
 
 fn yolo_send(fd: RawFd, buf: &[u8]) -> Option<io::Result<usize>> {
-    match sys::send_syscall(fd, buf.as_ptr(), buf.len(), MsgFlags::MSG_DONTWAIT.bits()) {
-        Ok(x) => Some(Ok(x)),
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => Some(Err(err)),
-        },
-    }
+    unless_would_block(socket::send(fd, buf, MsgFlags::MSG_DONTWAIT))
 }
 
 fn yolo_peek(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
-    match sys::recv_syscall(
+    unless_would_block(socket::recv(
         fd,
-        buf.as_mut_ptr(),
-        buf.len(),
-        (MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK).bits(),
-    ) {
-        Ok(x) => Some(Ok(x)),
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => Some(Err(err)),
-        },
-    }
+        buf,
+        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK,
+    ))
 }
 
 fn yolo_recv(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
-    match sys::recv_syscall(
-        fd,
-        buf.as_mut_ptr(),
-        buf.len(),
-        MsgFlags::MSG_DONTWAIT.bits(),
-    ) {
-        Ok(x) => Some(Ok(x)),
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => Some(Err(err)),
-        },
-    }
+    unless_would_block(socket::recv(fd, buf, MsgFlags::MSG_DONTWAIT))
 }
 
 fn yolo_recvmsg<T: SockaddrLike>(
@@ -95,45 +70,27 @@ fn yolo_recvmsg<T: SockaddrLike>(
 
 /// The vectored counterpart of [`yolo_send`].
 ///
-/// `IoSlice` is guaranteed ABI-compatible with `struct iovec`, so the slice is
-/// handed to the kernel as-is rather than copied into one. Anything beyond
-/// `UIO_MAXIOV` slices is truncated, which the caller already handles: a
-/// prefix write is a short write.
-fn yolo_sendv(fd: RawFd, bufs: &[std::io::IoSlice<'_>]) -> Option<io::Result<usize>> {
+/// Anything beyond `UIO_MAXIOV` slices is truncated, which the caller already
+/// handles: a prefix write is a short write.
+fn yolo_sendv(fd: RawFd, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
     let len = std::cmp::min(bufs.len(), libc::UIO_MAXIOV as usize);
-
-    match sys::sendmsg_iov_syscall(
+    unless_would_block(socket::sendmsg::<()>(
         fd,
-        bufs.as_ptr() as *const libc::iovec,
-        len,
-        MsgFlags::MSG_DONTWAIT.bits(),
-    ) {
-        Ok(x) => Some(Ok(x)),
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => Some(Err(err)),
-        },
-    }
+        &bufs[..len],
+        &[],
+        MsgFlags::MSG_DONTWAIT,
+        None,
+    ))
 }
 
-fn yolo_sendmsg(
-    fd: RawFd,
-    buf: &[u8],
-    addr: &impl nix::sys::socket::SockaddrLike,
-) -> Option<io::Result<usize>> {
-    match sys::sendmsg_syscall(
+fn yolo_sendmsg(fd: RawFd, buf: &[u8], addr: &impl SockaddrLike) -> Option<io::Result<usize>> {
+    unless_would_block(socket::sendmsg(
         fd,
-        buf.as_ptr(),
-        buf.len(),
-        addr,
-        MsgFlags::MSG_DONTWAIT.bits(),
-    ) {
-        Ok(x) => Some(Ok(x)),
-        Err(err) => match err.kind() {
-            io::ErrorKind::WouldBlock => None,
-            _ => Some(Err(err)),
-        },
-    }
+        &[IoSlice::new(buf)],
+        &[],
+        MsgFlags::MSG_DONTWAIT,
+        Some(addr),
+    ))
 }
 
 mod datagram;

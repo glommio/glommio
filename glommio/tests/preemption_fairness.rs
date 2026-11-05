@@ -1,10 +1,17 @@
-//! That a task queue is preempted, and that two of them share the cpu.
+//! That two task queues doing continuous I/O share the cpu.
 //!
 //! The preempt timer is armed by the reactor and kept armed while the same
 //! duration is wanted. Both halves of that need holding down: a timer that is
 //! never rearmed stops preempting, and one that is rearmed too eagerly never
-//! fires. These read the behaviour through the public API rather than the
-//! reactor's counters, so they say what a user would see.
+//! fires. The share between two equal queues shows both at once, and reads
+//! the behaviour through the public API rather than the reactor's counters,
+//! so it says what a user would see.
+//!
+//! A single queue cannot show it. Its task parks in every read, the reactor
+//! pass that wakes it also consumes the timer's completion, and
+//! `need_preempt` is only true in the microseconds between the read returning
+//! and the next one parking, so a check there catches the timer by luck: ten
+//! runs with a 10 ms timer saw the first catch between 10 ms and 840 ms.
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::{
@@ -40,47 +47,6 @@ async fn echo_pair() -> (TcpStream, glommio::Task<()>) {
     (TcpStream::connect(addr).await.unwrap(), server)
 }
 
-/// A queue doing nothing but I/O still gets preempted.
-///
-/// Every round trip takes the reactor through `wait`, which is where the
-/// preempt timer is decided. Rearming it there resets the deadline, so a
-/// timer that is reinstalled on every call can never reach it and the queue
-/// runs unpreempted for as long as it keeps doing I/O.
-#[test]
-fn a_queue_doing_continuous_io_is_preempted() {
-    let preempted = LocalExecutorBuilder::new(Placement::Unbound)
-        .preempt_timer(PREEMPT)
-        .spawn(|| async move {
-            let (mut client, server) = echo_pair().await;
-            let mut byte = [0u8; 1];
-            let start = Instant::now();
-            let mut preempted = false;
-
-            while start.elapsed() < RUN {
-                client.write_all(b"x").await.unwrap();
-                client.read_exact(&mut byte).await.unwrap();
-                if executor().need_preempt() {
-                    preempted = true;
-                    break;
-                }
-            }
-
-            client.close().await.unwrap();
-            server.await;
-            preempted
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-
-    assert!(
-        preempted,
-        "a queue doing continuous io ran for {RUN:?} against a {PREEMPT:?} preempt timer \
-         without ever being preempted"
-    );
-}
-
-/// Two equally weighted queues doing I/O get equal turns.
 #[test]
 fn two_equal_queues_share_the_cpu() {
     let (trips, gaps) = LocalExecutorBuilder::new(Placement::Unbound)

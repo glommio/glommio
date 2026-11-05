@@ -5,6 +5,8 @@ target="${1:-}"
 
 sudo -E \
     PATH="${PATH}:/usr/share/rust/.cargo/bin" \
+    RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}" \
+    CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}" \
     TEST_TARGET="${target}" \
     bash -c '
         set -euo pipefail

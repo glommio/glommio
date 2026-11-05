@@ -1528,7 +1528,7 @@ impl LocalExecutor {
 
                 this.context
                     .reactor
-                    .react(|| Some(this.preempt_timer_duration()))
+                    .react(|| Some(this.preempt_timer_duration()), false)
                     .expect("Failed to poll io! This is actually pretty bad!");
 
                 let queues = this.run_task_queues();
@@ -1549,7 +1549,7 @@ impl LocalExecutor {
                                 );
                                 this.context
                                     .reactor
-                                    .react(|| None)
+                                    .react(|| None, true)
                                     .expect("Failed to park! This is actually pretty bad!");
                                 break;
                             }

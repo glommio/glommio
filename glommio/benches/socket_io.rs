@@ -131,11 +131,55 @@ fn file_reads(rounds: u64, record_io_latencies: bool) -> Duration {
         .unwrap()
 }
 
+/// One connection, one byte each way, so every I/O blocks and pays for its own
+/// trip into the kernel. The other rung amortises that across 64 connections.
+fn ping_pong(iters: u64) -> Duration {
+    LocalExecutorBuilder::new(Placement::Unbound)
+        .spawn(move || async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let echo = glommio::spawn_local(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte).await.unwrap() {
+                        0 => break,
+                        _ => stream.write_all(&byte).await.unwrap(),
+                    }
+                }
+            })
+            .detach();
+
+            let mut client: TcpStream = TcpStream::connect(addr).await.unwrap();
+            client.set_nodelay(true).unwrap();
+            let mut byte = [0u8; 1];
+            client.write_all(b"x").await.unwrap();
+            client.read_exact(&mut byte).await.unwrap();
+
+            let start = thread_cpu();
+            for _ in 0..iters {
+                client.write_all(b"x").await.unwrap();
+                client.read_exact(&mut byte).await.unwrap();
+                black_box(&byte);
+            }
+            let elapsed = thread_cpu() - start;
+
+            client.close().await.unwrap();
+            echo.await;
+            elapsed
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
 fn socket_io(c: &mut Criterion) {
     let mut group = c.benchmark_group("socket_io");
     group.throughput(Throughput::Elements(CONNECTIONS as u64));
 
     group.bench_function("socket reads", |b| b.iter_custom(rounds));
+    group.bench_function("ping pong", |b| b.iter_custom(ping_pong));
     group.finish();
 
     let mut group = c.benchmark_group("file_io");

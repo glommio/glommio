@@ -1751,8 +1751,9 @@ impl<T> Future for Task<T> {
 /// Tasks are also futures themselves and yield the output of the spawned
 /// future.
 ///
-/// When a task is dropped, its gets canceled and won't be polled again. To
-/// cancel a task a bit more gracefully and wait until it stops running, use the
+/// When a task is dropped, it gets canceled and its future is dropped before
+/// `drop` returns, so nothing the future borrows is used after the scope ends.
+/// To cancel a task and get its output if it had already completed, use the
 /// [`cancel()`][`ScopedTask::cancel()`] method.
 ///
 /// Tasks that panic get immediately canceled. Awaiting a canceled task also
@@ -1917,8 +1918,18 @@ impl<T> ScopedTask<'_, T> {
     ///     task.cancel().await;
     /// });
     /// ```
-    pub async fn cancel(self) -> Option<T> {
-        self.0.cancel().await
+    pub async fn cancel(mut self) -> Option<T> {
+        let task = self.0.take();
+        task.cancel_in_place();
+        task.cancel().await
+    }
+}
+
+impl<T> Drop for ScopedTask<'_, T> {
+    /// The future may borrow from the scope that is ending, so unlike a
+    /// [`Task`]'s it cannot be left for the executor to drop later.
+    fn drop(&mut self) {
+        self.0.cancel_in_place();
     }
 }
 

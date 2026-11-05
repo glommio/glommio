@@ -40,6 +40,9 @@ pub(crate) struct TaskVTable {
     /// Cancels the task through its join handle.
     pub(crate) cancel: unsafe fn(*const ()),
 
+    /// Cancels the task and drops its future unless it is being polled.
+    pub(crate) cancel_in_place: unsafe fn(*const ()),
+
     /// Drops the join handle and any unread output.
     pub(crate) drop_handle: unsafe fn(*const ()),
 
@@ -154,6 +157,7 @@ where
                     get_output: Self::get_output,
                     drop_task: Self::drop_task,
                     cancel: Self::cancel,
+                    cancel_in_place: Self::cancel_in_place,
                     drop_handle: Self::drop_handle,
                     shutdown: Self::shutdown,
                     run: Self::run,
@@ -504,6 +508,18 @@ where
             Self::schedule(ptr);
         }
         Header::notify(&(*header).awaiter, None);
+    }
+
+    /// A future being polled cannot be dropped here; the poll drops it on return
+    /// because the task is closed. RUNNING defers reentrant work meanwhile.
+    unsafe fn cancel_in_place(ptr: *const ()) {
+        Self::cancel(ptr);
+        let header = ptr as *mut Header;
+        if (*header).state & RUNNING == 0 {
+            (*header).state |= RUNNING;
+            Self::drop_future(ptr);
+            (*header).state &= !RUNNING;
+        }
     }
 
     /// Drops outputs locally and routes abandoned futures through owner cleanup.

@@ -941,7 +941,8 @@ impl DmaStreamWriterState {
         } else {
             assert!(last_flush_pos < current_pos);
         }
-        let buffer = self.current_buffer.take().unwrap();
+        let mut buffer = self.current_buffer.take().unwrap();
+        buffer.as_bytes_mut()[self.buffer_pos..].fill(0);
         if let FileStatus::Open = self.file_status {
             let mut buffer_copy = file.alloc_dma_buffer(self.buffer_size);
             buffer_copy.as_bytes_mut()[..self.buffer_pos]
@@ -1574,6 +1575,29 @@ mod test {
         let rfile = DmaFile::open(&filename).await.unwrap();
         assert_eq!(rfile.file_size().await.unwrap(), 1_000_000);
     });
+
+    #[test]
+    fn a_partial_flush_pads_with_zeroes() {
+        let dir = make_test_directories("partial-flush-padding").remove(0);
+        test_executor!(async move {
+            let other = dir.path.join("other");
+            std::fs::write(&other, vec![0xABu8; 4096]).unwrap();
+            let other = DmaFile::open(&other).await.unwrap();
+            drop(other.read_at(0, 4096).await.unwrap());
+            other.close().await.unwrap();
+
+            let path = dir.path.join("out");
+            let writer = DmaStreamWriterBuilder::new(DmaFile::create(&path).await.unwrap())
+                .with_buffer_size(4096)
+                .build();
+            (&writer).write_all(&[7u8; 100]).await.unwrap();
+            writer.sync().await.unwrap();
+            let on_disk = std::fs::read(&path).unwrap();
+            assert!(on_disk[..100].iter().all(|&b| b == 7));
+            assert!(on_disk[100..].iter().all(|&b| b == 0));
+            drop(writer);
+        });
+    }
 
     file_stream_read_test!(read_exact_zero_buffer, path, _k, file, _file_size: 131072, {
         let mut reader = DmaStreamReaderBuilder::new(file)

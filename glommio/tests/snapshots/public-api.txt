@@ -1,8 +1,6 @@
 pub mod glommio
 pub use glommio::defer
 pub use glommio::enclose
-pub use glommio::main
-pub use glommio::test
 pub mod glommio::channels
 pub mod glommio::channels::channel_mesh
 pub enum glommio::channels::channel_mesh::Role
@@ -2980,14 +2978,12 @@ pub fn glommio::ExecutorProxy::create_task_queue(&self, shares: glommio::Shares,
 pub fn glommio::ExecutorProxy::current_task_queue(&self) -> glommio::TaskQueueHandle
 pub fn glommio::ExecutorProxy::executor_stats(&self) -> glommio::ExecutorStats
 pub fn glommio::ExecutorProxy::id(&self) -> usize
-pub fn glommio::ExecutorProxy::io_stats(&self) -> glommio::IoStats
 pub fn glommio::ExecutorProxy::need_preempt(&self) -> bool
 pub fn glommio::ExecutorProxy::spawn_blocking<F, R>(&self, func: F) -> impl core::future::future::Future<Output = R> where F: core::ops::function::FnOnce() -> R + core::marker::Send + 'static, R: core::marker::Send + 'static
 pub fn glommio::ExecutorProxy::spawn_local<T>(&self, future: impl core::future::future::Future<Output = T> + 'static) -> glommio::Task<T> where T: 'static
 pub fn glommio::ExecutorProxy::spawn_local_into<T>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::Task<T>> where T: 'static
 pub unsafe fn glommio::ExecutorProxy::spawn_scoped_local<'a, T>(&self, future: impl core::future::future::Future<Output = T> + 'a) -> glommio::ScopedTask<'a, T>
 pub unsafe fn glommio::ExecutorProxy::spawn_scoped_local_into<'a, T>(&self, future: impl core::future::future::Future<Output = T> + 'a, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::ScopedTask<'a, T>>
-pub fn glommio::ExecutorProxy::task_queue_io_stats(&self, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::IoStats>
 pub fn glommio::ExecutorProxy::task_queue_stats(&self, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::TaskQueueStats>
 pub async fn glommio::ExecutorProxy::yield_if_needed(&self)
 pub async fn glommio::ExecutorProxy::yield_now(&self)
@@ -3140,7 +3136,6 @@ pub fn glommio::LocalExecutorBuilder::make(self) -> glommio::Result<glommio::Loc
 pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
-pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -3192,7 +3187,6 @@ pub fn glommio::LocalExecutorPoolBuilder::name(self, name: &str) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
-pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -3789,14 +3783,12 @@ pub fn glommio::ExecutorProxy::create_task_queue(&self, shares: glommio::Shares,
 pub fn glommio::ExecutorProxy::current_task_queue(&self) -> glommio::TaskQueueHandle
 pub fn glommio::ExecutorProxy::executor_stats(&self) -> glommio::ExecutorStats
 pub fn glommio::ExecutorProxy::id(&self) -> usize
-pub fn glommio::ExecutorProxy::io_stats(&self) -> glommio::IoStats
 pub fn glommio::ExecutorProxy::need_preempt(&self) -> bool
 pub fn glommio::ExecutorProxy::spawn_blocking<F, R>(&self, func: F) -> impl core::future::future::Future<Output = R> where F: core::ops::function::FnOnce() -> R + core::marker::Send + 'static, R: core::marker::Send + 'static
 pub fn glommio::ExecutorProxy::spawn_local<T>(&self, future: impl core::future::future::Future<Output = T> + 'static) -> glommio::Task<T> where T: 'static
 pub fn glommio::ExecutorProxy::spawn_local_into<T>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::Task<T>> where T: 'static
 pub unsafe fn glommio::ExecutorProxy::spawn_scoped_local<'a, T>(&self, future: impl core::future::future::Future<Output = T> + 'a) -> glommio::ScopedTask<'a, T>
 pub unsafe fn glommio::ExecutorProxy::spawn_scoped_local_into<'a, T>(&self, future: impl core::future::future::Future<Output = T> + 'a, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::ScopedTask<'a, T>>
-pub fn glommio::ExecutorProxy::task_queue_io_stats(&self, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::IoStats>
 pub fn glommio::ExecutorProxy::task_queue_stats(&self, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::TaskQueueStats>
 pub async fn glommio::ExecutorProxy::yield_if_needed(&self)
 pub async fn glommio::ExecutorProxy::yield_now(&self)
@@ -3838,49 +3830,6 @@ pub unsafe fn glommio::ExecutorProxy::init(init: <T as crossbeam_epoch::atomic::
 impl<T> tracing::instrument::Instrument for glommio::ExecutorProxy
 impl<T> tracing::instrument::WithSubscriber for glommio::ExecutorProxy
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::ExecutorProxy where T: ?core::marker::Sized
-pub struct glommio::prelude::IoStats
-pub glommio::prelude::IoStats::latency_ring: glommio::RingIoStats
-pub glommio::prelude::IoStats::main_ring: glommio::RingIoStats
-pub glommio::prelude::IoStats::poll_ring: glommio::RingIoStats
-impl glommio::IoStats
-pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
-impl core::fmt::Debug for glommio::IoStats
-pub fn glommio::IoStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for glommio::IoStats
-impl core::marker::Send for glommio::IoStats
-impl core::marker::Sync for glommio::IoStats
-impl core::marker::Unpin for glommio::IoStats
-impl core::marker::UnsafeUnpin for glommio::IoStats
-impl core::panic::unwind_safe::RefUnwindSafe for glommio::IoStats
-impl core::panic::unwind_safe::UnwindSafe for glommio::IoStats
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::IoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::IoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for glommio::IoStats where U: core::convert::From<T>
-pub fn glommio::IoStats::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for glommio::IoStats where U: core::convert::Into<T>
-pub type glommio::IoStats::Error = core::convert::Infallible
-pub fn glommio::IoStats::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for glommio::IoStats where U: core::convert::TryFrom<T>
-pub type glommio::IoStats::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn glommio::IoStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for glommio::IoStats where T: 'static + ?core::marker::Sized
-pub fn glommio::IoStats::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for glommio::IoStats where T: ?core::marker::Sized
-pub fn glommio::IoStats::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for glommio::IoStats where T: ?core::marker::Sized
-pub fn glommio::IoStats::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for glommio::IoStats
-pub fn glommio::IoStats::from(t: T) -> T
-impl<T> crossbeam_epoch::atomic::Pointable for glommio::IoStats
-pub type glommio::IoStats::Init = T
-pub const glommio::IoStats::ALIGN: usize
-pub unsafe fn glommio::IoStats::deref<'a>(ptr: usize) -> &'a T
-pub unsafe fn glommio::IoStats::deref_mut<'a>(ptr: usize) -> &'a mut T
-pub unsafe fn glommio::IoStats::drop(ptr: usize)
-pub unsafe fn glommio::IoStats::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
-impl<T> tracing::instrument::Instrument for glommio::IoStats
-impl<T> tracing::instrument::WithSubscriber for glommio::IoStats
-impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::IoStats where T: ?core::marker::Sized
 pub struct glommio::prelude::LocalExecutor
 impl glommio::LocalExecutor
 pub fn glommio::LocalExecutor::detect_stalls(&self, handler: core::option::Option<alloc::boxed::Box<(dyn glommio::StallDetectionHandler + 'static)>>) -> glommio::Result<()>
@@ -3938,7 +3887,6 @@ pub fn glommio::LocalExecutorBuilder::make(self) -> glommio::Result<glommio::Loc
 pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
-pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -3990,7 +3938,6 @@ pub fn glommio::LocalExecutorPoolBuilder::name(self, name: &str) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
-pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -4071,67 +4018,6 @@ pub unsafe fn glommio::PoolThreadHandles<T>::init(init: <T as crossbeam_epoch::a
 impl<T> tracing::instrument::Instrument for glommio::PoolThreadHandles<T>
 impl<T> tracing::instrument::WithSubscriber for glommio::PoolThreadHandles<T>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::PoolThreadHandles<T> where T: ?core::marker::Sized
-pub struct glommio::prelude::RingIoStats
-impl glommio::RingIoStats
-pub fn glommio::RingIoStats::file_buffered_reads(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_buffered_writes(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_deduped_reads(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_reads(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_writes(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::files_closed(&self) -> u64
-pub fn glommio::RingIoStats::files_opened(&self) -> u64
-pub fn glommio::RingIoStats::io_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
-pub fn glommio::RingIoStats::post_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
-pub fn glommio::RingIoStats::pre_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
-impl core::clone::Clone for glommio::RingIoStats
-pub fn glommio::RingIoStats::clone(&self) -> glommio::RingIoStats
-impl core::default::Default for glommio::RingIoStats
-pub fn glommio::RingIoStats::default() -> Self
-impl core::fmt::Debug for glommio::RingIoStats
-pub fn glommio::RingIoStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::iter::traits::accum::Sum<&'a glommio::RingIoStats> for glommio::RingIoStats
-pub fn glommio::RingIoStats::sum<I: core::iter::traits::iterator::Iterator<Item = &'a glommio::RingIoStats>>(iter: I) -> Self
-impl core::marker::Freeze for glommio::RingIoStats
-impl core::marker::Send for glommio::RingIoStats
-impl core::marker::Sync for glommio::RingIoStats
-impl core::marker::Unpin for glommio::RingIoStats
-impl core::marker::UnsafeUnpin for glommio::RingIoStats
-impl core::panic::unwind_safe::RefUnwindSafe for glommio::RingIoStats
-impl core::panic::unwind_safe::UnwindSafe for glommio::RingIoStats
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::RingIoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::RingIoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for glommio::RingIoStats where U: core::convert::From<T>
-pub fn glommio::RingIoStats::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for glommio::RingIoStats where U: core::convert::Into<T>
-pub type glommio::RingIoStats::Error = core::convert::Infallible
-pub fn glommio::RingIoStats::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for glommio::RingIoStats where U: core::convert::TryFrom<T>
-pub type glommio::RingIoStats::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn glommio::RingIoStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for glommio::RingIoStats where T: core::clone::Clone
-pub type glommio::RingIoStats::Owned = T
-pub fn glommio::RingIoStats::clone_into(&self, target: &mut T)
-pub fn glommio::RingIoStats::to_owned(&self) -> T
-impl<T> core::any::Any for glommio::RingIoStats where T: 'static + ?core::marker::Sized
-pub fn glommio::RingIoStats::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for glommio::RingIoStats where T: ?core::marker::Sized
-pub fn glommio::RingIoStats::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for glommio::RingIoStats where T: ?core::marker::Sized
-pub fn glommio::RingIoStats::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for glommio::RingIoStats where T: core::clone::Clone
-pub unsafe fn glommio::RingIoStats::clone_to_uninit(&self, dest: *mut u8)
-impl<T> core::convert::From<T> for glommio::RingIoStats
-pub fn glommio::RingIoStats::from(t: T) -> T
-impl<T> crossbeam_epoch::atomic::Pointable for glommio::RingIoStats
-pub type glommio::RingIoStats::Init = T
-pub const glommio::RingIoStats::ALIGN: usize
-pub unsafe fn glommio::RingIoStats::deref<'a>(ptr: usize) -> &'a T
-pub unsafe fn glommio::RingIoStats::deref_mut<'a>(ptr: usize) -> &'a mut T
-pub unsafe fn glommio::RingIoStats::drop(ptr: usize)
-pub unsafe fn glommio::RingIoStats::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
-impl<T> tracing::instrument::Instrument for glommio::RingIoStats
-impl<T> tracing::instrument::WithSubscriber for glommio::RingIoStats
-impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::RingIoStats where T: ?core::marker::Sized
 pub struct glommio::prelude::TaskQueueHandle
 impl glommio::TaskQueueHandle
 pub fn glommio::TaskQueueHandle::index(&self) -> usize
@@ -5666,14 +5552,12 @@ pub fn glommio::ExecutorProxy::create_task_queue(&self, shares: glommio::Shares,
 pub fn glommio::ExecutorProxy::current_task_queue(&self) -> glommio::TaskQueueHandle
 pub fn glommio::ExecutorProxy::executor_stats(&self) -> glommio::ExecutorStats
 pub fn glommio::ExecutorProxy::id(&self) -> usize
-pub fn glommio::ExecutorProxy::io_stats(&self) -> glommio::IoStats
 pub fn glommio::ExecutorProxy::need_preempt(&self) -> bool
 pub fn glommio::ExecutorProxy::spawn_blocking<F, R>(&self, func: F) -> impl core::future::future::Future<Output = R> where F: core::ops::function::FnOnce() -> R + core::marker::Send + 'static, R: core::marker::Send + 'static
 pub fn glommio::ExecutorProxy::spawn_local<T>(&self, future: impl core::future::future::Future<Output = T> + 'static) -> glommio::Task<T> where T: 'static
 pub fn glommio::ExecutorProxy::spawn_local_into<T>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::Task<T>> where T: 'static
 pub unsafe fn glommio::ExecutorProxy::spawn_scoped_local<'a, T>(&self, future: impl core::future::future::Future<Output = T> + 'a) -> glommio::ScopedTask<'a, T>
 pub unsafe fn glommio::ExecutorProxy::spawn_scoped_local_into<'a, T>(&self, future: impl core::future::future::Future<Output = T> + 'a, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::ScopedTask<'a, T>>
-pub fn glommio::ExecutorProxy::task_queue_io_stats(&self, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::IoStats>
 pub fn glommio::ExecutorProxy::task_queue_stats(&self, handle: glommio::TaskQueueHandle) -> glommio::Result<glommio::TaskQueueStats>
 pub async fn glommio::ExecutorProxy::yield_if_needed(&self)
 pub async fn glommio::ExecutorProxy::yield_now(&self)
@@ -5769,49 +5653,6 @@ pub unsafe fn glommio::ExecutorStats::init(init: <T as crossbeam_epoch::atomic::
 impl<T> tracing::instrument::Instrument for glommio::ExecutorStats
 impl<T> tracing::instrument::WithSubscriber for glommio::ExecutorStats
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::ExecutorStats where T: ?core::marker::Sized
-pub struct glommio::IoStats
-pub glommio::IoStats::latency_ring: glommio::RingIoStats
-pub glommio::IoStats::main_ring: glommio::RingIoStats
-pub glommio::IoStats::poll_ring: glommio::RingIoStats
-impl glommio::IoStats
-pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
-impl core::fmt::Debug for glommio::IoStats
-pub fn glommio::IoStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::Freeze for glommio::IoStats
-impl core::marker::Send for glommio::IoStats
-impl core::marker::Sync for glommio::IoStats
-impl core::marker::Unpin for glommio::IoStats
-impl core::marker::UnsafeUnpin for glommio::IoStats
-impl core::panic::unwind_safe::RefUnwindSafe for glommio::IoStats
-impl core::panic::unwind_safe::UnwindSafe for glommio::IoStats
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::IoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::IoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for glommio::IoStats where U: core::convert::From<T>
-pub fn glommio::IoStats::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for glommio::IoStats where U: core::convert::Into<T>
-pub type glommio::IoStats::Error = core::convert::Infallible
-pub fn glommio::IoStats::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for glommio::IoStats where U: core::convert::TryFrom<T>
-pub type glommio::IoStats::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn glommio::IoStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> core::any::Any for glommio::IoStats where T: 'static + ?core::marker::Sized
-pub fn glommio::IoStats::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for glommio::IoStats where T: ?core::marker::Sized
-pub fn glommio::IoStats::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for glommio::IoStats where T: ?core::marker::Sized
-pub fn glommio::IoStats::borrow_mut(&mut self) -> &mut T
-impl<T> core::convert::From<T> for glommio::IoStats
-pub fn glommio::IoStats::from(t: T) -> T
-impl<T> crossbeam_epoch::atomic::Pointable for glommio::IoStats
-pub type glommio::IoStats::Init = T
-pub const glommio::IoStats::ALIGN: usize
-pub unsafe fn glommio::IoStats::deref<'a>(ptr: usize) -> &'a T
-pub unsafe fn glommio::IoStats::deref_mut<'a>(ptr: usize) -> &'a mut T
-pub unsafe fn glommio::IoStats::drop(ptr: usize)
-pub unsafe fn glommio::IoStats::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
-impl<T> tracing::instrument::Instrument for glommio::IoStats
-impl<T> tracing::instrument::WithSubscriber for glommio::IoStats
-impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::IoStats where T: ?core::marker::Sized
 pub struct glommio::LocalExecutor
 impl glommio::LocalExecutor
 pub fn glommio::LocalExecutor::detect_stalls(&self, handler: core::option::Option<alloc::boxed::Box<(dyn glommio::StallDetectionHandler + 'static)>>) -> glommio::Result<()>
@@ -5869,7 +5710,6 @@ pub fn glommio::LocalExecutorBuilder::make(self) -> glommio::Result<glommio::Loc
 pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
-pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -5921,7 +5761,6 @@ pub fn glommio::LocalExecutorPoolBuilder::name(self, name: &str) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
-pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -6002,67 +5841,6 @@ pub unsafe fn glommio::PoolThreadHandles<T>::init(init: <T as crossbeam_epoch::a
 impl<T> tracing::instrument::Instrument for glommio::PoolThreadHandles<T>
 impl<T> tracing::instrument::WithSubscriber for glommio::PoolThreadHandles<T>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::PoolThreadHandles<T> where T: ?core::marker::Sized
-pub struct glommio::RingIoStats
-impl glommio::RingIoStats
-pub fn glommio::RingIoStats::file_buffered_reads(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_buffered_writes(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_deduped_reads(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_reads(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::file_writes(&self) -> (u64, u64)
-pub fn glommio::RingIoStats::files_closed(&self) -> u64
-pub fn glommio::RingIoStats::files_opened(&self) -> u64
-pub fn glommio::RingIoStats::io_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
-pub fn glommio::RingIoStats::post_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
-pub fn glommio::RingIoStats::pre_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
-impl core::clone::Clone for glommio::RingIoStats
-pub fn glommio::RingIoStats::clone(&self) -> glommio::RingIoStats
-impl core::default::Default for glommio::RingIoStats
-pub fn glommio::RingIoStats::default() -> Self
-impl core::fmt::Debug for glommio::RingIoStats
-pub fn glommio::RingIoStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl<'a> core::iter::traits::accum::Sum<&'a glommio::RingIoStats> for glommio::RingIoStats
-pub fn glommio::RingIoStats::sum<I: core::iter::traits::iterator::Iterator<Item = &'a glommio::RingIoStats>>(iter: I) -> Self
-impl core::marker::Freeze for glommio::RingIoStats
-impl core::marker::Send for glommio::RingIoStats
-impl core::marker::Sync for glommio::RingIoStats
-impl core::marker::Unpin for glommio::RingIoStats
-impl core::marker::UnsafeUnpin for glommio::RingIoStats
-impl core::panic::unwind_safe::RefUnwindSafe for glommio::RingIoStats
-impl core::panic::unwind_safe::UnwindSafe for glommio::RingIoStats
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::RingIoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::RingIoStats where ST: ?core::marker::Sized, DT: ?core::marker::Sized
-impl<T, U> core::convert::Into<U> for glommio::RingIoStats where U: core::convert::From<T>
-pub fn glommio::RingIoStats::into(self) -> U
-impl<T, U> core::convert::TryFrom<U> for glommio::RingIoStats where U: core::convert::Into<T>
-pub type glommio::RingIoStats::Error = core::convert::Infallible
-pub fn glommio::RingIoStats::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
-impl<T, U> core::convert::TryInto<U> for glommio::RingIoStats where U: core::convert::TryFrom<T>
-pub type glommio::RingIoStats::Error = <U as core::convert::TryFrom<T>>::Error
-pub fn glommio::RingIoStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
-impl<T> alloc::borrow::ToOwned for glommio::RingIoStats where T: core::clone::Clone
-pub type glommio::RingIoStats::Owned = T
-pub fn glommio::RingIoStats::clone_into(&self, target: &mut T)
-pub fn glommio::RingIoStats::to_owned(&self) -> T
-impl<T> core::any::Any for glommio::RingIoStats where T: 'static + ?core::marker::Sized
-pub fn glommio::RingIoStats::type_id(&self) -> core::any::TypeId
-impl<T> core::borrow::Borrow<T> for glommio::RingIoStats where T: ?core::marker::Sized
-pub fn glommio::RingIoStats::borrow(&self) -> &T
-impl<T> core::borrow::BorrowMut<T> for glommio::RingIoStats where T: ?core::marker::Sized
-pub fn glommio::RingIoStats::borrow_mut(&mut self) -> &mut T
-impl<T> core::clone::CloneToUninit for glommio::RingIoStats where T: core::clone::Clone
-pub unsafe fn glommio::RingIoStats::clone_to_uninit(&self, dest: *mut u8)
-impl<T> core::convert::From<T> for glommio::RingIoStats
-pub fn glommio::RingIoStats::from(t: T) -> T
-impl<T> crossbeam_epoch::atomic::Pointable for glommio::RingIoStats
-pub type glommio::RingIoStats::Init = T
-pub const glommio::RingIoStats::ALIGN: usize
-pub unsafe fn glommio::RingIoStats::deref<'a>(ptr: usize) -> &'a T
-pub unsafe fn glommio::RingIoStats::deref_mut<'a>(ptr: usize) -> &'a mut T
-pub unsafe fn glommio::RingIoStats::drop(ptr: usize)
-pub unsafe fn glommio::RingIoStats::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
-impl<T> tracing::instrument::Instrument for glommio::RingIoStats
-impl<T> tracing::instrument::WithSubscriber for glommio::RingIoStats
-impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::RingIoStats where T: ?core::marker::Sized
 pub struct glommio::ScopedTask<'a, T>(_, _)
 impl<T> glommio::ScopedTask<'_, T>
 pub async fn glommio::ScopedTask<'_, T>::cancel(self) -> core::option::Option<T>

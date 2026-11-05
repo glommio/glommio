@@ -4,6 +4,7 @@
 //! latency collection function is installed, so the flag being off has to mean
 //! no readings, and the flag being on has to still produce them.
 
+#[cfg(feature = "stats")]
 use glommio::{io::DmaFile, LocalExecutorBuilder, Placement};
 
 /// Writes a file, reads it back, and reports how many I/O latencies landed in
@@ -12,6 +13,7 @@ use glommio::{io::DmaFile, LocalExecutorBuilder, Placement};
 /// The reading matters: latencies are collected on the read paths, so a
 /// write-only workload records nothing however the flag is set. `DmaFile::create`
 /// opens write-only, hence the reopen.
+#[cfg(feature = "stats")]
 fn run_and_count(record: bool) -> usize {
     LocalExecutorBuilder::new(Placement::Unbound)
         .record_io_latencies(record)
@@ -50,6 +52,7 @@ fn run_and_count(record: bool) -> usize {
         .unwrap()
 }
 
+#[cfg(feature = "stats")]
 #[test]
 fn latencies_are_recorded_when_asked_for() {
     assert!(
@@ -58,6 +61,7 @@ fn latencies_are_recorded_when_asked_for() {
     );
 }
 
+#[cfg(feature = "stats")]
 #[test]
 fn nothing_is_recorded_when_not_asked_for() {
     assert_eq!(

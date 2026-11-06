@@ -126,7 +126,7 @@ pub struct Preallocated {
 }
 
 impl Preallocated {
-    const DEFAULT_BUFFER_SIZE: usize = 8192;
+    pub(crate) const DEFAULT_BUFFER_SIZE: usize = 8192;
 
     /// Creates a fixed sized receive buffer
     pub fn new(size: usize) -> Self {

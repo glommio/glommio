@@ -78,6 +78,51 @@ pub(crate) const DEFAULT_EXECUTOR_NAME: &str = "unnamed";
 pub(crate) const DEFAULT_PREEMPT_TIMER: Duration = Duration::from_millis(100);
 pub(crate) const DEFAULT_IO_MEMORY: usize = 10 << 20;
 pub(crate) const DEFAULT_RING_SUBMISSION_DEPTH: usize = 128;
+/// Provided receive buffers per executor, see [`LocalExecutorBuilder::recv_buffers`].
+pub(crate) const DEFAULT_RECV_BUFFER_COUNT: usize = 1024;
+/// Bytes per provided receive buffer: what a buffered stream allocates for
+/// itself, so a full fill means the same thing either way.
+pub(crate) const DEFAULT_RECV_BUFFER_SIZE: usize = crate::net::Preallocated::DEFAULT_BUFFER_SIZE;
+
+/// The receive buffers an executor lends to the kernel for multishot
+/// receive. `count` of zero means none, and no multishot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecvBuffers {
+    pub(crate) count: usize,
+    pub(crate) size: usize,
+}
+
+impl RecvBuffers {
+    /// The kernel's limits: a buffer ring holds at most 32768 entries and the
+    /// count must be a power of two, which it is rounded up to.
+    pub(crate) const MAX_COUNT: usize = 32768;
+
+    pub(crate) fn new(count: usize, size: usize) -> Self {
+        assert!(
+            count <= Self::MAX_COUNT,
+            "recv_buffers: count {count} is above the kernel's limit of {}",
+            Self::MAX_COUNT
+        );
+        assert!(
+            count == 0 || size > 0,
+            "recv_buffers: a receive buffer of zero bytes cannot hold a message"
+        );
+        RecvBuffers {
+            count: if count == 0 {
+                0
+            } else {
+                count.next_power_of_two()
+            },
+            size,
+        }
+    }
+}
+
+impl Default for RecvBuffers {
+    fn default() -> Self {
+        Self::new(DEFAULT_RECV_BUFFER_COUNT, DEFAULT_RECV_BUFFER_SIZE)
+    }
+}
 
 /// Result type alias that removes the need to specify a type parameter
 /// that's only valid in the channel variants of the error. Otherwise, it
@@ -522,6 +567,8 @@ pub struct LocalExecutorBuilder {
     /// [`stall::DefaultStallDetectionHandler`] installs a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
     detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
+    /// Receive buffers lent to the kernel for multishot receive
+    recv_buffers: RecvBuffers,
 }
 
 impl LocalExecutorBuilder {
@@ -541,6 +588,7 @@ impl LocalExecutorBuilder {
             record_io_latencies: false,
             blocking_thread_pool_placement: PoolPlacement::from(placement),
             detect_stalls: None,
+            recv_buffers: RecvBuffers::default(),
         }
     }
 
@@ -589,6 +637,40 @@ impl LocalExecutorBuilder {
     pub fn ring_depth(mut self, ring_depth: usize) -> LocalExecutorBuilder {
         assert!(ring_depth > 0, "ring depth should be strictly positive");
         self.ring_depth = ring_depth;
+        self
+    }
+
+    /// The receive buffers this executor lends to the kernel: `count` buffers
+    /// of `size` bytes each.
+    ///
+    /// A buffered [`TcpStream`] or [`UnixStream`] arms one multishot receive
+    /// for its lifetime instead of submitting a read per message. The kernel
+    /// copies each arrival into one of these buffers and posts a completion,
+    /// so the executor submits nothing per message and a reply that was
+    /// already waiting is a completion already in the queue. The buffers are
+    /// handed back as the stream consumes them; an idle connection holds none.
+    ///
+    /// `count` bounds how many arrivals the kernel can hold between two visits
+    /// to the completion queue, not how many connections can be open. When
+    /// they run out the kernel drops the request with `ENOBUFS` and the
+    /// stream falls back to a plain read until it re-arms. It is rounded up
+    /// to a power of two and is at most 32768. `size` is the most one
+    /// completion can carry; a message larger than it arrives in several.
+    ///
+    /// The memory is `count * size` per executor, allocated at start. The
+    /// default is 1024 buffers of 8 KiB, 8 MiB, which is the buffer a
+    /// buffered stream allocates for itself times a count on the scale of
+    /// [`io_memory`](Self::io_memory). A pool of shards multiplies it by the
+    /// number of shards, which is why both numbers are here rather than
+    /// chosen for you. A `count` of zero turns multishot receive off, and
+    /// buffered streams submit a read per message as before. A kernel older
+    /// than 6.0 behaves as if it were zero.
+    ///
+    /// [`TcpStream`]: crate::net::TcpStream
+    /// [`UnixStream`]: crate::net::UnixStream
+    #[must_use = "The builder must be built to be useful"]
+    pub fn recv_buffers(mut self, count: usize, size: usize) -> LocalExecutorBuilder {
+        self.recv_buffers = RecvBuffers::new(count, size);
         self
     }
 
@@ -674,6 +756,7 @@ impl LocalExecutorBuilder {
                 spin_before_park: self.spin_before_park,
                 thread_pool_placement: self.blocking_thread_pool_placement,
                 detect_stalls: self.detect_stalls,
+                recv_buffers: self.recv_buffers,
             },
         )?;
         le.init();
@@ -740,6 +823,7 @@ impl LocalExecutorBuilder {
         let detect_stalls = self.detect_stalls;
         let record_io_latencies = self.record_io_latencies;
         let blocking_thread_pool_placement = self.blocking_thread_pool_placement;
+        let recv_buffers = self.recv_buffers;
 
         Builder::new()
             .name(name)
@@ -755,6 +839,7 @@ impl LocalExecutorBuilder {
                         spin_before_park,
                         thread_pool_placement: blocking_thread_pool_placement,
                         detect_stalls,
+                        recv_buffers,
                     },
                 )?;
                 le.init();
@@ -823,6 +908,8 @@ pub struct LocalExecutorPoolBuilder {
     /// [`DefaultStallDetectionHandler installs`] a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
     handler_gen: Option<Box<dyn Fn() -> Box<dyn stall::StallDetectionHandler + 'static>>>,
+    /// Receive buffers each executor lends to the kernel for multishot receive
+    recv_buffers: RecvBuffers,
 }
 
 impl fmt::Debug for LocalExecutorPoolBuilder {
@@ -838,6 +925,7 @@ impl fmt::Debug for LocalExecutorPoolBuilder {
                 "blocking_thread_pool_placement",
                 &self.blocking_thread_pool_placement,
             )
+            .field("recv_buffers", &self.recv_buffers)
             .finish_non_exhaustive()
     }
 }
@@ -859,6 +947,7 @@ impl LocalExecutorPoolBuilder {
             record_io_latencies: false,
             blocking_thread_pool_placement: placement.shrink_to(1),
             handler_gen: None,
+            recv_buffers: RecvBuffers::default(),
         }
     }
 
@@ -896,6 +985,14 @@ impl LocalExecutorPoolBuilder {
     pub fn ring_depth(mut self, ring_depth: usize) -> Self {
         assert!(ring_depth > 0, "ring depth should be strictly positive");
         self.ring_depth = ring_depth;
+        self
+    }
+
+    /// The receive buffers each executor in the pool lends to the kernel, as
+    /// [`LocalExecutorBuilder::recv_buffers`]. The memory is per executor.
+    #[must_use = "The builder must be built to be useful"]
+    pub fn recv_buffers(mut self, count: usize, size: usize) -> Self {
+        self.recv_buffers = RecvBuffers::new(count, size);
         self
     }
 
@@ -1031,6 +1128,7 @@ impl LocalExecutorPoolBuilder {
             let record_io_latencies = self.record_io_latencies;
             let blocking_thread_pool_placement = self.blocking_thread_pool_placement.clone();
             let detect_stalls = self.handler_gen.as_ref().map(|x| (*x.deref())());
+            let recv_buffers = self.recv_buffers;
             let latch = Latch::clone(latch);
 
             move || {
@@ -1046,6 +1144,7 @@ impl LocalExecutorPoolBuilder {
                             spin_before_park,
                             thread_pool_placement: blocking_thread_pool_placement,
                             detect_stalls,
+                            recv_buffers,
                         },
                     )?;
                     le.init();
@@ -1131,6 +1230,7 @@ pub struct LocalExecutorConfig {
     pub spin_before_park: Option<Duration>,
     pub thread_pool_placement: PoolPlacement,
     pub detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
+    pub(crate) recv_buffers: RecvBuffers,
 }
 
 /// Single-threaded executor.
@@ -1234,6 +1334,7 @@ impl LocalExecutor {
             config.ring_depth,
             config.record_io_latencies,
             blocking_thread,
+            config.recv_buffers,
         )?);
         let tasks = Rc::new(TaskRegistry::new(WeakExecutorContext::new(
             id, &queues, &reactor,

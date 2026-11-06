@@ -39,6 +39,7 @@ pub(crate) enum SourceType {
     /// A read into a stream's own receive buffer, held here until the
     /// completion arrives so the stream can be dropped mid-read.
     SockRecvInto(Option<crate::net::OwnedRxBuf>),
+    RecvMulti(RecvMultiState),
     SockRecvMsg(
         Option<DmaBuffer>,
         libc::iovec,
@@ -70,6 +71,45 @@ pub(crate) enum SourceType {
     CopyFileRange(RawFd, u64, usize),
     #[cfg(feature = "bench")]
     Noop,
+}
+
+/// What a multishot receive has delivered and not yet handed over.
+///
+/// One request, many completions: each arrival lands in a buffer the kernel
+/// picked from the executor's ring and is queued here as the buffer's id and
+/// the byte count. The owner takes them in order and gives each buffer back.
+/// Anything still queued when the state is dropped goes back by itself.
+#[derive(Debug)]
+pub(crate) struct RecvMultiState {
+    pub(crate) ready: std::collections::VecDeque<(u16, usize)>,
+    /// Whether the kernel still holds the request. Cleared by the completion
+    /// that carries no `MORE` flag, which is also the one that retires the
+    /// source and stores its result.
+    pub(crate) armed: bool,
+    pub(crate) buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>,
+}
+
+impl RecvMultiState {
+    pub(crate) fn new(buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>) -> Self {
+        RecvMultiState {
+            ready: Default::default(),
+            armed: true,
+            buffers,
+        }
+    }
+}
+
+impl Drop for RecvMultiState {
+    fn drop(&mut self) {
+        if self.ready.is_empty() {
+            return;
+        }
+        let mut buffers = self.buffers.borrow_mut();
+        for (bid, _) in self.ready.drain(..) {
+            buffers.give_back(bid);
+        }
+        buffers.publish();
+    }
 }
 
 impl TryFrom<SourceType> for Statx {

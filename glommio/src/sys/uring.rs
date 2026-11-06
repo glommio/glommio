@@ -69,6 +69,7 @@ enum UringOpDescriptor {
     SockSendMsg(*mut libc::msghdr, i32),
     SockRecv(usize, i32),
     SockRecvInto(i32),
+    RecvMulti,
     SockRecvMsg(usize, i32),
     Nop,
 }
@@ -387,6 +388,7 @@ where
     F: FnOnce(usize) -> Option<DmaBuffer>,
 {
     let mut user_data = op.user_data;
+    let mut flags = op.flags;
     let fd = types::Fd(op.fd);
 
     let entry = unsafe {
@@ -539,6 +541,10 @@ where
                     }
                 })
             }
+            UringOpDescriptor::RecvMulti => {
+                flags |= squeue::Flags::BUFFER_SELECT;
+                opcode::RecvMulti::new(fd, RECV_BUFFER_GROUP).build()
+            }
             UringOpDescriptor::SockRecv(len, flags) => {
                 let mut buf = DmaBuffer::new(len).expect("failed to allocate buffer");
                 let entry = opcode::Recv::new(fd, buf.as_mut_ptr(), len as u32)
@@ -584,7 +590,7 @@ where
         }
     };
 
-    entry.user_data(user_data).flags(op.flags)
+    entry.user_data(user_data).flags(flags)
 }
 
 /// Turns a raw CQE result into an `io::Result`. io_uring reports failure as a
@@ -750,35 +756,81 @@ fn submit_event_chain(
 /// Processes a single completion event, if any.
 ///
 /// No user data is `POLL_REMOVE` or `CANCEL`; we won't process it.
+/// What one completion did: whether it woke anyone, and whether it was the
+/// source's last, which is what retires the source and frees its ring slot.
+/// Every completion is the last one except a multishot receive's while the
+/// kernel still holds the request.
+struct Processed {
+    woke: bool,
+    retired: bool,
+}
+
+/// Queues the arrival a multishot completion carries, if any, on its source.
+fn queue_multishot_arrival(inner: &mut InnerSource, value: &cqueue::Entry) {
+    let SourceType::RecvMulti(state) = &mut inner.source_type else {
+        return;
+    };
+    if value.result() < 0 {
+        return;
+    }
+    if let Some(bid) = cqueue::buffer_select(value.flags()) {
+        state.buffers.borrow_mut().lent();
+        state.ready.push_back((bid, value.result() as usize));
+    }
+}
+
 fn process_one_event<F, R>(
     cqe: Option<cqueue::Entry>,
     try_process: F,
     post_process: R,
     source_map: Rc<RefCell<SourceMap>>,
-) -> Option<bool>
+) -> Option<Processed>
 where
     F: FnOnce(Ref<'_, InnerSource>) -> Option<()>,
     R: FnOnce(RefMut<'_, InnerSource>, io::Result<usize>) -> io::Result<usize>,
 {
     if let Some(value) = cqe {
         if value.user_data() == 0 {
-            return Some(false);
+            return Some(Processed {
+                woke: false,
+                retired: true,
+            });
+        }
+        let id = from_user_data(value.user_data());
+
+        if cqueue::more(value.flags()) {
+            let woke = source_map.borrow_mut().peek_source_mut(id, |mut inner| {
+                queue_multishot_arrival(&mut inner, &value);
+                inner.wakers.wake_waiters()
+            });
+            return Some(Processed {
+                woke,
+                retired: false,
+            });
         }
 
-        let src = source_map
-            .borrow_mut()
-            .consume_source(from_user_data(value.user_data()));
+        let src = source_map.borrow_mut().consume_source(id);
 
         let result = value.result();
 
         let mut woke = false;
         if try_process(src.borrow()).is_none() {
+            {
+                let mut inner = src.borrow_mut();
+                queue_multishot_arrival(&mut inner, &value);
+                if let SourceType::RecvMulti(state) = &mut inner.source_type {
+                    state.armed = false;
+                }
+            }
             let res = Some(post_process(src.borrow_mut(), transmute_error(result)));
             let mut inner_source = src.borrow_mut();
             inner_source.wakers.result = res;
             woke = inner_source.wakers.wake_waiters();
         }
-        return Some(woke);
+        return Some(Processed {
+            woke,
+            retired: true,
+        });
     }
     None
 }
@@ -1065,8 +1117,11 @@ impl UringCommon for PollRing {
             },
             source_map,
         )
-        .inspect(|_| {
-            self.in_kernel -= 1;
+        .map(|processed| {
+            if processed.retired {
+                self.in_kernel -= 1;
+            }
+            processed.woke
         })
     }
 
@@ -1081,8 +1136,162 @@ impl UringCommon for PollRing {
     }
 }
 
+/// The buffer group a ring's provided buffers are registered under. One
+/// group per ring is all multishot receive needs.
+const RECV_BUFFER_GROUP: u16 = 0;
+
+/// Receive buffers lent to the kernel through a provided-buffer ring.
+///
+/// `entries` is the ring the kernel reads buffer descriptors from and
+/// `memory` the buffers themselves, `count` of `size` bytes each, both
+/// page-aligned and alive for as long as the registration. Handing a buffer
+/// back is a write to the ring's tail, no syscall.
+pub(crate) struct ProvidedBuffers {
+    entries: *mut types::BufRingEntry,
+    memory: *mut u8,
+    count: u16,
+    size: usize,
+    tail: u16,
+    /// Buffers the kernel has filled and nobody has given back yet.
+    held: usize,
+}
+
+impl ProvidedBuffers {
+    /// Registers `count` buffers of `size` bytes with `ring`. `count` is a
+    /// power of two at most 32768, which the builder guarantees.
+    fn register(ring: &IoUring, count: usize, size: usize) -> io::Result<Self> {
+        debug_assert!(count.is_power_of_two() && count <= 32768);
+        let count = count as u16;
+        let ring_layout =
+            Layout::from_size_align(count as usize * size_of::<types::BufRingEntry>(), 4096)
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let memory_layout = Layout::from_size_align(count as usize * size, 4096)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let entries =
+            unsafe { alloc::alloc::alloc_zeroed(ring_layout) } as *mut types::BufRingEntry;
+        if entries.is_null() {
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        let memory = unsafe { alloc::alloc::alloc_zeroed(memory_layout) };
+        if memory.is_null() {
+            unsafe { alloc::alloc::dealloc(entries as *mut u8, ring_layout) };
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        }
+        if let Err(err) = unsafe {
+            ring.submitter().register_buf_ring_with_flags(
+                entries as u64,
+                count,
+                RECV_BUFFER_GROUP,
+                0,
+            )
+        } {
+            unsafe {
+                alloc::alloc::dealloc(entries as *mut u8, ring_layout);
+                alloc::alloc::dealloc(memory, memory_layout);
+            }
+            return Err(err);
+        }
+        let mut buffers = ProvidedBuffers {
+            entries,
+            memory,
+            count,
+            size,
+            tail: 0,
+            held: 0,
+        };
+        for bid in 0..count {
+            buffers.give_back(bid);
+        }
+        buffers.publish();
+        Ok(buffers)
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.count as usize
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
+    /// How many buffers are filled and waiting to be given back.
+    pub(crate) fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Records that the kernel filled a buffer, which is now the receiver's
+    /// to give back.
+    fn lent(&mut self) {
+        self.held += 1;
+    }
+
+    /// The bytes the kernel wrote into buffer `bid`, `len` of them.
+    pub(crate) fn bytes(&self, bid: u16, len: usize) -> &[u8] {
+        debug_assert!(bid < self.count && len <= self.size);
+        unsafe { std::slice::from_raw_parts(self.memory.add(bid as usize * self.size), len) }
+    }
+
+    /// Queues buffer `bid` for the kernel to pick again. Visible to the
+    /// kernel after [`publish`](Self::publish).
+    pub(crate) fn give_back(&mut self, bid: u16) {
+        debug_assert!(bid < self.count);
+        self.held = self.held.saturating_sub(1);
+        let slot = (self.tail & (self.count - 1)) as usize;
+        unsafe {
+            let entry = &mut *self.entries.add(slot);
+            entry.set_addr(self.memory.add(bid as usize * self.size) as u64);
+            entry.set_len(self.size as u32);
+            entry.set_bid(bid);
+        }
+        self.tail = self.tail.wrapping_add(1);
+    }
+
+    /// Makes every buffer given back so far visible to the kernel.
+    pub(crate) fn publish(&self) {
+        unsafe {
+            let tail =
+                types::BufRingEntry::tail(self.entries) as *const std::sync::atomic::AtomicU16;
+            (*tail).store(self.tail, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl fmt::Debug for ProvidedBuffers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProvidedBuffers")
+            .field("count", &self.count)
+            .field("size", &self.size)
+            .field("held", &self.held)
+            .finish()
+    }
+}
+
+impl Drop for ProvidedBuffers {
+    /// The ring this was registered with is declared before it in
+    /// [`SleepableRing`], so the registration is gone by the time the memory
+    /// is.
+    fn drop(&mut self) {
+        unsafe {
+            alloc::alloc::dealloc(
+                self.entries as *mut u8,
+                Layout::from_size_align_unchecked(
+                    self.count as usize * size_of::<types::BufRingEntry>(),
+                    4096,
+                ),
+            );
+            alloc::alloc::dealloc(
+                self.memory,
+                Layout::from_size_align_unchecked(self.count as usize * self.size, 4096),
+            );
+        }
+    }
+}
+
 struct SleepableRing {
     ring: IoUring,
+    /// Declared after `ring` so the registration is released first. Shared
+    /// with every multishot source, which gives its buffers back through it.
+    provided_buffers: Option<Rc<RefCell<ProvidedBuffers>>>,
     size: usize,
     submission_queue: ReactorQueue,
     name: &'static str,
@@ -1103,6 +1312,7 @@ impl SleepableRing {
         check_uring_support()?;
         Ok(SleepableRing {
             ring: IoUring::new(size as _)?,
+            provided_buffers: None,
             size,
             submission_queue: UringQueueState::with_capacity(size * 4),
             name,
@@ -1395,8 +1605,11 @@ impl UringCommon for SleepableRing {
             },
             source_map,
         )
-        .inspect(|_| {
-            self.in_kernel -= 1;
+        .map(|processed| {
+            if processed.retired {
+                self.in_kernel -= 1;
+            }
+            processed.woke
         })
     }
 
@@ -1434,6 +1647,9 @@ pub(crate) struct Reactor {
     blocking_thread: BlockingThreadPool,
 
     rings_depth: usize,
+
+    /// Set once the kernel has rejected the multishot receive flag.
+    recv_multi_refused: Cell<bool>,
 }
 
 pub(crate) fn common_flags() -> PollFlags {
@@ -1491,6 +1707,7 @@ impl Reactor {
         mut io_memory: usize,
         ring_depth: usize,
         blocking_thread: BlockingThreadPool,
+        recv_buffers: crate::executor::RecvBuffers,
     ) -> crate::Result<Reactor, ()> {
         const MIN_MEMLOCK_LIMIT: u64 = 512 * 1024;
         let (memlock_limit, _) = Resource::MEMLOCK.get()?;
@@ -1518,6 +1735,19 @@ impl Reactor {
         let mut poll_ring = PollRing::new(ring_depth, allocator.clone(), source_map.clone())?;
         let mut latency_ring =
             SleepableRing::new(ring_depth, "latency", allocator.clone(), source_map.clone())?;
+        if recv_buffers.count > 0 {
+            match ProvidedBuffers::register(
+                &latency_ring.ring,
+                recv_buffers.count,
+                recv_buffers.size,
+            ) {
+                Ok(buffers) => latency_ring.provided_buffers = Some(Rc::new(RefCell::new(buffers))),
+                Err(err) => warn!(
+                    "this kernel takes no provided-buffer ring ({err}); buffered sockets will \
+                     read without multishot receive"
+                ),
+            }
+        }
 
         match unsafe { main_ring.submitter().register_buffers(&registry) } {
             Err(x) => warn!("Error: registering buffers in the main ring. Skipping{x:#?}"),
@@ -1567,6 +1797,7 @@ impl Reactor {
             eventfd_src,
             source_map,
             rings_depth: ring_depth,
+            recv_multi_refused: Cell::new(false),
         })
     }
 
@@ -1576,6 +1807,30 @@ impl Reactor {
 
     pub(crate) fn ring_depth(&self) -> usize {
         self.rings_depth
+    }
+
+    /// The receive buffers lent to the kernel, as `(count, size)`, or `None`
+    /// when there are none, by configuration or because the kernel refused.
+    pub(crate) fn provided_buffers(&self) -> Option<(usize, usize)> {
+        self.recv_buffers().map(|b| {
+            let b = b.borrow();
+            (b.count(), b.size())
+        })
+    }
+
+    /// The ring of receive buffers multishot sources draw from, when the
+    /// executor has one and the kernel has not refused the multishot flag.
+    pub(crate) fn recv_buffers(&self) -> Option<Rc<RefCell<ProvidedBuffers>>> {
+        if self.recv_multi_refused.get() {
+            return None;
+        }
+        self.latency_ring.borrow().provided_buffers.clone()
+    }
+
+    /// Remembers that this kernel answered a multishot receive with EINVAL,
+    /// so no further stream tries one.
+    pub(crate) fn refuse_recv_multi(&self) {
+        self.recv_multi_refused.set(true);
     }
 
     pub(crate) fn install_eventfd(&self) {
@@ -1705,6 +1960,17 @@ impl Reactor {
             &mut *self.ring_for_source(source),
             source,
             op,
+            &mut self.source_map.borrow_mut(),
+        );
+    }
+
+    /// Arms a multishot receive: one request that completes once per
+    /// arrival into a buffer from the executor's ring.
+    pub(crate) fn recv_multi(&self, source: &Source) {
+        queue_request_into_ring(
+            &mut *self.ring_for_source(source),
+            source,
+            UringOpDescriptor::RecvMulti,
             &mut self.source_map.borrow_mut(),
         );
     }
@@ -2180,6 +2446,7 @@ impl Reactor {
                 PollableStatus::NonPollable(_) => self.main_ring.borrow_mut(),
             },
             SourceType::SockRecv(_)
+            | SourceType::RecvMulti(_)
             | SourceType::SockRecvMsg(_, _, _, _)
             | SourceType::Accept(_)
             | SourceType::Connect(_) => self.latency_ring.borrow_mut(),
@@ -2330,6 +2597,164 @@ mod tests {
         }
     }
 
+    /// The pool the builder asked for is the pool the latency ring holds.
+    #[test]
+    fn provided_buffers_follow_the_builder() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(64, 4096)
+            .make()
+            .unwrap();
+        ex.run(async {
+            assert_eq!(
+                crate::executor().reactor().sys.provided_buffers(),
+                Some((64, 4096))
+            );
+        });
+    }
+
+    /// A count that is not a power of two is rounded up, as the kernel needs.
+    #[test]
+    fn provided_buffer_count_rounds_up() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(100, 512)
+            .make()
+            .unwrap();
+        ex.run(async {
+            assert_eq!(
+                crate::executor().reactor().sys.provided_buffers(),
+                Some((128, 512))
+            );
+        });
+    }
+
+    /// Zero buffers means no ring registered at all.
+    #[test]
+    fn zero_provided_buffers_registers_nothing() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(0, 4096)
+            .make()
+            .unwrap();
+        ex.run(async {
+            assert_eq!(crate::executor().reactor().sys.provided_buffers(), None);
+        });
+    }
+
+    /// Drives submission and completion without sleeping, the way a reactor
+    /// pass does, after giving the kernel a moment to deliver.
+    fn settle(reactor: &crate::reactor::Reactor) {
+        std::thread::sleep(Duration::from_millis(20));
+        let mut woke = 0;
+        reactor.sys.poll_io(&mut woke).unwrap();
+    }
+
+    fn arrivals(source: &Source) -> (Vec<Vec<u8>>, bool) {
+        match &*source.source_type() {
+            SourceType::RecvMulti(state) => {
+                let buffers = state.buffers.borrow();
+                (
+                    state
+                        .ready
+                        .iter()
+                        .map(|(bid, len)| buffers.bytes(*bid, *len).to_vec())
+                        .collect(),
+                    state.armed,
+                )
+            }
+            other => panic!("not a multishot source: {other:?}"),
+        }
+    }
+
+    /// One request, a completion per arrival, and the kernel's end-of-file
+    /// retires it with a zero result.
+    #[test]
+    fn a_multishot_source_queues_every_arrival_and_retires_on_eof() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(8, 64)
+            .make()
+            .unwrap();
+        ex.run(async {
+            let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            let reactor = crate::executor().reactor();
+            let source = reactor.recv_multi(reader.as_raw_fd()).unwrap();
+            settle(&reactor);
+
+            for msg in [&b"one"[..], b"two", b"three"] {
+                std::io::Write::write_all(&mut writer, msg).unwrap();
+                settle(&reactor);
+            }
+            let (ready, armed) = arrivals(&source);
+            assert_eq!(ready.concat(), b"onetwothree");
+            assert!(armed, "the kernel dropped the request before end of file");
+            assert!(source.result().is_none(), "retired before end of file");
+            let buffers = reactor.sys.recv_buffers().unwrap();
+            assert_eq!(buffers.borrow().held(), ready.len());
+
+            drop(writer);
+            settle(&reactor);
+            let (_, armed) = arrivals(&source);
+            assert!(!armed);
+            assert_eq!(source.result().unwrap().unwrap(), 0);
+
+            drop(source);
+            assert_eq!(buffers.borrow().held(), 0, "buffers leaked with the source");
+        });
+    }
+
+    /// Running out of buffers ends the request with ENOBUFS rather than
+    /// losing data: what arrived is queued, and the rest is still in the
+    /// socket for a re-armed request.
+    #[test]
+    fn a_multishot_source_stops_with_enobufs_when_the_ring_runs_dry() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(2, 16)
+            .make()
+            .unwrap();
+        ex.run(async {
+            let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            let reactor = crate::executor().reactor();
+            let source = reactor.recv_multi(reader.as_raw_fd()).unwrap();
+            settle(&reactor);
+
+            for msg in [&b"aaaa"[..], b"bbbb", b"cccc"] {
+                std::io::Write::write_all(&mut writer, msg).unwrap();
+                settle(&reactor);
+            }
+            let (ready, armed) = arrivals(&source);
+            assert!(!armed, "two buffers took three arrivals");
+            assert_eq!(ready.concat(), b"aaaabbbb");
+            assert_eq!(
+                source.result().unwrap().unwrap_err().raw_os_error(),
+                Some(libc::ENOBUFS)
+            );
+
+            drop(source);
+            let again = reactor.recv_multi(reader.as_raw_fd()).unwrap();
+            settle(&reactor);
+            let (ready, armed) = arrivals(&again);
+            assert!(armed);
+            assert_eq!(ready.concat(), b"cccc");
+        });
+    }
+
+    /// Every buffer handed back lands in its own slot with its own address.
+    #[test]
+    fn provided_buffers_are_distinct() {
+        let ring = IoUring::new(8).unwrap();
+        let buffers = ProvidedBuffers::register(&ring, 8, 1024).unwrap();
+        let addresses: std::collections::HashSet<usize> = (0..8)
+            .map(|bid| buffers.bytes(bid, 1024).as_ptr() as usize)
+            .collect();
+        assert_eq!(addresses.len(), 8);
+        let sorted = {
+            let mut v: Vec<usize> = addresses.into_iter().collect();
+            v.sort();
+            v
+        };
+        assert!(sorted.windows(2).all(|w| w[1] - w[0] == 1024));
+    }
+
     #[test]
     fn missing_opcodes_are_named_in_the_error() {
         let err = UringUnsupported::MissingOps(vec!["STATX", "CLOSE"]).to_string();
@@ -2354,7 +2779,14 @@ mod tests {
     fn timeout_smoke_test() {
         let notifier = sys::new_sleep_notifier().unwrap();
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
-        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let reactor = Reactor::new(
+            notifier,
+            0,
+            128,
+            pool,
+            crate::executor::RecvBuffers::default(),
+        )
+        .unwrap();
 
         fn timeout_source(millis: u64) -> (Source, UringOpDescriptor) {
             let source = Source::new(
@@ -2473,7 +2905,14 @@ mod tests {
         );
         let notifier = sys::new_sleep_notifier().unwrap();
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
-        let mut reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let mut reactor = Reactor::new(
+            notifier,
+            0,
+            128,
+            pool,
+            crate::executor::RecvBuffers::default(),
+        )
+        .unwrap();
 
         let queues = [
             ("main", reactor.main_ring.get_mut().submission_queue()),

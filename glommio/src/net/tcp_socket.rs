@@ -1034,6 +1034,35 @@ impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
 
 #[cfg(test)]
 mod tests {
+    /// A kernel with buffer rings but no bundles answers the first bundled
+    /// receive with EINVAL. The stream must re-arm the plain form, not
+    /// unwrap the source it just gave up.
+    #[test]
+    fn a_bundled_einval_re_arms_plain() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = super::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut writer = super::TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::EINVAL), true);
+                writer.write_all(b"hello").await.unwrap();
+                let mut got = [0u8; 5];
+                reader.read_exact(&mut got).await.unwrap();
+                assert_eq!(&got, b"hello");
+                assert!(
+                    reader.stream.multishot_armed(),
+                    "the plain form was not re-armed after the bundle was refused"
+                );
+            });
+    }
+
     use super::*;
     use crate::{channels::shared_channel, enclose, timer::Timer, LocalExecutorBuilder};
     use futures_lite::{

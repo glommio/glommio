@@ -59,6 +59,14 @@ branch, three interleaved runs each, CPU on the reading thread per message:
 streaming rung moved from 2833 ns to 2742 ns per 64 KiB, 3% better, and the
 unbuffered rung did not move, as it keeps its path.
 
+The ring of its own (below) did not move the ladder: buffered 903/888/894 ns
+against 899/905/909 ns for the revision before it, three interleaved runs.
+What it moved is the pipelined cell: on the PostgreSQL client's
+`pipeline-select 1 × 16`, three runs of five seconds, 44564/44499/44578
+transactions a second at a p99 of 0.369 ms, where the readiness path does
+45079 at 0.365 ms and the revision before the ring did 599 at 196 ms.
+`select-only 1 × 1` went from 70046 to 77946/78664.
+
 ## Acceptance
 
 Two cells of the PostgreSQL client's scoreboard, both against the main this
@@ -77,8 +85,8 @@ Plus, here: `recv_ladder` rung 4 buffered against rung 3, and
 
 ### Buffer ring, one per executor
 
-A provided-buffer ring (`IORING_REGISTER_PBUF_RING`) registered on the latency
-ring, which is where socket receives are submitted. The ring holds `count`
+A provided-buffer ring (`IORING_REGISTER_PBUF_RING`) registered on the socket
+ring, which is where multishot receives are submitted. The ring holds `count`
 entries of `size` bytes each, contiguous, page-aligned, allocated once at
 executor start. Giving a buffer back to the kernel is a write to the ring's
 tail, no syscall.
@@ -101,6 +109,36 @@ defaults, for a builder that does not say:
 
 `count` is at most 32768 and is rounded up to a power of two, both kernel
 rules.
+
+### A ring of its own, with deferred task work
+
+The receives live on a fourth ring, built with `IORING_SETUP_DEFER_TASKRUN`
+and `IORING_SETUP_SINGLE_ISSUER`. On a plain ring the kernel runs each
+arrival's receive as task work the moment it is queued, interrupting the
+thread per arrival; with sixteen pipelined replies landing a few microseconds
+apart that was a receive and a completion each, and nothing bundled. On a
+deferred ring a poll wakeup only queues the receive, which runs when this
+thread enters the ring and takes everything the socket holds by then.
+
+Deferred work is posted only on an entry that asks for events, so the ring is
+entered once per reactor pass, every submit on it carries `GETEVENTS`, and the
+reactor sleeps in this ring, polling the main and latency rings' fds from
+there: deferred work wakes only the ring's own submitter, never a poller of
+its fd, so the link cannot run the other way. A stream that finds its queue
+empty may enter once between two passes, so a reply already in the socket is
+seen on the first poll; a second empty poll before the next pass enters
+nothing.
+
+The latency ring stays plain, and that is the reason for the fourth ring.
+The preempt timer and the foreign-wake eventfd must interrupt a task that
+never enters the kernel, which deferred work by definition cannot.
+
+The kernel also reports pending work in `IORING_SQ_TASKRUN`, and that flag is
+never read. On 7.3 a multishot receive that re-queues itself while the work
+runs leaves it set over an empty queue, and no entry clears it (the secondary
+item of liburing issue 1645, unfixed in mainline at 7.4-rc2). A reactor that
+took it for pending work spun at 140k entries a second and the pipeline cell
+below fell from 45000 to 599 transactions a second.
 
 ### Kernel gate
 

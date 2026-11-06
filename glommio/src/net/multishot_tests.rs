@@ -209,29 +209,6 @@ fn an_arrival_already_posted_is_ready_on_the_first_poll() {
     });
 }
 
-/// Reaping inline must not hide a fired preempt timer: when the reap took
-/// its completion, the executor is told to yield as if the queue were still
-/// non-empty.
-#[test]
-fn an_inline_reap_that_takes_the_preempt_timer_asks_the_executor_to_yield() {
-    LocalExecutorBuilder::new(Placement::Unbound)
-        .recv_buffers(8, 64)
-        .preempt_timer(Duration::from_millis(1))
-        .make()
-        .unwrap()
-        .run(async {
-            let (mut writer, mut reader) = pair(Preallocated::default()).await;
-            writer.write_all(b"x").await.unwrap();
-            std::thread::sleep(Duration::from_millis(20));
-            let mut got = [0u8; 1];
-            poll_once(reader.read(&mut got)).await.unwrap().unwrap();
-            assert!(
-                crate::executor().need_preempt(),
-                "inline reap consumed the preempt timer without asking for a pass"
-            );
-        });
-}
-
 /// A reap that took only the stream's own arrival asks for nothing: a pass
 /// per message is what a pipeline cannot afford.
 #[test]
@@ -273,5 +250,20 @@ fn one_fill_takes_every_queued_arrival_that_fits() {
             12 * 48,
             "a fill returned one arrival of the dozen queued"
         );
+    });
+}
+
+/// A message larger than a kernel buffer comes back whole and in order
+/// through the stream, whether the kernel bundled it or split it.
+#[test]
+fn a_message_spanning_kernel_buffers_reads_whole() {
+    executor(8, 32).run(async {
+        let (mut writer, mut reader) = pair(Preallocated::new(4096)).await;
+        let message: Vec<u8> = (0..120u8).collect();
+        writer.write_all(&message).await.unwrap();
+        let mut got = vec![0u8; message.len()];
+        reader.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, message);
+        assert_eq!(buffers_held(), 0);
     });
 }

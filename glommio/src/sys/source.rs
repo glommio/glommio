@@ -79,9 +79,18 @@ pub(crate) enum SourceType {
 /// picked from the executor's ring and is queued here as the buffer's id and
 /// the byte count. The owner takes them in order and gives each buffer back.
 /// Anything still queued when the state is dropped goes back by itself.
+/// One delivery of a multishot receive: `len` bytes in buffer `bid`, of
+/// which the owner has already taken `taken`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Arrival {
+    pub(crate) bid: u16,
+    pub(crate) len: usize,
+    pub(crate) taken: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct RecvMultiState {
-    pub(crate) ready: std::collections::VecDeque<(u16, usize)>,
+    pub(crate) ready: std::collections::VecDeque<Arrival>,
     /// Whether the kernel still holds the request. Cleared by the completion
     /// that carries no `MORE` flag, which is also the one that retires the
     /// source and stores its result.
@@ -105,8 +114,8 @@ impl Drop for RecvMultiState {
             return;
         }
         let mut buffers = self.buffers.borrow_mut();
-        for (bid, _) in self.ready.drain(..) {
-            buffers.give_back(bid);
+        for arrival in self.ready.drain(..) {
+            buffers.give_back(arrival.bid);
         }
         buffers.publish();
     }

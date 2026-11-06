@@ -139,6 +139,8 @@ fn yolo_sendmsg(
 #[cfg(test)]
 mod completion_read_tests;
 mod datagram;
+#[cfg(test)]
+mod multishot_tests;
 mod stream;
 mod tcp_socket;
 mod udp_socket;

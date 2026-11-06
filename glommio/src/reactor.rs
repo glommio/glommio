@@ -497,6 +497,11 @@ impl Reactor {
         }
     }
 
+    /// See [`sys::Reactor::note_recv_buffers_exhausted`].
+    pub(crate) fn note_recv_buffers_exhausted(&self) {
+        self.sys.note_recv_buffers_exhausted()
+    }
+
     /// See [`sys::Reactor::reap_socket_completions`].
     pub(crate) fn reap_socket_completions(&self) -> io::Result<usize> {
         self.sys.reap_socket_completions()

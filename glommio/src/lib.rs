@@ -459,7 +459,8 @@ pub use crate::{
         stall::{DefaultStallDetectionHandler, StallDetection, StallDetectionHandler},
         yield_if_needed, CpuSet, ExecutorJoinHandle, ExecutorProxy, ExecutorStats, LocalExecutor,
         LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
-        PoolThreadHandles, ScopedTask, Task, TaskQueueHandle, TaskQueueStats,
+        PoolThreadHandles, RecvBuffers, RecvBuffersShape, ScopedTask, Task, TaskQueueHandle,
+        TaskQueueStats,
     },
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,
@@ -782,14 +783,29 @@ pub struct IoStats {
     pub latency_ring: RingIoStats,
     /// The IO stats of the poll ring
     pub poll_ring: RingIoStats,
+    /// How many times a multishot receive ran out of
+    /// [`RecvBuffers`] and had to be re-armed, since the stats were last
+    /// taken. Each costs a submission and a plain read; a steady rate says
+    /// the count is too small for the connections and their arrivals.
+    /// Counted for the executor as a whole: the reactor cannot say which
+    /// task queue a receive belongs to, so
+    /// [`task_queue_io_stats`](crate::ExecutorProxy::task_queue_io_stats)
+    /// reports zero here.
+    pub recv_buffers_exhausted: u64,
 }
 
 impl IoStats {
-    fn new(main_ring: RingIoStats, latency_ring: RingIoStats, poll_ring: RingIoStats) -> IoStats {
+    fn new(
+        main_ring: RingIoStats,
+        latency_ring: RingIoStats,
+        poll_ring: RingIoStats,
+        recv_buffers_exhausted: u64,
+    ) -> IoStats {
         IoStats {
             main_ring,
             latency_ring,
             poll_ring,
+            recv_buffers_exhausted,
         }
     }
 

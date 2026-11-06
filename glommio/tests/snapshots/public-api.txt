@@ -3357,6 +3357,7 @@ pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalEx
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::recv_buffers(self, count: usize, size: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -3409,6 +3410,7 @@ pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement)
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, count: usize, size: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -4157,6 +4159,7 @@ pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalEx
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::recv_buffers(self, count: usize, size: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -4209,6 +4212,7 @@ pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement)
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, count: usize, size: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -6088,6 +6092,7 @@ pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalEx
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::recv_buffers(self, count: usize, size: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -6140,6 +6145,7 @@ pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement)
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, count: usize, size: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder

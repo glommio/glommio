@@ -45,6 +45,20 @@ one. The library spends about 300 ns on top of its primitive, so a buffered read
 around 950 ns is the realistic landing for this regime, with the per-message
 submission gone altogether in request and response.
 
+## Measured, the library
+
+The same ladder, rung 4 buffered, the completion-read base against this
+branch, three interleaved runs each, CPU on the reading thread per message:
+
+| arm | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| completion read, the base | 1102 ns | 1107 ns | 1109 ns |
+| multishot | 931 ns | 921 ns | 932 ns |
+
+16% less per message, where the design above predicted about 950 ns. The
+streaming rung moved from 2833 ns to 2742 ns per 64 KiB, 3% better, and the
+unbuffered rung did not move, as it keeps its path.
+
 ## Acceptance
 
 Two cells of the PostgreSQL client's scoreboard, both against the main this

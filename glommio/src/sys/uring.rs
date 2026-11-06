@@ -1526,23 +1526,26 @@ impl SleepableRing {
         self.enter_for_events()
     }
 
-    /// The reactor pass's entry. Skipped on a pass that may sleep, since
-    /// the sleep's own entry runs the work and returns at once if it posted
-    /// anything; entering before the sleep instead found a depth-1 reply on
-    /// the second or third pass and never parked, at the cost of the whole
-    /// core. Also skipped when a stream entered since the last pass, since
-    /// that entry ran the work, unless the pass comes after a preempt slice,
-    /// in which case the stream's entry is a slice old and a reply that
-    /// landed behind it would wait a second slice beside a CPU-bound queue.
-    /// A busy executor whose readers are all parked gets the entry, which is
-    /// what keeps their arrivals surfacing without a sleep.
-    fn run_deferred_work_for_pass(
-        &mut self,
-        may_sleep: bool,
-        slice_expired: bool,
-    ) -> io::Result<()> {
+    /// The entry of a reactor pass that cannot sleep. Skipped when a stream
+    /// entered since the last pass, since that entry ran the work, unless
+    /// the pass comes after a preempt slice, in which case the stream's
+    /// entry is a slice old and a reply that landed behind it would wait a
+    /// second slice beside a CPU-bound queue. A busy executor whose readers
+    /// are all parked gets the entry, which is what keeps their arrivals
+    /// surfacing without a sleep.
+    ///
+    /// A pass that may sleep enters instead at the last moment before it
+    /// commits to sleeping, in [`Reactor::wait`]: deferred work is invisible
+    /// until an entry, so anything that lands between an early entry and
+    /// the decision would send the pass into a sleep that returns at once,
+    /// after paying for it, the notifier's heavy membarrier, an IPI to every
+    /// thread of the process under a global mutex, and two link polls. On
+    /// eight executors with sixteen pipelined connections each that was a
+    /// hundred times the readiness path's sleeps and 5% of the kernel's
+    /// time.
+    fn run_deferred_work_for_pass(&mut self, slice_expired: bool) -> io::Result<()> {
         let spent = std::mem::replace(&mut self.inline_enter_spent, false);
-        if may_sleep || (spent && !slice_expired) {
+        if spent && !slice_expired {
             return Ok(());
         }
         self.run_deferred_work()
@@ -2653,7 +2656,7 @@ impl Reactor {
         self.latency_ring.borrow_mut().poll(woke)?;
         if let Some(socket_ring) = self.socket_ring.as_ref() {
             let mut socket_ring = socket_ring.borrow_mut();
-            socket_ring.run_deferred_work_for_pass(false, false)?;
+            socket_ring.run_deferred_work_for_pass(false)?;
             socket_ring.poll(woke)?;
         }
         *woke += self.flush_syscall_thread();
@@ -2819,9 +2822,11 @@ impl Reactor {
         let mut sock_ring = self.socket_ring.as_ref().map(|ring| ring.borrow_mut());
 
         if let Some(sock_ring) = sock_ring.as_deref_mut() {
-            let slice_expired = lat_ring.waiting_kernel_collection() > 0;
-            sock_ring.run_deferred_work_for_pass(may_sleep, slice_expired)?;
-            consume_rings!(into &mut woke; sock_ring);
+            if !may_sleep {
+                let slice_expired = lat_ring.waiting_kernel_collection() > 0;
+                sock_ring.run_deferred_work_for_pass(slice_expired)?;
+                consume_rings!(into &mut woke; sock_ring);
+            }
         }
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
@@ -2842,15 +2847,24 @@ impl Reactor {
             flush_rings!(sock_ring)?;
             consume_rings!(into &mut woke; sock_ring);
         }
-        after_drain(self);
-        let settled = Settled(());
-
-        let should_sleep = may_sleep
+        let mut should_sleep = may_sleep
             && (woke == 0)
             && poll_ring.can_sleep()
             && main_ring.can_sleep()
             && lat_ring.can_sleep()
             && sock_ring.as_deref_mut().is_none_or(|ring| ring.can_sleep());
+
+        if should_sleep {
+            if let Some(sock_ring) = sock_ring.as_deref_mut() {
+                sock_ring.inline_enter_spent = false;
+                sock_ring.run_deferred_work()?;
+                consume_rings!(into &mut woke; sock_ring);
+                should_sleep = woke == 0;
+            }
+        }
+
+        after_drain(self);
+        let settled = Settled(());
 
         let settled = if should_sleep {
             drop(settled);

@@ -433,7 +433,10 @@ fn run_multishot() {
 /// loop from a single task is *not* the same thing: by the time such a loop
 /// reaches connection 200 the data is already there, the speculation succeeds,
 /// and the rung silently measures the easy case.
-fn run_glommio(buffered: bool) {
+/// `multishot` opts the executor into the multishot receive, which is off by
+/// default; the buffered rung is run both ways so one run holds the base and
+/// the change.
+fn run_glommio(buffered: bool, multishot: bool) {
     use futures_lite::io::AsyncReadExt;
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -460,7 +463,13 @@ fn run_glommio(buffered: bool) {
         }
     });
 
+    let buffers = if multishot {
+        glommio::RecvBuffers::exact(1024, glommio::RecvBuffers::DEFAULT_SIZE)
+    } else {
+        glommio::RecvBuffers::none()
+    };
     let cpu = glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(CPU_SERVER))
+        .recv_buffers(buffers)
         .spawn(move || async move {
             let listener = glommio::net::TcpListener::bind(addr).unwrap();
             let mut streams = Vec::with_capacity(CONNECTIONS);
@@ -525,10 +534,10 @@ fn run_glommio(buffered: bool) {
     armed.recv().unwrap();
     let _ = writer.join();
     report(
-        if buffered {
-            "glommio TcpStream::read, buffered"
-        } else {
-            "glommio TcpStream::read, unbuffered"
+        match (buffered, multishot) {
+            (true, true) => "glommio TcpStream::read, buffered, multishot",
+            (true, false) => "glommio TcpStream::read, buffered",
+            (false, _) => "glommio TcpStream::read, unbuffered",
         },
         cpu,
     );
@@ -544,7 +553,7 @@ enum Reader {
 /// This is where speculation earns its keep, and where turning every read
 /// into a submission would be a regression. Reported per 64 KiB read rather
 /// than per message.
-fn run_glommio_streaming(buffered: bool) {
+fn run_glommio_streaming(buffered: bool, multishot: bool) {
     use futures_lite::io::AsyncReadExt;
 
     const CHUNK: usize = 64 * 1024;
@@ -566,7 +575,13 @@ fn run_glommio_streaming(buffered: bool) {
     let fd = stream.as_raw_fd();
     std::mem::forget(stream);
 
+    let buffers = if multishot {
+        glommio::RecvBuffers::exact(1024, glommio::RecvBuffers::DEFAULT_SIZE)
+    } else {
+        glommio::RecvBuffers::none()
+    };
     let cpu = glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(CPU_SERVER))
+        .recv_buffers(buffers)
         .spawn(move || async move {
             let stream = unsafe {
                 <glommio::net::TcpStream as std::os::unix::io::FromRawFd>::from_raw_fd(fd)
@@ -609,10 +624,10 @@ fn run_glommio_streaming(buffered: bool) {
     let (cpu, taken) = cpu;
     println!(
         "{:<48} {:>8.0} ns cpu / 64KiB",
-        if buffered {
-            "streaming, buffered"
-        } else {
-            "streaming, unbuffered"
+        match (buffered, multishot) {
+            (true, true) => "streaming, buffered, multishot",
+            (true, false) => "streaming, buffered",
+            (false, _) => "streaming, unbuffered",
         },
         cpu.as_nanos() as f64 / (taken as f64 / CHUNK as f64)
     );
@@ -625,9 +640,11 @@ fn main() {
     run_single_shot();
     run_hybrid();
     run_multishot();
-    run_glommio(false);
-    run_glommio(true);
+    run_glommio(false, false);
+    run_glommio(true, false);
+    run_glommio(true, true);
     println!();
-    run_glommio_streaming(false);
-    run_glommio_streaming(true);
+    run_glommio_streaming(false, false);
+    run_glommio_streaming(true, false);
+    run_glommio_streaming(true, true);
 }

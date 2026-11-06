@@ -190,7 +190,7 @@ impl Reactor {
 
     #[inline(always)]
     pub(crate) fn need_preempt(&self) -> bool {
-        !self.preempt_status.is_empty()
+        !self.preempt_status.is_empty() || self.sys.preempt_requested()
     }
 
     pub(crate) fn id(&self) -> usize {
@@ -489,6 +489,11 @@ impl Reactor {
     /// answered one with EINVAL.
     pub(crate) fn refuse_recv_multi(&self) {
         self.sys.refuse_recv_multi()
+    }
+
+    /// See [`sys::Reactor::reap_latency_completions`].
+    pub(crate) fn reap_latency_completions(&self) -> io::Result<usize> {
+        self.sys.reap_latency_completions()
     }
 
     pub(crate) fn recv_into(&self, fd: RawFd, buffer: crate::net::OwnedRxBuf) -> Source {

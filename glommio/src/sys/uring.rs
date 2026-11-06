@@ -775,7 +775,11 @@ fn queue_multishot_arrival(inner: &mut InnerSource, value: &cqueue::Entry) {
     }
     if let Some(bid) = cqueue::buffer_select(value.flags()) {
         state.buffers.borrow_mut().lent();
-        state.ready.push_back((bid, value.result() as usize));
+        state.ready.push_back(crate::sys::Arrival {
+            bid,
+            len: value.result() as usize,
+            taken: 0,
+        });
     }
 }
 
@@ -1206,14 +1210,17 @@ impl ProvidedBuffers {
         Ok(buffers)
     }
 
+    #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
         self.count as usize
     }
 
+    #[cfg(test)]
     pub(crate) fn size(&self) -> usize {
         self.size
     }
 
+    #[cfg(test)]
     /// How many buffers are filled and waiting to be given back.
     pub(crate) fn held(&self) -> usize {
         self.held
@@ -1650,6 +1657,11 @@ pub(crate) struct Reactor {
 
     /// Set once the kernel has rejected the multishot receive flag.
     recv_multi_refused: Cell<bool>,
+
+    /// Raised when a stream consumed latency completions inline, which may
+    /// have taken the preempt timer's with them. The executor treats it as it
+    /// would a non-empty completion queue, and the next pass clears it.
+    preempt_requested: Cell<bool>,
 }
 
 pub(crate) fn common_flags() -> PollFlags {
@@ -1798,6 +1810,7 @@ impl Reactor {
             source_map,
             rings_depth: ring_depth,
             recv_multi_refused: Cell::new(false),
+            preempt_requested: Cell::new(false),
         })
     }
 
@@ -1811,6 +1824,7 @@ impl Reactor {
 
     /// The receive buffers lent to the kernel, as `(count, size)`, or `None`
     /// when there are none, by configuration or because the kernel refused.
+    #[cfg(test)]
     pub(crate) fn provided_buffers(&self) -> Option<(usize, usize)> {
         self.recv_buffers().map(|b| {
             let b = b.borrow();
@@ -1831,6 +1845,53 @@ impl Reactor {
     /// so no further stream tries one.
     pub(crate) fn refuse_recv_multi(&self) {
         self.recv_multi_refused.set(true);
+    }
+
+    /// Consumes whatever the kernel has already posted on the latency ring
+    /// without sleeping: shared memory, no syscall, unless a submission is
+    /// still queued, in which case it goes out first so a request armed a
+    /// moment ago is in the kernel. A stream with a multishot receive calls
+    /// this before parking, so an arrival already in the queue is seen on the
+    /// same poll.
+    ///
+    /// The preempt timer's completion may be among what is consumed, and
+    /// that one would otherwise have made the executor yield at its next
+    /// check, so when it is, the request to yield is kept on the side and
+    /// cleared by the next pass. Other completions only wake their waiters,
+    /// which needs no pass, and asking for one per reap turns a pipeline
+    /// into a pass per message.
+    pub(crate) fn reap_latency_completions(&self) -> io::Result<usize> {
+        let mut woke = 0;
+        let mut ring = self.latency_ring.borrow_mut();
+        ring.consume_cancellation_queue()
+            .or_else(Reactor::busy_ok)
+            .or_else(Reactor::again_ok)
+            .or_else(Reactor::intr_ok)?;
+        ring.consume_submission_queue()
+            .or_else(Reactor::busy_ok)
+            .or_else(Reactor::again_ok)
+            .or_else(Reactor::intr_ok)?;
+        let consumed = ring.consume_completion_queue(&mut woke);
+        drop(ring);
+        if consumed > 0 && self.preempt_timer_fired() {
+            self.preempt_requested.set(true);
+        }
+        Ok(consumed)
+    }
+
+    /// Whether the latency ring's preempt timer has completed and the
+    /// executor has not yet run the pass that would act on it.
+    fn preempt_timer_fired(&self) -> bool {
+        let timer = self.latency_preemption_timeout_src.take();
+        let fired = timer.as_ref().is_some_and(|t| t.result().is_some());
+        self.latency_preemption_timeout_src.set(timer);
+        fired
+    }
+
+    /// Whether an inline reap has taken completions the executor has not
+    /// yet answered with a pass.
+    pub(crate) fn preempt_requested(&self) -> bool {
+        self.preempt_requested.get()
     }
 
     pub(crate) fn install_eventfd(&self) {
@@ -2332,6 +2393,7 @@ impl Reactor {
         Preempt: Fn() -> Option<Duration>,
         F: Fn() -> usize,
     {
+        self.preempt_requested.set(false);
         woke += self.flush_syscall_thread();
 
         let mut poll_ring = self.poll_ring.borrow_mut();
@@ -2655,7 +2717,7 @@ mod tests {
                     state
                         .ready
                         .iter()
-                        .map(|(bid, len)| buffers.bytes(*bid, *len).to_vec())
+                        .map(|a| buffers.bytes(a.bid, a.len).to_vec())
                         .collect(),
                     state.armed,
                 )

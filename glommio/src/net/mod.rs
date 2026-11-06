@@ -96,6 +96,8 @@ fn yolo_sendmsg(fd: RawFd, buf: &[u8], addr: &impl SockaddrLike) -> Option<io::R
 #[cfg(test)]
 mod completion_read_tests;
 mod datagram;
+#[cfg(test)]
+mod multishot_tests;
 mod stream;
 mod tcp_socket;
 mod udp_socket;

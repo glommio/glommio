@@ -62,10 +62,31 @@ unbuffered rung did not move, as it keeps its path.
 The ring of its own (below) did not move the ladder: buffered 903/888/894 ns
 against 899/905/909 ns for the revision before it, three interleaved runs.
 What it moved is the pipelined cell: on the PostgreSQL client's
-`pipeline-select 1 × 16`, three runs of five seconds, 44564/44499/44578
-transactions a second at a p99 of 0.369 ms, where the readiness path does
-45079 at 0.365 ms and the revision before the ring did 599 at 196 ms.
-`select-only 1 × 1` went from 70046 to 77946/78664.
+`pipeline-select 1 × 16`, 44564/44499/44578 transactions a second at a p99
+of 0.369 ms, where the readiness path does 45079 at 0.365 ms and the
+revision before the ring did 599 at 196 ms.
+
+With the pass entering the ring at the last moment before it commits to a
+sleep (below), measured here against the readiness path, interleaved, three
+seconds each, the client pinned to its own cores:
+
+| cell | readiness path | multishot |
+|---|---|---|
+| `pipeline-select 8 × 16`, tps | 171094 / 172284 | 169110 / 169491 |
+| `pipeline-select 8 × 16`, p99 | 0.167 / 0.168 ms | 0.169 / 0.169 ms |
+| `pipeline-select 1 × 16`, tps | 44873 | 44625 |
+| `select-only 1 × 1`, tps | 68890 | 67912 |
+| `select-only 1 × 1`, parks in 3 s | 207351 | 204392 |
+| `select-only 1 × 1`, CPU in 3 s | 1803 ms | 1757 ms |
+
+At depth one the executor parks once per transaction, as the readiness path
+does, for the same throughput at slightly less CPU; an earlier revision that
+entered the ring before deciding to sleep found the reply on a later pass
+instead and never parked, which bought 10% throughput for the whole core.
+The 1.4% left at 8 × 16 is the kernel's multishot receive path against
+`recvfrom` on data that is already there, and the completion processing per
+reply in user space, about a point each; the syscalls per transaction are
+0.3 against 2.4.
 
 ## Acceptance
 

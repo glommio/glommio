@@ -126,7 +126,7 @@ pub struct Preallocated {
 }
 
 impl Preallocated {
-    const DEFAULT_BUFFER_SIZE: usize = 8192;
+    pub(crate) const DEFAULT_BUFFER_SIZE: usize = 8192;
 
     /// Creates a fixed sized receive buffer
     pub fn new(size: usize) -> Self {
@@ -443,6 +443,11 @@ pub(crate) struct GlommioStream<S, B> {
     rx_done: Cell<bool>,
     /// A completion-based read with the receive buffer lent to the kernel.
     rx_source: Option<Source>,
+    /// The multishot receive a buffered stream arms for its lifetime, when
+    /// the executor lends buffers. While it is armed every byte the socket
+    /// produces lands in one of those buffers, so nothing here reads the
+    /// socket directly.
+    rx_multi: Option<Source>,
 }
 
 impl<S> From<socket2::Socket> for GlommioStream<S, NonBuffered>
@@ -465,6 +470,7 @@ where
             rx_buf: NonBuffered,
             rx_done: Cell::new(false),
             rx_source: None,
+            rx_multi: None,
         }
     }
 }
@@ -485,13 +491,17 @@ where
     }
 }
 
-impl<S> GlommioStream<S, NonBuffered> {
+impl<S: AsRawFd> GlommioStream<S, NonBuffered> {
     pub(crate) fn buffered_with<B: Buffered>(self, rx_buf: B) -> GlommioStream<S, B> {
+        let rx_multi = self.stream.reactor.upgrade().and_then(|reactor| {
+            reactor.recv_multi(self.stream.stream.as_raw_fd(), rx_buf.buffer_size())
+        });
         GlommioStream {
             stream: self.stream,
             rx_buf,
             rx_done: self.rx_done,
             rx_source: self.rx_source,
+            rx_multi,
         }
     }
 }
@@ -503,6 +513,15 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// On success, returns the number of bytes peeked.
     /// Successive calls return the same data. This is accomplished by passing
     /// `MSG_PEEK` as a flag to the underlying `recv` system call.
+    ///
+    /// With a multishot receive armed every byte the socket produces goes to
+    /// a kernel buffer, so a peek on the socket itself would see the bytes
+    /// behind the ones the request has taken or is about to, out of order.
+    /// While the request is armed the socket is never touched: the peek
+    /// serves what is queued, reaps what the kernel has posted, and
+    /// otherwise waits on the request. A peek may return fewer bytes than
+    /// asked for, so stopping at the queued ones is within its contract.
+    /// Only a request the kernel has dropped leaves the socket to be peeked.
     pub(crate) async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(source) = self.rx_source.as_ref() {
             let read = std::future::poll_fn(|cx| match source.result() {
@@ -521,6 +540,46 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 _ => unreachable!("a completion read without its buffer"),
             }
             return Ok(len);
+        }
+        if let Some(multi) = self.rx_multi.as_ref() {
+            let reactor = self.stream.reactor.upgrade().unwrap();
+            loop {
+                let (pos, armed) = {
+                    let mut pos = self.rx_buf.peek(buf);
+                    let SourceType::RecvMulti(state) = &*multi.source_type() else {
+                        unreachable!("rx_multi holds a multishot receive");
+                    };
+                    let buffers = state.buffers.borrow();
+                    for arrival in &state.ready {
+                        if pos == buf.len() {
+                            break;
+                        }
+                        pos += arrival.copy_to(&buffers, arrival.taken, &mut buf[pos..]);
+                    }
+                    (pos, state.armed)
+                };
+                if pos > 0 || buf.is_empty() {
+                    return Ok(pos);
+                }
+                if !armed {
+                    break;
+                }
+                if reactor.reap_socket_completions()? > 0 {
+                    continue;
+                }
+                std::future::poll_fn(|cx| {
+                    let settled = match &*multi.source_type() {
+                        SourceType::RecvMulti(state) => !state.ready.is_empty() || !state.armed,
+                        _ => unreachable!("rx_multi holds a multishot receive"),
+                    };
+                    if settled {
+                        return Poll::Ready(());
+                    }
+                    multi.add_waiter_single(cx.waker());
+                    Poll::Pending
+                })
+                .await;
+            }
         }
         let mut pos = self.rx_buf.peek(buf);
         if pos < buf.len() && !self.rx_done.get() {
@@ -548,7 +607,10 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
         if self.rx_buf.is_empty() {
-            if buf.len() >= self.rx_buf.buffer_size() && self.rx_source.is_none() {
+            if buf.len() >= self.rx_buf.buffer_size()
+                && self.rx_source.is_none()
+                && self.rx_multi.is_none()
+            {
                 return self.stream.poll_read(cx, buf);
             }
             if !self.rx_done.get() {
@@ -559,8 +621,13 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     }
 
     fn poll_replenish_buffer(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
-        let result = poll_err!(ready!(self.poll_fill(cx)));
-        self.rx_buf.handle_result(result);
+        let result = if self.rx_multi.is_some() {
+            poll_err!(ready!(self.poll_fill_multishot(cx)))
+        } else {
+            let result = poll_err!(ready!(self.poll_fill(cx)));
+            self.rx_buf.handle_result(result);
+            result
+        };
         if result == 0 {
             self.rx_done.set(true);
         }
@@ -605,6 +672,157 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             }
             None => self.stream.poll_read(cx, self.rx_buf.unfilled()),
         }
+    }
+
+    /// Fills the receive buffer from the multishot receive: every queued
+    /// arrival that fits, else whatever the kernel has already posted and the
+    /// reactor has not yet looked at, else waits. A request the kernel has
+    /// dropped is re-armed, after taking what the socket holds, unless it
+    /// ended in end of file or an error.
+    ///
+    /// Unlike [`poll_fill`](Self::poll_fill), this advances the receive
+    /// buffer itself, arrival by arrival: a pipeline's replies sit in the
+    /// queue as a dozen completions, and handing them out one per poll costs
+    /// a poll round each.
+    ///
+    /// A request that ran out of buffers is counted for the IO stats. A
+    /// plain multishot says so with `ENOBUFS`; a bundled one ends, without
+    /// error, on the arrival that took the last buffer, which is the only
+    /// way a bundled request ends with data and no error. A plain one that
+    /// ends that way was cut off by a full completion queue instead, which
+    /// more buffers would not help, so it is not counted. A request the
+    /// reactor cancelled for queueing more than this stream can take is
+    /// re-armed here, which happens only once the queue is drained: that is
+    /// the backpressure a connection nobody reads is given. The reactor
+    /// reports a cancelled request as timed out, since before this the only
+    /// thing that cancelled a request was a timeout, and this stream has no
+    /// timeout of its own on the request, so that is the value to match.
+    fn poll_fill_multishot(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
+        let reactor = self.stream.reactor.upgrade().unwrap();
+        let mut reaped = false;
+        loop {
+            let taken = self.take_arrivals();
+            if taken > 0 {
+                self.stream.read_timeout.cancel_timer(&reactor);
+                return Poll::Ready(Ok(taken));
+            }
+            let multi = self.rx_multi.as_ref().unwrap();
+            let Some(result) = multi.result() else {
+                if !reaped {
+                    reaped = true;
+                    if poll_err!(reactor.reap_socket_completions()) > 0 {
+                        continue;
+                    }
+                }
+                poll_err!(self.stream.read_timeout.check(&reactor));
+                multi.add_waiter_single(cx.waker());
+                self.stream
+                    .read_timeout
+                    .maybe_set_timer(&reactor, cx.waker());
+                return Poll::Pending;
+            };
+            let was_bundled = match &*multi.source_type() {
+                SourceType::RecvMulti(state) => state.bundled,
+                _ => unreachable!("rx_multi holds a multishot receive"),
+            };
+            self.rx_multi = None;
+            match result {
+                Ok(0) => return Poll::Ready(Ok(0)),
+                Ok(_) if was_bundled => reactor.note_recv_buffers_exhausted(),
+                Ok(_) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
+                    reactor.note_recv_buffers_exhausted()
+                }
+                Err(err) if err.raw_os_error() == Some(libc::ETIMEDOUT) => {}
+                Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
+                    reactor.refuse_recv_multi(was_bundled);
+                    if was_bundled {
+                        self.rx_multi = reactor
+                            .recv_multi(self.stream.stream.as_raw_fd(), self.rx_buf.buffer_size());
+                        if self.rx_multi.is_some() {
+                            continue;
+                        }
+                    }
+                    let result = poll_err!(ready!(self.poll_fill(cx)));
+                    self.rx_buf.handle_result(result);
+                    return Poll::Ready(Ok(result));
+                }
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+            let fd = self.stream.stream.as_raw_fd();
+            if let Some(result) = self.stream.poll_read_speculative(self.rx_buf.unfilled()) {
+                self.rx_multi = reactor.recv_multi(fd, self.rx_buf.buffer_size());
+                let result = poll_err!(result);
+                self.rx_buf.handle_result(result);
+                return Poll::Ready(Ok(result));
+            }
+            match reactor.recv_multi(fd, self.rx_buf.buffer_size()) {
+                Some(source) => self.rx_multi = Some(source),
+                None => {
+                    let result = poll_err!(ready!(self.poll_fill(cx)));
+                    self.rx_buf.handle_result(result);
+                    return Poll::Ready(Ok(result));
+                }
+            }
+        }
+    }
+
+    /// Makes the armed multishot receive look as if the kernel had ended it
+    /// with `err`, for a test of the fallback on kernels this one is not.
+    #[cfg(test)]
+    pub(crate) fn end_multishot_with(&self, err: io::Error, bundled: bool) {
+        let source = self
+            .rx_multi
+            .as_ref()
+            .expect("no multishot receive is armed");
+        let mut inner = source.inner.borrow_mut();
+        if let SourceType::RecvMulti(state) = &mut inner.source_type {
+            state.armed = false;
+            state.bundled = bundled;
+        }
+        inner.wakers.result = Some(Err(err));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn multishot_armed(&self) -> bool {
+        self.rx_multi.is_some()
+    }
+
+    /// Moves queued arrivals into the receive buffer until it is full or the
+    /// queue is empty, and returns how many bytes that was.
+    fn take_arrivals(&mut self) -> usize {
+        let mut total = 0;
+        while let Some(n) = self.take_arrival() {
+            self.rx_buf.handle_result(n);
+            total += n;
+            if self.rx_buf.unfilled().is_empty() {
+                break;
+            }
+        }
+        total
+    }
+
+    /// Copies the oldest queued arrival into the receive buffer, as much as
+    /// fits, and gives the kernel its buffer back once it is drained.
+    fn take_arrival(&mut self) -> Option<usize> {
+        let multi = self.rx_multi.as_ref()?;
+        let mut source_type = multi.source_type_mut();
+        let SourceType::RecvMulti(state) = &mut *source_type else {
+            unreachable!("rx_multi holds a multishot receive");
+        };
+        let arrival = state.ready.front_mut()?;
+        let room = self.rx_buf.unfilled();
+        let n = arrival.copy_to(&state.buffers.borrow(), arrival.taken, room);
+        arrival.taken += n;
+        if arrival.taken == arrival.len {
+            let arrival = state.ready.pop_front().unwrap();
+            let mut buffers = state.buffers.borrow_mut();
+            for bid in arrival.bids {
+                buffers.give_back(bid);
+            }
+            buffers.publish();
+        }
+        Some(n)
     }
 
     pub(crate) fn poll_write(&mut self, cx: &Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
@@ -746,12 +964,14 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 rx_buf: self.rx_buf,
                 rx_done: self.rx_done,
                 rx_source: self.rx_source,
+                rx_multi: self.rx_multi,
             },
             GlommioStream {
                 stream: tx,
                 rx_buf: NonBuffered,
                 rx_done: Cell::new(false),
                 rx_source: None,
+                rx_multi: None,
             },
         )
     }
@@ -776,6 +996,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<Rc<S>, B> {
             rx_buf: rx.rx_buf,
             rx_done: rx.rx_done,
             rx_source: rx.rx_source,
+            rx_multi: rx.rx_multi,
         })
     }
 }

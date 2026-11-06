@@ -3357,6 +3357,7 @@ pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalEx
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -3409,6 +3410,7 @@ pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement)
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -3489,6 +3491,130 @@ pub unsafe fn glommio::PoolThreadHandles<T>::init(init: <T as crossbeam_epoch::a
 impl<T> tracing::instrument::Instrument for glommio::PoolThreadHandles<T>
 impl<T> tracing::instrument::WithSubscriber for glommio::PoolThreadHandles<T>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::PoolThreadHandles<T> where T: ?core::marker::Sized
+pub struct glommio::prelude::executor::RecvBuffers
+impl glommio::RecvBuffers
+pub const glommio::RecvBuffers::DEFAULT_SIZE: usize
+pub const glommio::RecvBuffers::MAX_COUNT: usize
+pub const glommio::RecvBuffers::MAX_SIZE: usize
+pub fn glommio::RecvBuffers::budget(bytes: usize) -> Self
+pub fn glommio::RecvBuffers::budget_of(bytes: usize, size: usize) -> Self
+pub fn glommio::RecvBuffers::bytes(&self) -> usize
+pub fn glommio::RecvBuffers::count(&self) -> usize
+pub fn glommio::RecvBuffers::exact(count: usize, size: usize) -> Self
+pub fn glommio::RecvBuffers::for_connections(connections: usize) -> glommio::RecvBuffersShape
+pub fn glommio::RecvBuffers::none() -> Self
+pub fn glommio::RecvBuffers::size(&self) -> usize
+impl core::clone::Clone for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::clone(&self) -> glommio::RecvBuffers
+impl core::cmp::Eq for glommio::RecvBuffers
+impl core::cmp::PartialEq for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::eq(&self, other: &glommio::RecvBuffers) -> bool
+impl core::convert::From<glommio::RecvBuffersShape> for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::from(shape: glommio::RecvBuffersShape) -> Self
+impl core::default::Default for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::default() -> Self
+impl core::fmt::Debug for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for glommio::RecvBuffers
+impl core::marker::StructuralPartialEq for glommio::RecvBuffers
+impl core::marker::Freeze for glommio::RecvBuffers
+impl core::marker::Send for glommio::RecvBuffers
+impl core::marker::Sync for glommio::RecvBuffers
+impl core::marker::Unpin for glommio::RecvBuffers
+impl core::marker::UnsafeUnpin for glommio::RecvBuffers
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::RecvBuffers
+impl core::panic::unwind_safe::UnwindSafe for glommio::RecvBuffers
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::RecvBuffers where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::RecvBuffers where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::RecvBuffers where U: core::convert::From<T>
+pub fn glommio::RecvBuffers::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::RecvBuffers where U: core::convert::Into<T>
+pub type glommio::RecvBuffers::Error = core::convert::Infallible
+pub fn glommio::RecvBuffers::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::RecvBuffers where U: core::convert::TryFrom<T>
+pub type glommio::RecvBuffers::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::RecvBuffers::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::RecvBuffers where T: core::clone::Clone
+pub type glommio::RecvBuffers::Owned = T
+pub fn glommio::RecvBuffers::clone_into(&self, target: &mut T)
+pub fn glommio::RecvBuffers::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::RecvBuffers where T: 'static + ?core::marker::Sized
+pub fn glommio::RecvBuffers::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::RecvBuffers where T: ?core::marker::Sized
+pub fn glommio::RecvBuffers::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::RecvBuffers where T: ?core::marker::Sized
+pub fn glommio::RecvBuffers::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::RecvBuffers where T: core::clone::Clone
+pub unsafe fn glommio::RecvBuffers::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::RecvBuffers
+pub type glommio::RecvBuffers::Init = T
+pub const glommio::RecvBuffers::ALIGN: usize
+pub unsafe fn glommio::RecvBuffers::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::RecvBuffers::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::RecvBuffers::drop(ptr: usize)
+pub unsafe fn glommio::RecvBuffers::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::RecvBuffers
+impl<T> tracing::instrument::WithSubscriber for glommio::RecvBuffers
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::RecvBuffers where T: ?core::marker::Sized
+pub struct glommio::prelude::executor::RecvBuffersShape
+impl glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::arrivals_each(self, arrivals: usize) -> Self
+pub fn glommio::RecvBuffersShape::message_size(self, bytes: usize) -> Self
+pub fn glommio::RecvBuffersShape::resolve(self) -> glommio::RecvBuffers
+impl core::clone::Clone for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::clone(&self) -> glommio::RecvBuffersShape
+impl core::cmp::Eq for glommio::RecvBuffersShape
+impl core::cmp::PartialEq for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::eq(&self, other: &glommio::RecvBuffersShape) -> bool
+impl core::convert::From<glommio::RecvBuffersShape> for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::from(shape: glommio::RecvBuffersShape) -> Self
+impl core::fmt::Debug for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for glommio::RecvBuffersShape
+impl core::marker::StructuralPartialEq for glommio::RecvBuffersShape
+impl core::marker::Freeze for glommio::RecvBuffersShape
+impl core::marker::Send for glommio::RecvBuffersShape
+impl core::marker::Sync for glommio::RecvBuffersShape
+impl core::marker::Unpin for glommio::RecvBuffersShape
+impl core::marker::UnsafeUnpin for glommio::RecvBuffersShape
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::RecvBuffersShape
+impl core::panic::unwind_safe::UnwindSafe for glommio::RecvBuffersShape
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::RecvBuffersShape where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::RecvBuffersShape where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::RecvBuffersShape where U: core::convert::From<T>
+pub fn glommio::RecvBuffersShape::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::RecvBuffersShape where U: core::convert::Into<T>
+pub type glommio::RecvBuffersShape::Error = core::convert::Infallible
+pub fn glommio::RecvBuffersShape::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::RecvBuffersShape where U: core::convert::TryFrom<T>
+pub type glommio::RecvBuffersShape::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::RecvBuffersShape::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::RecvBuffersShape where T: core::clone::Clone
+pub type glommio::RecvBuffersShape::Owned = T
+pub fn glommio::RecvBuffersShape::clone_into(&self, target: &mut T)
+pub fn glommio::RecvBuffersShape::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::RecvBuffersShape where T: 'static + ?core::marker::Sized
+pub fn glommio::RecvBuffersShape::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::RecvBuffersShape where T: ?core::marker::Sized
+pub fn glommio::RecvBuffersShape::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::RecvBuffersShape where T: ?core::marker::Sized
+pub fn glommio::RecvBuffersShape::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::RecvBuffersShape where T: core::clone::Clone
+pub unsafe fn glommio::RecvBuffersShape::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::RecvBuffersShape
+pub type glommio::RecvBuffersShape::Init = T
+pub const glommio::RecvBuffersShape::ALIGN: usize
+pub unsafe fn glommio::RecvBuffersShape::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::RecvBuffersShape::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::RecvBuffersShape::drop(ptr: usize)
+pub unsafe fn glommio::RecvBuffersShape::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::RecvBuffersShape
+impl<T> tracing::instrument::WithSubscriber for glommio::RecvBuffersShape
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::RecvBuffersShape where T: ?core::marker::Sized
 pub struct glommio::prelude::executor::ScopedTask<'a, T>(_, _)
 impl<T> glommio::ScopedTask<'_, T>
 pub async fn glommio::ScopedTask<'_, T>::cancel(self) -> core::option::Option<T>
@@ -4060,6 +4186,7 @@ pub struct glommio::prelude::IoStats
 pub glommio::prelude::IoStats::latency_ring: glommio::RingIoStats
 pub glommio::prelude::IoStats::main_ring: glommio::RingIoStats
 pub glommio::prelude::IoStats::poll_ring: glommio::RingIoStats
+pub glommio::prelude::IoStats::recv_buffers_exhausted: u64
 impl glommio::IoStats
 pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
 impl core::fmt::Debug for glommio::IoStats
@@ -4157,6 +4284,7 @@ pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalEx
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -4209,6 +4337,7 @@ pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement)
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -5991,6 +6120,7 @@ pub struct glommio::IoStats
 pub glommio::IoStats::latency_ring: glommio::RingIoStats
 pub glommio::IoStats::main_ring: glommio::RingIoStats
 pub glommio::IoStats::poll_ring: glommio::RingIoStats
+pub glommio::IoStats::recv_buffers_exhausted: u64
 impl glommio::IoStats
 pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
 impl core::fmt::Debug for glommio::IoStats
@@ -6088,6 +6218,7 @@ pub fn glommio::LocalExecutorBuilder::name(self, name: &str) -> glommio::LocalEx
 pub fn glommio::LocalExecutorBuilder::new(placement: glommio::Placement) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::preempt_timer(self, dur: core::time::Duration) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::record_io_latencies(self, enabled: bool) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
@@ -6140,6 +6271,7 @@ pub fn glommio::LocalExecutorPoolBuilder::new(placement: glommio::PoolPlacement)
 pub fn glommio::LocalExecutorPoolBuilder::on_all_shards<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::PoolThreadHandles<T>> where G: core::ops::function::FnOnce() -> F + core::clone::Clone + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorPoolBuilder::preempt_timer(self, dur: core::time::Duration) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: bool) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
@@ -6220,6 +6352,130 @@ pub unsafe fn glommio::PoolThreadHandles<T>::init(init: <T as crossbeam_epoch::a
 impl<T> tracing::instrument::Instrument for glommio::PoolThreadHandles<T>
 impl<T> tracing::instrument::WithSubscriber for glommio::PoolThreadHandles<T>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::PoolThreadHandles<T> where T: ?core::marker::Sized
+pub struct glommio::RecvBuffers
+impl glommio::RecvBuffers
+pub const glommio::RecvBuffers::DEFAULT_SIZE: usize
+pub const glommio::RecvBuffers::MAX_COUNT: usize
+pub const glommio::RecvBuffers::MAX_SIZE: usize
+pub fn glommio::RecvBuffers::budget(bytes: usize) -> Self
+pub fn glommio::RecvBuffers::budget_of(bytes: usize, size: usize) -> Self
+pub fn glommio::RecvBuffers::bytes(&self) -> usize
+pub fn glommio::RecvBuffers::count(&self) -> usize
+pub fn glommio::RecvBuffers::exact(count: usize, size: usize) -> Self
+pub fn glommio::RecvBuffers::for_connections(connections: usize) -> glommio::RecvBuffersShape
+pub fn glommio::RecvBuffers::none() -> Self
+pub fn glommio::RecvBuffers::size(&self) -> usize
+impl core::clone::Clone for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::clone(&self) -> glommio::RecvBuffers
+impl core::cmp::Eq for glommio::RecvBuffers
+impl core::cmp::PartialEq for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::eq(&self, other: &glommio::RecvBuffers) -> bool
+impl core::convert::From<glommio::RecvBuffersShape> for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::from(shape: glommio::RecvBuffersShape) -> Self
+impl core::default::Default for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::default() -> Self
+impl core::fmt::Debug for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for glommio::RecvBuffers
+impl core::marker::StructuralPartialEq for glommio::RecvBuffers
+impl core::marker::Freeze for glommio::RecvBuffers
+impl core::marker::Send for glommio::RecvBuffers
+impl core::marker::Sync for glommio::RecvBuffers
+impl core::marker::Unpin for glommio::RecvBuffers
+impl core::marker::UnsafeUnpin for glommio::RecvBuffers
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::RecvBuffers
+impl core::panic::unwind_safe::UnwindSafe for glommio::RecvBuffers
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::RecvBuffers where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::RecvBuffers where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::RecvBuffers where U: core::convert::From<T>
+pub fn glommio::RecvBuffers::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::RecvBuffers where U: core::convert::Into<T>
+pub type glommio::RecvBuffers::Error = core::convert::Infallible
+pub fn glommio::RecvBuffers::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::RecvBuffers where U: core::convert::TryFrom<T>
+pub type glommio::RecvBuffers::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::RecvBuffers::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::RecvBuffers where T: core::clone::Clone
+pub type glommio::RecvBuffers::Owned = T
+pub fn glommio::RecvBuffers::clone_into(&self, target: &mut T)
+pub fn glommio::RecvBuffers::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::RecvBuffers where T: 'static + ?core::marker::Sized
+pub fn glommio::RecvBuffers::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::RecvBuffers where T: ?core::marker::Sized
+pub fn glommio::RecvBuffers::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::RecvBuffers where T: ?core::marker::Sized
+pub fn glommio::RecvBuffers::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::RecvBuffers where T: core::clone::Clone
+pub unsafe fn glommio::RecvBuffers::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::RecvBuffers
+pub type glommio::RecvBuffers::Init = T
+pub const glommio::RecvBuffers::ALIGN: usize
+pub unsafe fn glommio::RecvBuffers::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::RecvBuffers::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::RecvBuffers::drop(ptr: usize)
+pub unsafe fn glommio::RecvBuffers::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::RecvBuffers
+impl<T> tracing::instrument::WithSubscriber for glommio::RecvBuffers
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::RecvBuffers where T: ?core::marker::Sized
+pub struct glommio::RecvBuffersShape
+impl glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::arrivals_each(self, arrivals: usize) -> Self
+pub fn glommio::RecvBuffersShape::message_size(self, bytes: usize) -> Self
+pub fn glommio::RecvBuffersShape::resolve(self) -> glommio::RecvBuffers
+impl core::clone::Clone for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::clone(&self) -> glommio::RecvBuffersShape
+impl core::cmp::Eq for glommio::RecvBuffersShape
+impl core::cmp::PartialEq for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::eq(&self, other: &glommio::RecvBuffersShape) -> bool
+impl core::convert::From<glommio::RecvBuffersShape> for glommio::RecvBuffers
+pub fn glommio::RecvBuffers::from(shape: glommio::RecvBuffersShape) -> Self
+impl core::fmt::Debug for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for glommio::RecvBuffersShape
+impl core::marker::StructuralPartialEq for glommio::RecvBuffersShape
+impl core::marker::Freeze for glommio::RecvBuffersShape
+impl core::marker::Send for glommio::RecvBuffersShape
+impl core::marker::Sync for glommio::RecvBuffersShape
+impl core::marker::Unpin for glommio::RecvBuffersShape
+impl core::marker::UnsafeUnpin for glommio::RecvBuffersShape
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::RecvBuffersShape
+impl core::panic::unwind_safe::UnwindSafe for glommio::RecvBuffersShape
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::RecvBuffersShape where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::RecvBuffersShape where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::RecvBuffersShape where U: core::convert::From<T>
+pub fn glommio::RecvBuffersShape::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::RecvBuffersShape where U: core::convert::Into<T>
+pub type glommio::RecvBuffersShape::Error = core::convert::Infallible
+pub fn glommio::RecvBuffersShape::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::RecvBuffersShape where U: core::convert::TryFrom<T>
+pub type glommio::RecvBuffersShape::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::RecvBuffersShape::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::RecvBuffersShape where T: core::clone::Clone
+pub type glommio::RecvBuffersShape::Owned = T
+pub fn glommio::RecvBuffersShape::clone_into(&self, target: &mut T)
+pub fn glommio::RecvBuffersShape::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::RecvBuffersShape where T: 'static + ?core::marker::Sized
+pub fn glommio::RecvBuffersShape::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::RecvBuffersShape where T: ?core::marker::Sized
+pub fn glommio::RecvBuffersShape::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::RecvBuffersShape where T: ?core::marker::Sized
+pub fn glommio::RecvBuffersShape::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::RecvBuffersShape where T: core::clone::Clone
+pub unsafe fn glommio::RecvBuffersShape::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::RecvBuffersShape
+pub fn glommio::RecvBuffersShape::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::RecvBuffersShape
+pub type glommio::RecvBuffersShape::Init = T
+pub const glommio::RecvBuffersShape::ALIGN: usize
+pub unsafe fn glommio::RecvBuffersShape::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::RecvBuffersShape::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::RecvBuffersShape::drop(ptr: usize)
+pub unsafe fn glommio::RecvBuffersShape::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::RecvBuffersShape
+impl<T> tracing::instrument::WithSubscriber for glommio::RecvBuffersShape
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::RecvBuffersShape where T: ?core::marker::Sized
 pub struct glommio::RingIoStats
 impl glommio::RingIoStats
 pub fn glommio::RingIoStats::file_buffered_reads(&self) -> (u64, u64)

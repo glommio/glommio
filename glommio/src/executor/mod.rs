@@ -78,6 +78,210 @@ pub(crate) const DEFAULT_EXECUTOR_NAME: &str = "unnamed";
 pub(crate) const DEFAULT_PREEMPT_TIMER: Duration = Duration::from_millis(100);
 pub(crate) const DEFAULT_IO_MEMORY: usize = 10 << 20;
 pub(crate) const DEFAULT_RING_SUBMISSION_DEPTH: usize = 128;
+/// Bytes per provided receive buffer: what a buffered stream allocates for
+/// itself, so a full fill means the same thing either way.
+pub(crate) const DEFAULT_RECV_BUFFER_SIZE: usize = crate::net::Preallocated::DEFAULT_BUFFER_SIZE;
+
+/// The receive buffers an executor lends to the kernel for multishot
+/// receive: `count` buffers of `size` bytes, `count * size` bytes per
+/// executor, allocated at start. See [`LocalExecutorBuilder::recv_buffers`]
+/// for what they do and when to want them. Three ways to say it:
+///
+/// - [`for_connections`](Self::for_connections), from the workload: how many
+///   connections, how many arrivals each may have outstanding between two
+///   visits to the ring, and the size of a message;
+/// - [`budget`](Self::budget), from the memory to spend per executor;
+/// - [`exact`](Self::exact), the two numbers, for a workload already measured.
+///
+/// Whichever way, [`count`](Self::count) and [`size`](Self::size) say what
+/// was resolved, worth a line in the startup log, and
+/// [`IoStats::recv_buffers_exhausted`](crate::IoStats::recv_buffers_exhausted)
+/// says afterwards whether it was enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvBuffers {
+    count: usize,
+    size: usize,
+}
+
+impl RecvBuffers {
+    /// The kernel's limit on a buffer ring: 32768 entries.
+    pub const MAX_COUNT: usize = 32768;
+    /// The kernel's limit on a buffer: its length is 32 bits.
+    pub const MAX_SIZE: usize = u32::MAX as usize;
+    /// The size used when none is given: 8 KiB, the buffer a buffered stream
+    /// allocates for itself, so a full fill means the same thing either way.
+    pub const DEFAULT_SIZE: usize = DEFAULT_RECV_BUFFER_SIZE;
+
+    /// No buffers and no multishot, which is the default.
+    #[must_use = "The buffers must be given to a builder to be useful"]
+    pub fn none() -> Self {
+        RecvBuffers {
+            count: 0,
+            size: Self::DEFAULT_SIZE,
+        }
+    }
+
+    /// `count` buffers of `size` bytes, exactly. A count of zero is
+    /// [`none`](Self::none), whatever the size.
+    ///
+    /// # Panics
+    ///
+    /// If `count` is above [`MAX_COUNT`](Self::MAX_COUNT), or `size` is zero
+    /// or above [`MAX_SIZE`](Self::MAX_SIZE), with a non-zero count.
+    #[must_use = "The buffers must be given to a builder to be useful"]
+    pub fn exact(count: usize, size: usize) -> Self {
+        if count == 0 {
+            return Self::none();
+        }
+        assert!(
+            count <= Self::MAX_COUNT,
+            "recv_buffers: count {count} is above the kernel's limit of {}",
+            Self::MAX_COUNT
+        );
+        Self::check_size(size);
+        RecvBuffers { count, size }
+    }
+
+    /// As many buffers of [`DEFAULT_SIZE`](Self::DEFAULT_SIZE) as fit in
+    /// `bytes`, so the budget is never exceeded, and at most
+    /// [`MAX_COUNT`](Self::MAX_COUNT). A pool multiplies the budget by its
+    /// shard count.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` is below one buffer.
+    #[must_use = "The buffers must be given to a builder to be useful"]
+    pub fn budget(bytes: usize) -> Self {
+        Self::budget_of(bytes, Self::DEFAULT_SIZE)
+    }
+
+    /// As [`budget`](Self::budget), with buffers of `size` bytes.
+    ///
+    /// # Panics
+    ///
+    /// If `size` is zero or above [`MAX_SIZE`](Self::MAX_SIZE), or `bytes`
+    /// is below one buffer.
+    #[must_use = "The buffers must be given to a builder to be useful"]
+    pub fn budget_of(bytes: usize, size: usize) -> Self {
+        Self::check_size(size);
+        assert!(
+            bytes >= size,
+            "recv_buffers: a budget of {bytes} bytes holds no buffer of {size}"
+        );
+        RecvBuffers {
+            count: (bytes / size).min(Self::MAX_COUNT),
+            size,
+        }
+    }
+
+    /// Sized from the workload: `connections` open at once, each with
+    /// [`arrivals_each`](RecvBuffersShape::arrivals_each) outstanding, two
+    /// unless said otherwise, of
+    /// [`message_size`](RecvBuffersShape::message_size) bytes, 8 KiB unless
+    /// said otherwise. Zero connections is [`none`](Self::none). The count
+    /// is capped at [`MAX_COUNT`](Self::MAX_COUNT), which a shape above it
+    /// does not reach; the exhaustion count in the IO stats says so at run
+    /// time.
+    ///
+    /// The product is an upper bound: the kernel runs deferred receives a
+    /// batch at a time and buffers come back between batches, so fewer
+    /// usually do. The exhaustion count is the way to size downward.
+    #[must_use = "The shape must be given to a builder to be useful"]
+    pub fn for_connections(connections: usize) -> RecvBuffersShape {
+        RecvBuffersShape {
+            connections,
+            arrivals_each: 2,
+            message_size: Self::DEFAULT_SIZE,
+        }
+    }
+
+    /// How many buffers; zero means multishot is off.
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The bytes in each buffer, the most one completion carries.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// The memory this costs per executor. Cannot overflow: the count and
+    /// size limits keep the product under 2^47.
+    pub fn bytes(&self) -> usize {
+        self.count * self.size
+    }
+
+    /// The kernel describes a buffer with a 32-bit length; a larger one
+    /// would be registered as its length modulo 2^32 and read back whole,
+    /// which is a corrupt stream, not an error.
+    fn check_size(size: usize) {
+        assert!(
+            size > 0,
+            "recv_buffers: a receive buffer of zero bytes cannot hold a message"
+        );
+        assert!(
+            size <= Self::MAX_SIZE,
+            "recv_buffers: a receive buffer of {size} bytes is above the kernel's 32-bit length"
+        );
+    }
+}
+
+/// Off: no buffers, no multishot, and nothing allocated. Multishot trades
+/// CPU for throughput on a core that would otherwise idle, which is a
+/// choice the application makes, not the runtime.
+impl Default for RecvBuffers {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+/// A [`RecvBuffers`] stated from the workload, see
+/// [`RecvBuffers::for_connections`]. Passed to the builder as is, or
+/// resolved with [`resolve`](Self::resolve) to read the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvBuffersShape {
+    connections: usize,
+    arrivals_each: usize,
+    message_size: usize,
+}
+
+impl RecvBuffersShape {
+    /// How many arrivals one connection may have outstanding between two
+    /// visits to the ring: the pipeline depth for a pipelined protocol, one
+    /// or two for request and response. Zero is [`RecvBuffers::none`].
+    #[must_use = "The shape must be given to a builder to be useful"]
+    pub fn arrivals_each(mut self, arrivals: usize) -> Self {
+        self.arrivals_each = arrivals;
+        self
+    }
+
+    /// The bytes one buffer holds: the protocol's usual message. A larger
+    /// message arrives in several buffers.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` is zero or above [`RecvBuffers::MAX_SIZE`], here rather
+    /// than in the builder, so the panic names the call that caused it.
+    #[must_use = "The shape must be given to a builder to be useful"]
+    pub fn message_size(mut self, bytes: usize) -> Self {
+        RecvBuffers::check_size(bytes);
+        self.message_size = bytes;
+        self
+    }
+
+    /// The count and size this shape comes to.
+    #[must_use = "The buffers must be given to a builder to be useful"]
+    pub fn resolve(self) -> RecvBuffers {
+        self.into()
+    }
+}
+
+impl From<RecvBuffersShape> for RecvBuffers {
+    fn from(shape: RecvBuffersShape) -> Self {
+        let wanted = shape.connections.saturating_mul(shape.arrivals_each);
+        RecvBuffers::exact(wanted.min(RecvBuffers::MAX_COUNT), shape.message_size)
+    }
+}
 
 /// Result type alias that removes the need to specify a type parameter
 /// that's only valid in the channel variants of the error. Otherwise, it
@@ -522,6 +726,8 @@ pub struct LocalExecutorBuilder {
     /// [`stall::DefaultStallDetectionHandler`] installs a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
     detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
+    /// Receive buffers lent to the kernel for multishot receive
+    recv_buffers: RecvBuffers,
 }
 
 impl LocalExecutorBuilder {
@@ -541,6 +747,7 @@ impl LocalExecutorBuilder {
             record_io_latencies: false,
             blocking_thread_pool_placement: PoolPlacement::from(placement),
             detect_stalls: None,
+            recv_buffers: RecvBuffers::default(),
         }
     }
 
@@ -589,6 +796,46 @@ impl LocalExecutorBuilder {
     pub fn ring_depth(mut self, ring_depth: usize) -> LocalExecutorBuilder {
         assert!(ring_depth > 0, "ring depth should be strictly positive");
         self.ring_depth = ring_depth;
+        self
+    }
+
+    /// The receive buffers this executor lends to the kernel, a
+    /// [`RecvBuffers`] or the shape [`RecvBuffers::for_connections`] gives.
+    ///
+    /// A buffered [`TcpStream`] or [`UnixStream`] arms one multishot receive
+    /// for its lifetime instead of submitting a read per message. The kernel
+    /// copies each arrival into one of these buffers and posts a completion,
+    /// so the executor submits nothing per message and a reply that was
+    /// already waiting is a completion already in the queue. The buffers are
+    /// handed back as the stream consumes them; an idle connection holds none.
+    ///
+    /// `count` bounds how many arrivals the kernel can hold between two visits
+    /// to the completion queue, not how many connections can be open. When
+    /// they run out the kernel drops the request with `ENOBUFS` and the
+    /// stream falls back to a plain read until it re-arms. It is at most
+    /// 32768. `size` is the most one completion can carry; a message larger
+    /// than it arrives in several.
+    ///
+    /// The memory is `count * size` per executor, allocated at start, and a
+    /// pool of shards multiplies it by the number of shards, which is why
+    /// both numbers are here rather than chosen for you. The default is
+    /// none: multishot is off, buffered streams submit a read per message,
+    /// and nothing is allocated. A `count` of zero says the same. A kernel
+    /// older than 6.0 behaves as if it were zero. Multishot pays under
+    /// fan-in, many connections into one executor; on a single connection
+    /// it buys throughput with CPU the core would otherwise have idled, so
+    /// measure before turning it on. [`RecvBuffers::for_connections`] does
+    /// the arithmetic from the workload, [`RecvBuffers::budget`] from the
+    /// memory, and [`IoStats::recv_buffers_exhausted`] says afterwards
+    /// whether the count was enough.
+    ///
+    /// [`IoStats::recv_buffers_exhausted`]: crate::IoStats::recv_buffers_exhausted
+    ///
+    /// [`TcpStream`]: crate::net::TcpStream
+    /// [`UnixStream`]: crate::net::UnixStream
+    #[must_use = "The builder must be built to be useful"]
+    pub fn recv_buffers(mut self, buffers: impl Into<RecvBuffers>) -> LocalExecutorBuilder {
+        self.recv_buffers = buffers.into();
         self
     }
 
@@ -674,6 +921,7 @@ impl LocalExecutorBuilder {
                 spin_before_park: self.spin_before_park,
                 thread_pool_placement: self.blocking_thread_pool_placement,
                 detect_stalls: self.detect_stalls,
+                recv_buffers: self.recv_buffers,
             },
         )?;
         le.init();
@@ -740,6 +988,7 @@ impl LocalExecutorBuilder {
         let detect_stalls = self.detect_stalls;
         let record_io_latencies = self.record_io_latencies;
         let blocking_thread_pool_placement = self.blocking_thread_pool_placement;
+        let recv_buffers = self.recv_buffers;
 
         Builder::new()
             .name(name)
@@ -755,6 +1004,7 @@ impl LocalExecutorBuilder {
                         spin_before_park,
                         thread_pool_placement: blocking_thread_pool_placement,
                         detect_stalls,
+                        recv_buffers,
                     },
                 )?;
                 le.init();
@@ -823,6 +1073,8 @@ pub struct LocalExecutorPoolBuilder {
     /// [`DefaultStallDetectionHandler installs`] a signal handler for
     /// [`nix::libc::SIGUSR1`], so is disabled by default.
     handler_gen: Option<Box<dyn Fn() -> Box<dyn stall::StallDetectionHandler + 'static>>>,
+    /// Receive buffers each executor lends to the kernel for multishot receive
+    recv_buffers: RecvBuffers,
 }
 
 impl fmt::Debug for LocalExecutorPoolBuilder {
@@ -838,6 +1090,7 @@ impl fmt::Debug for LocalExecutorPoolBuilder {
                 "blocking_thread_pool_placement",
                 &self.blocking_thread_pool_placement,
             )
+            .field("recv_buffers", &self.recv_buffers)
             .finish_non_exhaustive()
     }
 }
@@ -859,6 +1112,7 @@ impl LocalExecutorPoolBuilder {
             record_io_latencies: false,
             blocking_thread_pool_placement: placement.shrink_to(1),
             handler_gen: None,
+            recv_buffers: RecvBuffers::default(),
         }
     }
 
@@ -896,6 +1150,14 @@ impl LocalExecutorPoolBuilder {
     pub fn ring_depth(mut self, ring_depth: usize) -> Self {
         assert!(ring_depth > 0, "ring depth should be strictly positive");
         self.ring_depth = ring_depth;
+        self
+    }
+
+    /// The receive buffers each executor in the pool lends to the kernel, as
+    /// [`LocalExecutorBuilder::recv_buffers`]. The memory is per executor.
+    #[must_use = "The builder must be built to be useful"]
+    pub fn recv_buffers(mut self, buffers: impl Into<RecvBuffers>) -> Self {
+        self.recv_buffers = buffers.into();
         self
     }
 
@@ -1031,6 +1293,7 @@ impl LocalExecutorPoolBuilder {
             let record_io_latencies = self.record_io_latencies;
             let blocking_thread_pool_placement = self.blocking_thread_pool_placement.clone();
             let detect_stalls = self.handler_gen.as_ref().map(|x| (*x.deref())());
+            let recv_buffers = self.recv_buffers;
             let latch = Latch::clone(latch);
 
             move || {
@@ -1046,6 +1309,7 @@ impl LocalExecutorPoolBuilder {
                             spin_before_park,
                             thread_pool_placement: blocking_thread_pool_placement,
                             detect_stalls,
+                            recv_buffers,
                         },
                     )?;
                     le.init();
@@ -1131,6 +1395,7 @@ pub struct LocalExecutorConfig {
     pub spin_before_park: Option<Duration>,
     pub thread_pool_placement: PoolPlacement,
     pub detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
+    pub(crate) recv_buffers: RecvBuffers,
 }
 
 /// Single-threaded executor.
@@ -1234,6 +1499,7 @@ impl LocalExecutor {
             config.ring_depth,
             config.record_io_latencies,
             blocking_thread,
+            config.recv_buffers,
         )?);
         let tasks = Rc::new(TaskRegistry::new(WeakExecutorContext::new(
             id, &queues, &reactor,

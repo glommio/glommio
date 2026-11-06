@@ -165,12 +165,16 @@ the ring's own submitter, never a poller of its fd, so the link cannot run the
 other way. A stream that finds its queue empty may enter once between two
 passes, so a reply already in the socket is seen on the first poll; a second
 empty poll before the next pass enters nothing. A pass that cannot sleep
-enters the ring, unless a stream entered since the last pass and no preempt
-slice has gone by, since that entry ran the work; a pass that may sleep does
-not enter before deciding, because the sleep's own entry runs the work and
-returns at once if it posted anything, and entering first found a depth-1
-reply on the second or third pass and never parked, at the cost of the whole
-core.
+enters the ring at its start, unless a stream entered since the last pass
+and no preempt slice has gone by, since that entry ran the work. A pass that
+may sleep enters at the last moment before it commits to sleeping, and sleeps
+only if that posted nothing. Deferred work is invisible until an entry, so
+an early entry leaves a window in which a reply lands unseen and the pass
+goes into a sleep that returns at once, after paying for it: the notifier's
+heavy membarrier, an IPI to every thread of the process under a global
+mutex, and two link polls. On eight executors with sixteen pipelined
+connections each that was a hundred times the readiness path's sleeps and
+5% of the kernel's time, which is where the cell's 2.6% went.
 
 The ring exists only when the executor asked for buffers. An executor
 without them has no fourth ring and sleeps in the main ring as it always

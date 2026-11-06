@@ -542,10 +542,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                     if pos == buf.len() {
                         break;
                     }
-                    let bytes = &buffers.bytes(arrival.bid, arrival.len)[arrival.taken..];
-                    let n = bytes.len().min(buf.len() - pos);
-                    buf[pos..pos + n].copy_from_slice(&bytes[..n]);
-                    pos += n;
+                    pos += arrival.copy_to(&buffers, arrival.taken, &mut buf[pos..]);
                 }
             }
         }
@@ -664,7 +661,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             let Some(result) = multi.result() else {
                 if !reaped {
                     reaped = true;
-                    if poll_err!(reactor.reap_latency_completions()) > 0 {
+                    if poll_err!(reactor.reap_socket_completions()) > 0 {
                         continue;
                     }
                 }
@@ -675,13 +672,20 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                     .maybe_set_timer(&reactor, cx.waker());
                 return Poll::Pending;
             };
+            let was_bundled = match &*multi.source_type() {
+                SourceType::RecvMulti(state) => state.bundled,
+                _ => unreachable!("rx_multi holds a multishot receive"),
+            };
             self.rx_multi = None;
             match result {
                 Ok(0) => return Poll::Ready(Ok(0)),
                 Ok(_) => {}
                 Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
-                    reactor.refuse_recv_multi();
+                    reactor.refuse_recv_multi(was_bundled);
+                    if was_bundled {
+                        continue;
+                    }
                     let result = poll_err!(ready!(self.poll_fill(cx)));
                     self.rx_buf.handle_result(result);
                     return Poll::Ready(Ok(result));
@@ -730,19 +734,14 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
         };
         let arrival = state.ready.front_mut()?;
         let room = self.rx_buf.unfilled();
-        let n = {
-            let buffers = state.buffers.borrow();
-            let bytes = &buffers.bytes(arrival.bid, arrival.len)[arrival.taken..];
-            let n = bytes.len().min(room.len());
-            room[..n].copy_from_slice(&bytes[..n]);
-            n
-        };
+        let n = arrival.copy_to(&state.buffers.borrow(), arrival.taken, room);
         arrival.taken += n;
         if arrival.taken == arrival.len {
-            let bid = arrival.bid;
-            state.ready.pop_front();
+            let arrival = state.ready.pop_front().unwrap();
             let mut buffers = state.buffers.borrow_mut();
-            buffers.give_back(bid);
+            for bid in arrival.bids {
+                buffers.give_back(bid);
+            }
             buffers.publish();
         }
         Some(n)

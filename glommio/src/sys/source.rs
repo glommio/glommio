@@ -79,13 +79,39 @@ pub(crate) enum SourceType {
 /// picked from the executor's ring and is queued here as the buffer's id and
 /// the byte count. The owner takes them in order and gives each buffer back.
 /// Anything still queued when the state is dropped goes back by itself.
-/// One delivery of a multishot receive: `len` bytes in buffer `bid`, of
-/// which the owner has already taken `taken`.
-#[derive(Debug, Clone, Copy)]
+/// One delivery of a multishot receive: `len` bytes spread over `bids` in
+/// order, each buffer full but the last, of which the owner has already
+/// taken `taken`. A plain multishot delivers one buffer per completion; a
+/// bundled one as many as the socket had data for.
+#[derive(Debug, Clone)]
 pub(crate) struct Arrival {
-    pub(crate) bid: u16,
+    pub(crate) bids: smallvec::SmallVec<[u16; 4]>,
     pub(crate) len: usize,
     pub(crate) taken: usize,
+}
+
+impl Arrival {
+    /// Copies up to `out.len()` bytes starting `from` bytes into the
+    /// arrival, across buffer boundaries, and returns how many.
+    pub(crate) fn copy_to(
+        &self,
+        buffers: &crate::sys::ProvidedBuffers,
+        from: usize,
+        out: &mut [u8],
+    ) -> usize {
+        let size = buffers.size();
+        let mut done = 0;
+        let mut at = from;
+        while at < self.len && done < out.len() {
+            let (which, offset) = (at / size, at % size);
+            let in_buffer = (self.len - at).min(size - offset).min(out.len() - done);
+            let bytes = &buffers.bytes(self.bids[which], offset + in_buffer)[offset..];
+            out[done..done + in_buffer].copy_from_slice(bytes);
+            done += in_buffer;
+            at += in_buffer;
+        }
+        done
+    }
 }
 
 #[derive(Debug)]
@@ -95,14 +121,18 @@ pub(crate) struct RecvMultiState {
     /// that carries no `MORE` flag, which is also the one that retires the
     /// source and stores its result.
     pub(crate) armed: bool,
+    /// Whether the request was armed as a bundle, so a completion may span
+    /// several buffers.
+    pub(crate) bundled: bool,
     pub(crate) buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>,
 }
 
 impl RecvMultiState {
-    pub(crate) fn new(buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>) -> Self {
+    pub(crate) fn new(buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>, bundled: bool) -> Self {
         RecvMultiState {
             ready: Default::default(),
             armed: true,
+            bundled,
             buffers,
         }
     }
@@ -115,7 +145,9 @@ impl Drop for RecvMultiState {
         }
         let mut buffers = self.buffers.borrow_mut();
         for arrival in self.ready.drain(..) {
-            buffers.give_back(arrival.bid);
+            for bid in arrival.bids {
+                buffers.give_back(bid);
+            }
         }
         buffers.publish();
     }

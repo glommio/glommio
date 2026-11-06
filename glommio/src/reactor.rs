@@ -190,7 +190,7 @@ impl Reactor {
 
     #[inline(always)]
     pub(crate) fn need_preempt(&self) -> bool {
-        !self.preempt_status.is_empty() || self.sys.preempt_requested()
+        !self.preempt_status.is_empty()
     }
 
     pub(crate) fn id(&self) -> usize {
@@ -476,24 +476,30 @@ impl Reactor {
     /// executor has no receive buffers or the kernel refused the flag.
     pub(crate) fn recv_multi(&self, fd: RawFd) -> Option<Source> {
         let buffers = self.sys.recv_buffers()?;
+        let bundle = self.sys.recv_multi_bundles();
         let source = self.new_source(
             fd,
-            SourceType::RecvMulti(sys::RecvMultiState::new(buffers)),
+            SourceType::RecvMulti(sys::RecvMultiState::new(buffers, bundle)),
             None,
         );
-        self.sys.recv_multi(&source);
+        self.sys.recv_multi(&source, bundle);
         Some(source)
     }
 
-    /// Stops trying multishot receive on this executor, after the kernel
-    /// answered one with EINVAL.
-    pub(crate) fn refuse_recv_multi(&self) {
-        self.sys.refuse_recv_multi()
+    /// The kernel answered a multishot receive with EINVAL. If it was asking
+    /// for bundles, those are given up and the plain form is tried; if not,
+    /// multishot itself is given up on this executor.
+    pub(crate) fn refuse_recv_multi(&self, was_bundled: bool) {
+        if was_bundled {
+            self.sys.refuse_bundle()
+        } else {
+            self.sys.refuse_recv_multi()
+        }
     }
 
-    /// See [`sys::Reactor::reap_latency_completions`].
-    pub(crate) fn reap_latency_completions(&self) -> io::Result<usize> {
-        self.sys.reap_latency_completions()
+    /// See [`sys::Reactor::reap_socket_completions`].
+    pub(crate) fn reap_socket_completions(&self) -> io::Result<usize> {
+        self.sys.reap_socket_completions()
     }
 
     pub(crate) fn recv_into(&self, fd: RawFd, buffer: crate::net::OwnedRxBuf) -> Source {

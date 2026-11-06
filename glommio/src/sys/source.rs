@@ -73,17 +73,12 @@ pub(crate) enum SourceType {
     Noop,
 }
 
-/// What a multishot receive has delivered and not yet handed over.
-///
-/// One request, many completions: each arrival lands in a buffer the kernel
-/// picked from the executor's ring and is queued here as the buffer's id and
-/// the byte count. The owner takes them in order and gives each buffer back.
-/// Anything still queued when the state is dropped goes back by itself.
 /// One delivery of a multishot receive: `len` bytes spread over `bids` in
 /// order, each buffer full but the last, of which the owner has already
 /// taken `taken`. A plain multishot delivers one buffer per completion; a
-/// bundled one as many as the socket had data for.
-#[derive(Debug, Clone)]
+/// bundled one as many as the socket had data for. Not `Clone`: the bids
+/// are owed back to the ring exactly once.
+#[derive(Debug)]
 pub(crate) struct Arrival {
     pub(crate) bids: smallvec::SmallVec<[u16; 4]>,
     pub(crate) len: usize,
@@ -114,6 +109,12 @@ impl Arrival {
     }
 }
 
+/// What a multishot receive has delivered and not yet handed over.
+///
+/// One request, many completions: each arrival lands in a buffer the kernel
+/// picked from the executor's ring and is queued here as the buffer's id and
+/// the byte count. The owner takes them in order and gives each buffer back.
+/// Anything still queued when the state is dropped goes back by itself.
 #[derive(Debug)]
 pub(crate) struct RecvMultiState {
     pub(crate) ready: std::collections::VecDeque<Arrival>,
@@ -124,17 +125,38 @@ pub(crate) struct RecvMultiState {
     /// Whether the request was armed as a bundle, so a completion may span
     /// several buffers.
     pub(crate) bundled: bool,
+    /// The most bytes the queue may hold before the request is cancelled,
+    /// so a connection nobody reads cannot drain the executor's buffers for
+    /// every other connection: once its queue is full the kernel stops
+    /// taking its socket, the socket fills, and the peer's window closes,
+    /// which is backpressure where it belongs. The owner re-arms when it
+    /// drains the queue.
+    pub(crate) ceiling: usize,
+    /// Whether the request was cancelled for exceeding the ceiling; one
+    /// cancellation per request.
+    pub(crate) throttled: bool,
     pub(crate) buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>,
 }
 
 impl RecvMultiState {
-    pub(crate) fn new(buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>, bundled: bool) -> Self {
+    pub(crate) fn new(
+        buffers: Rc<RefCell<crate::sys::ProvidedBuffers>>,
+        bundled: bool,
+        ceiling: usize,
+    ) -> Self {
         RecvMultiState {
             ready: Default::default(),
             armed: true,
             bundled,
+            ceiling,
+            throttled: false,
             buffers,
         }
+    }
+
+    /// Bytes queued and not yet taken by the owner.
+    pub(crate) fn queued(&self) -> usize {
+        self.ready.iter().map(|a| a.len - a.taken).sum()
     }
 }
 

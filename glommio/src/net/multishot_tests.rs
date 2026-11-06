@@ -271,3 +271,220 @@ fn a_message_spanning_kernel_buffers_reads_whole() {
         assert_eq!(buffers_held(), 0);
     });
 }
+
+/// A task queue that keeps the core busy for `for_how_long`, yielding at
+/// every slice, so the reactor never sleeps and every pass comes from the
+/// preempt timer: the regime in which a reply has to be found by the pass.
+fn burn(for_how_long: Duration) -> crate::Task<()> {
+    let queue = crate::executor().create_task_queue(
+        crate::Shares::Static(1),
+        crate::Latency::NotImportant,
+        "burner",
+    );
+    crate::spawn_local_into(
+        async move {
+            let until = std::time::Instant::now() + for_how_long;
+            while std::time::Instant::now() < until {
+                crate::yield_if_needed().await;
+            }
+        },
+        queue,
+    )
+    .unwrap()
+}
+
+/// Fan-in under stress, with peeks: twelve connections writing chunks that
+/// span buffers, a quarter of the readers dropped mid-stream with arrivals
+/// queued, and every third reader peeking before it reads. Every byte must
+/// come out in order, through the peek as much as the read, and every
+/// buffer must come back. A peek that waited on the socket beside the armed
+/// receive saw the bytes behind the ones the request was taking, three runs
+/// in three.
+#[test]
+fn fan_in_with_peeks_and_dropped_readers_keeps_order_and_buffers() {
+    use std::io::Write as _;
+    for round in 0..3u64 {
+        executor(8, 64).run(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            const CONNS: usize = 12;
+            let writers = std::thread::spawn(move || {
+                let mut socks: Vec<_> = (0..CONNS)
+                    .map(|_| std::net::TcpStream::connect(addr).unwrap())
+                    .collect();
+                let mut seed = round.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mut sent = [0usize; CONNS];
+                for _ in 0..400 {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let c = (seed >> 33) as usize % CONNS;
+                    let len = 1 + (seed >> 40) as usize % 300;
+                    let chunk: Vec<u8> = (0..len).map(|i| ((sent[c] + i) % 251) as u8).collect();
+                    if socks[c].write_all(&chunk).is_ok() {
+                        sent[c] += len;
+                    }
+                    if seed % 7 == 0 {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+            });
+            let mut tasks = vec![];
+            for i in 0..CONNS {
+                let reader = listener
+                    .accept()
+                    .await
+                    .unwrap()
+                    .buffered_with(Preallocated::new(97));
+                tasks.push(crate::spawn_local(async move {
+                    let mut reader = reader;
+                    let mut got = 0usize;
+                    let mut buf = [0u8; 113];
+                    let quit_at = if i % 4 == 0 { 500 } else { usize::MAX };
+                    loop {
+                        if got >= quit_at {
+                            return;
+                        }
+                        if i % 3 == 0 {
+                            let mut p = [0u8; 50];
+                            let n = reader.peek(&mut p).await.unwrap();
+                            let want: Vec<u8> = (0..n).map(|k| ((got + k) % 251) as u8).collect();
+                            assert_eq!(
+                                &p[..n],
+                                &want[..],
+                                "round {round}: a peek on connection {i} at byte {got} was out of order"
+                            );
+                        }
+                        let n = reader.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        for (k, b) in buf[..n].iter().enumerate() {
+                            assert_eq!(*b, ((got + k) % 251) as u8, "connection {i} byte {}", got + k);
+                        }
+                        got += n;
+                    }
+                }));
+            }
+            for t in tasks {
+                t.await;
+            }
+            writers.join().unwrap();
+            Timer::new(Duration::from_millis(20)).await;
+            let mut woke = 0;
+            crate::executor().reactor().sys.poll_io(&mut woke).unwrap();
+            assert_eq!(buffers_held(), 0, "round {round}: buffers leaked");
+        });
+    }
+}
+
+/// A reply that lands while a CPU-bound queue runs its slice is seen on the
+/// pass that ends the slice, not the one after: the stream's own entry a
+/// slice ago does not excuse the pass from entering. The reader parks right
+/// after a pass, so a reply sent a few milliseconds later lands in that
+/// same slice: the pass that ends it finds the reply, or the next one does,
+/// a slice later. Measured at 32 ms against 52 ms with a 20 ms slice; the
+/// bound sits between.
+#[test]
+fn a_reply_beside_a_cpu_bound_queue_waits_one_slice_not_two() {
+    use std::time::Instant;
+    const SLICE: Duration = Duration::from_millis(20);
+    LocalExecutorBuilder::new(Placement::Unbound)
+        .recv_buffers(crate::RecvBuffers::exact(8, 64))
+        .preempt_timer(SLICE)
+        .make()
+        .unwrap()
+        .run(async {
+            let (writer, mut reader) = pair(Preallocated::default()).await;
+            let burner = burn(SLICE * 20);
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
+            let mut total = Duration::ZERO;
+            let phases = [2u64, 6, 10, 14];
+            for phase in phases {
+                let sender = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(phase));
+                    let at = Instant::now();
+                    let n = unsafe { libc::send(fd, b"x".as_ptr() as *const _, 1, 0) };
+                    assert_eq!(n, 1);
+                    at
+                });
+                let mut got = [0u8; 1];
+                reader.read_exact(&mut got).await.unwrap();
+                let seen = Instant::now();
+                total += seen.duration_since(sender.join().unwrap());
+            }
+            burner.await;
+            let mean = total / phases.len() as u32;
+            assert!(
+                mean < SLICE * 2,
+                "replies waited {mean:?} on average beside a CPU-bound queue with a {SLICE:?} slice"
+            );
+            drop(writer);
+        });
+}
+
+/// A connection nobody reads must not take every buffer: once its queue
+/// holds more than its owner can take, its request is cancelled and the
+/// socket backs up to the peer, while every other connection on the
+/// executor keeps reading without running dry. Reading it later gets every
+/// byte in order, through a re-armed request. The flood comes as small
+/// writes a moment apart, since one bundle takes whatever the socket holds
+/// at that moment and the ceiling acts between bundles.
+#[test]
+fn an_unread_connection_is_throttled_and_the_others_keep_their_buffers() {
+    executor(16, 64).run(async {
+        let (flooder, unread) = pair(Preallocated::new(256)).await;
+        let (mut writer, mut reader) = pair(Preallocated::default()).await;
+        let flood: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&flooder);
+        let flooder_thread = std::thread::spawn(move || {
+            for chunk in flood.chunks(100) {
+                let mut sent = 0;
+                while sent < chunk.len() {
+                    let n = unsafe {
+                        libc::send(
+                            fd,
+                            chunk[sent..].as_ptr() as *const _,
+                            chunk.len() - sent,
+                            0,
+                        )
+                    };
+                    if n < 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    sent += n as usize;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        Timer::new(Duration::from_millis(100)).await;
+        let held = buffers_held();
+        assert!(
+            held <= 8,
+            "the unread connection took {held} of 16 buffers; its ceiling is 256 bytes, four"
+        );
+
+        for i in 0..20u8 {
+            writer.write_all(&[i; 32]).await.unwrap();
+            let mut got = [0u8; 32];
+            reader.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, [i; 32]);
+        }
+        assert_eq!(
+            crate::executor().io_stats().recv_buffers_exhausted,
+            0,
+            "the readers ran dry beside an unread connection"
+        );
+
+        let mut unread = unread;
+        let mut got = vec![0u8; 4000];
+        unread.read_exact(&mut got).await.unwrap();
+        assert!(
+            got.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8),
+            "the throttled connection lost or reordered bytes"
+        );
+        flooder_thread.join().unwrap();
+        drop(flooder);
+    });
+}

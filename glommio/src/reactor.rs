@@ -470,16 +470,20 @@ impl Reactor {
         Ok(source)
     }
 
-    /// A completion-based read into `buffer`, which stays in the `Source`
-    /// until the read completes.
     /// Arms a multishot receive on `fd`, or returns `None` when this
     /// executor has no receive buffers or the kernel refused the flag.
-    pub(crate) fn recv_multi(&self, fd: RawFd) -> Option<Source> {
+    /// `wanted` is how many bytes the owner can take at once, its own
+    /// buffer; the request is cancelled once it has queued more than that.
+    /// At least two kernel buffers, so a bundle can always land. One bundle
+    /// can still overshoot by what the socket held at that moment, which
+    /// the kernel bounds by the socket's receive queue, not by this.
+    pub(crate) fn recv_multi(&self, fd: RawFd, wanted: usize) -> Option<Source> {
         let buffers = self.sys.recv_buffers()?;
         let bundle = self.sys.recv_multi_bundles();
+        let ceiling = wanted.max(2 * buffers.borrow().size());
         let source = self.new_source(
             fd,
-            SourceType::RecvMulti(sys::RecvMultiState::new(buffers, bundle)),
+            SourceType::RecvMulti(sys::RecvMultiState::new(buffers, bundle, ceiling)),
             None,
         );
         self.sys.recv_multi(&source, bundle);
@@ -507,6 +511,8 @@ impl Reactor {
         self.sys.reap_socket_completions()
     }
 
+    /// A completion-based read into `buffer`, which stays in the `Source`
+    /// until the read completes.
     pub(crate) fn recv_into(&self, fd: RawFd, buffer: crate::net::OwnedRxBuf) -> Source {
         let source = self.new_source(fd, SourceType::SockRecvInto(Some(buffer)), None);
         self.sys.recv_into(&source, MsgFlags::empty());

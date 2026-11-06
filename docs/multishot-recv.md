@@ -119,7 +119,8 @@ executor, it is a saving per message.
   outstanding between two visits is the number, and it is an upper bound:
   the kernel runs deferred receives a batch at a time and buffers come back
   between batches, so 64 connections with one message each waiting took 33
-  buffers, not 64. Running out is not fatal:
+  buffers, not 64. A connection nobody reads is bounded separately, below,
+  so it cannot be the reason the count runs out. Running out is not fatal:
   the kernel ends the request with `ENOBUFS`, the stream takes what is there
   and re-arms, and the reader never notices, at the cost of a submission.
 - `count = 0` disables multishot and every buffered stream keeps the
@@ -129,6 +130,23 @@ executor, it is a saving per message.
 descriptors from must hold a power of two of entries and is sized to the one
 at or above `count`; the buffers themselves are exactly `count`, so a budget
 costs what it says and not up to twice that.
+
+### A connection nobody reads
+
+Once armed, the kernel keeps copying a socket into provided buffers whether
+or not anyone reads the stream, and that empties the socket, which keeps the
+peer's window open. Left alone, one connection the application has stopped
+reading, which is ordinary backpressure, would take every buffer on the
+executor and put every other connection on the re-arm path for each message;
+raising the count would not help. So each request carries a ceiling, the
+bytes its stream can take at once (its own buffer, at least two kernel
+buffers), and the reactor cancels the request once the queue holds more than
+that. The socket then fills, the peer's window closes, and the stream re-arms
+when it drains its queue. One bundle can still overshoot by what the socket
+held at that moment, which the kernel bounds by the socket's receive queue;
+a per-shot length would have capped that, but the kernel then maps that many
+bytes of buffers for every shot however little arrives, and drained a small
+pool on the first byte.
 
 ### A ring of its own, with deferred task work
 
@@ -140,18 +158,34 @@ apart that was a receive and a completion each, and nothing bundled. On a
 deferred ring a poll wakeup only queues the receive, which runs when this
 thread enters the ring and takes everything the socket holds by then.
 
-Deferred work is posted only on an entry that asks for events, so the ring is
-entered once per reactor pass, every submit on it carries `GETEVENTS`, and the
-reactor sleeps in this ring, polling the main and latency rings' fds from
-there: deferred work wakes only the ring's own submitter, never a poller of
-its fd, so the link cannot run the other way. A stream that finds its queue
-empty may enter once between two passes, so a reply already in the socket is
-seen on the first poll; a second empty poll before the next pass enters
-nothing.
+Deferred work is posted only on an entry that asks for events, so every
+submit on the ring carries `GETEVENTS`, and the reactor sleeps in this ring,
+polling the main and latency rings' fds from there: deferred work wakes only
+the ring's own submitter, never a poller of its fd, so the link cannot run the
+other way. A stream that finds its queue empty may enter once between two
+passes, so a reply already in the socket is seen on the first poll; a second
+empty poll before the next pass enters nothing. A pass that cannot sleep
+enters the ring, unless a stream entered since the last pass and no preempt
+slice has gone by, since that entry ran the work; a pass that may sleep does
+not enter before deciding, because the sleep's own entry runs the work and
+returns at once if it posted anything, and entering first found a depth-1
+reply on the second or third pass and never parked, at the cost of the whole
+core.
+
+The ring exists only when the executor asked for buffers. An executor
+without them has no fourth ring and sleeps in the main ring as it always
+did; building the ring regardless cost the default path 9.5% more CPU per
+round trip on a depth-1 ping-pong, for a ring it never used.
 
 The latency ring stays plain, and that is the reason for the fourth ring.
 The preempt timer and the foreign-wake eventfd must interrupt a task that
 never enters the kernel, which deferred work by definition cannot.
+
+`peek` never touches the socket while a request is armed: every byte the
+socket produces goes to a kernel buffer, so a peek on the socket would see
+the bytes behind the ones the request has taken or is about to. It serves
+what is queued, reaps what the kernel has posted, and otherwise waits on the
+request. A peek may return fewer bytes than asked for.
 
 The kernel also reports pending work in `IORING_SQ_TASKRUN`, and that flag is
 never read. On 7.3 a multishot receive that re-queues itself while the work

@@ -16,7 +16,7 @@ use std::time::Duration;
 /// An executor with `count` provided buffers of `size` bytes.
 fn executor(count: usize, size: usize) -> crate::LocalExecutor {
     LocalExecutorBuilder::new(Placement::Unbound)
-        .recv_buffers(count, size)
+        .recv_buffers(crate::RecvBuffers::exact(count, size))
         .make()
         .unwrap()
 }
@@ -97,6 +97,10 @@ fn running_out_of_buffers_is_invisible_to_the_reader() {
         reader.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"after");
         assert_eq!(buffers_held(), 0);
+        assert!(
+            crate::executor().io_stats().recv_buffers_exhausted >= 1,
+            "running dry was not counted"
+        );
     });
 }
 
@@ -214,7 +218,7 @@ fn an_arrival_already_posted_is_ready_on_the_first_poll() {
 #[test]
 fn an_inline_reap_of_an_arrival_alone_asks_for_no_pass() {
     LocalExecutorBuilder::new(Placement::Unbound)
-        .recv_buffers(8, 64)
+        .recv_buffers(crate::RecvBuffers::exact(8, 64))
         .preempt_timer(Duration::from_secs(10))
         .make()
         .unwrap()

@@ -1161,9 +1161,15 @@ const GETEVENTS: u32 = 1;
 /// `memory` the buffers themselves, `count` of `size` bytes each, both
 /// page-aligned and alive for as long as the registration. Handing a buffer
 /// back is a write to the ring's tail, no syscall.
+///
+/// The kernel wants the ring's entry count to be a power of two; the number
+/// of buffers in it is anyone's, so `ring_entries` is the power of two at or
+/// above `count` and the buffers are exactly `count`. Rounding the buffers
+/// up instead cost up to twice the memory asked for.
 pub(crate) struct ProvidedBuffers {
     entries: *mut types::BufRingEntry,
     memory: *mut u8,
+    ring_entries: u16,
     count: u16,
     size: usize,
     tail: u16,
@@ -1176,14 +1182,18 @@ pub(crate) struct ProvidedBuffers {
 }
 
 impl ProvidedBuffers {
-    /// Registers `count` buffers of `size` bytes with `ring`. `count` is a
-    /// power of two at most 32768, which the builder guarantees.
+    /// Registers `count` buffers of `size` bytes with `ring`. `count` is
+    /// between 1 and 32768 and `size` fits the kernel's 32-bit length, which
+    /// [`RecvBuffers`](crate::RecvBuffers) guarantees.
     fn register(ring: &IoUring, count: usize, size: usize) -> io::Result<Self> {
-        debug_assert!(count.is_power_of_two() && count <= 32768);
+        debug_assert!((1..=32768).contains(&count) && size <= u32::MAX as usize);
+        let ring_entries = count.next_power_of_two() as u16;
         let count = count as u16;
-        let ring_layout =
-            Layout::from_size_align(count as usize * size_of::<types::BufRingEntry>(), 4096)
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let ring_layout = Layout::from_size_align(
+            ring_entries as usize * size_of::<types::BufRingEntry>(),
+            4096,
+        )
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let memory_layout = Layout::from_size_align(count as usize * size, 4096)
             .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         let entries =
@@ -1199,7 +1209,7 @@ impl ProvidedBuffers {
         if let Err(err) = unsafe {
             ring.submitter().register_buf_ring_with_flags(
                 entries as u64,
-                count,
+                ring_entries,
                 RECV_BUFFER_GROUP,
                 0,
             )
@@ -1213,6 +1223,7 @@ impl ProvidedBuffers {
         let mut buffers = ProvidedBuffers {
             entries,
             memory,
+            ring_entries,
             count,
             size,
             tail: 0,
@@ -1277,7 +1288,7 @@ impl ProvidedBuffers {
         debug_assert!(bid < self.count);
         self.held = self.held.saturating_sub(1);
         self.order.push_back(bid);
-        let slot = (self.tail & (self.count - 1)) as usize;
+        let slot = (self.tail & (self.ring_entries - 1)) as usize;
         unsafe {
             let entry = &mut *self.entries.add(slot);
             entry.set_addr(self.memory.add(bid as usize * self.size) as u64);
@@ -1316,7 +1327,7 @@ impl Drop for ProvidedBuffers {
             alloc::alloc::dealloc(
                 self.entries as *mut u8,
                 Layout::from_size_align_unchecked(
-                    self.count as usize * size_of::<types::BufRingEntry>(),
+                    self.ring_entries as usize * size_of::<types::BufRingEntry>(),
                     4096,
                 ),
             );
@@ -1811,6 +1822,9 @@ pub(crate) struct Reactor {
     /// Set once the kernel has rejected the bundle flag (before 6.10), after
     /// which multishot receives are armed one buffer per completion.
     bundle_refused: Cell<bool>,
+    /// Multishot receives that ended because the buffers ran out, since the
+    /// stats were last taken.
+    recv_buffers_exhausted: Cell<u64>,
 }
 
 pub(crate) fn common_flags() -> PollFlags {
@@ -1913,11 +1927,11 @@ impl Reactor {
             source_map.clone(),
             true,
         )?;
-        if recv_buffers.count > 0 {
+        if recv_buffers.count() > 0 {
             match ProvidedBuffers::register(
                 &socket_ring.ring,
-                recv_buffers.count,
-                recv_buffers.size,
+                recv_buffers.count(),
+                recv_buffers.size(),
             ) {
                 Ok(buffers) => socket_ring.provided_buffers = Some(Rc::new(RefCell::new(buffers))),
                 Err(err) => warn!(
@@ -1978,6 +1992,7 @@ impl Reactor {
             rings_depth: ring_depth,
             recv_multi_refused: Cell::new(false),
             bundle_refused: Cell::new(false),
+            recv_buffers_exhausted: Cell::new(0),
         })
     }
 
@@ -2022,6 +2037,12 @@ impl Reactor {
     /// Remembers that this kernel answered a bundled receive with EINVAL.
     pub(crate) fn refuse_bundle(&self) {
         self.bundle_refused.set(true);
+    }
+
+    /// Counts a multishot receive the kernel ended for want of a buffer.
+    pub(crate) fn note_recv_buffers_exhausted(&self) {
+        self.recv_buffers_exhausted
+            .set(self.recv_buffers_exhausted.get() + 1);
     }
 
     /// Consumes what the socket ring has posted, for a stream that found
@@ -2693,6 +2714,7 @@ impl Reactor {
             std::mem::take(&mut self.main_ring.borrow_mut().stats),
             std::mem::take(&mut self.latency_ring.borrow_mut().stats),
             std::mem::take(&mut self.poll_ring.borrow_mut().stats),
+            self.recv_buffers_exhausted.take(),
         )
     }
 
@@ -2723,6 +2745,7 @@ impl Reactor {
                 main.unwrap_or_default(),
                 lat.unwrap_or_default(),
                 poll.unwrap_or_default(),
+                0,
             ))
         }
     }
@@ -2833,7 +2856,7 @@ mod tests {
     #[test]
     fn provided_buffers_follow_the_builder() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(64, 4096)
+            .recv_buffers(crate::RecvBuffers::exact(64, 4096))
             .make()
             .unwrap();
         ex.run(async {
@@ -2844,17 +2867,34 @@ mod tests {
         });
     }
 
-    /// A count that is not a power of two is rounded up, as the kernel needs.
+    /// A count that is not a power of two is kept: the kernel's rule is on
+    /// the ring's entries, not on the buffers in it, and every buffer asked
+    /// for is one the kernel can take.
     #[test]
-    fn provided_buffer_count_rounds_up() {
+    fn a_count_that_is_not_a_power_of_two_is_kept_and_usable() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(100, 512)
+            .recv_buffers(crate::RecvBuffers::exact(3, 16))
             .make()
             .unwrap();
         ex.run(async {
             assert_eq!(
                 crate::executor().reactor().sys.provided_buffers(),
-                Some((128, 512))
+                Some((3, 16))
+            );
+            let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            let reactor = crate::executor().reactor();
+            let source = reactor.recv_multi(reader.as_raw_fd()).unwrap();
+            settle(&reactor);
+            for msg in [&b"aaaa"[..], b"bbbb", b"cccc"] {
+                std::io::Write::write_all(&mut writer, msg).unwrap();
+                settle(&reactor);
+            }
+            let (ready, _) = arrivals(&source);
+            assert_eq!(
+                ready.concat(),
+                b"aaaabbbbcccc",
+                "the third buffer was not usable"
             );
         });
     }
@@ -2863,7 +2903,7 @@ mod tests {
     #[test]
     fn zero_provided_buffers_registers_nothing() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(0, 4096)
+            .recv_buffers(crate::RecvBuffers::exact(0, 4096))
             .make()
             .unwrap();
         ex.run(async {
@@ -2905,7 +2945,7 @@ mod tests {
     #[test]
     fn a_multishot_source_queues_every_arrival_and_retires_on_eof() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(8, 64)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
             .make()
             .unwrap();
         ex.run(async {
@@ -2944,7 +2984,7 @@ mod tests {
     #[test]
     fn a_multishot_source_stops_with_enobufs_when_the_ring_runs_dry() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(2, 16)
+            .recv_buffers(crate::RecvBuffers::exact(2, 16))
             .make()
             .unwrap();
         ex.run(async {
@@ -2992,7 +3032,7 @@ mod tests {
     #[test]
     fn an_inline_reap_runs_pending_task_work() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(8, 64)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
             .preempt_timer(Duration::from_secs(10))
             .make()
             .unwrap();
@@ -3055,7 +3095,7 @@ mod tests {
     #[test]
     fn a_bundled_arrival_spans_buffers() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
-            .recv_buffers(8, 64)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
             .make()
             .unwrap();
         ex.run(async {
@@ -3128,14 +3168,7 @@ mod tests {
     fn timeout_smoke_test() {
         let notifier = sys::new_sleep_notifier().unwrap();
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
-        let reactor = Reactor::new(
-            notifier,
-            0,
-            128,
-            pool,
-            crate::executor::RecvBuffers::default(),
-        )
-        .unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
 
         fn timeout_source(millis: u64) -> (Source, UringOpDescriptor) {
             let source = Source::new(
@@ -3254,14 +3287,7 @@ mod tests {
         );
         let notifier = sys::new_sleep_notifier().unwrap();
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
-        let mut reactor = Reactor::new(
-            notifier,
-            0,
-            128,
-            pool,
-            crate::executor::RecvBuffers::default(),
-        )
-        .unwrap();
+        let mut reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
 
         let queues = [
             ("main", reactor.main_ring.get_mut().submission_queue()),

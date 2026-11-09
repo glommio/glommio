@@ -269,8 +269,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Use Rust MSRV
-        run: rustup override set 1.92.0
+      # loom is a cfg(loom) dependency that never reaches a consumer, and its
+      # tree moves ahead of the MSRV: generator 0.8.12 already needs 1.95.
+      - name: Use stable Rust
+        run: rustup override set stable
 
       - name: Cache setup
         uses: ./.github/actions/cache-setup

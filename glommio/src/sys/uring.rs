@@ -2854,12 +2854,19 @@ impl Reactor {
         }
     }
 
+    /// The socket ring reports under the latency ring, whose work it took
+    /// over, so [`IoStats`] keeps its three fields.
     pub fn io_stats(&self) -> IoStats {
+        let mut lat = std::mem::take(&mut self.latency_ring.borrow_mut().stats);
+        if let Some(sock) = &self.socket_ring {
+            let sock = std::mem::take(&mut sock.borrow_mut().stats);
+            lat = [&lat, &sock].into_iter().sum();
+        }
+        lat.recv_buffers_exhausted = self.recv_buffers_exhausted.take();
         IoStats::new(
             std::mem::take(&mut self.main_ring.borrow_mut().stats),
-            std::mem::take(&mut self.latency_ring.borrow_mut().stats),
+            lat,
             std::mem::take(&mut self.poll_ring.borrow_mut().stats),
-            self.recv_buffers_exhausted.take(),
         )
     }
 
@@ -2882,15 +2889,24 @@ impl Reactor {
             .task_queue_stats
             .get_mut(h)
             .map(std::mem::take);
+        let sock = self.socket_ring.as_ref().and_then(|ring| {
+            ring.borrow_mut()
+                .task_queue_stats
+                .get_mut(h)
+                .map(std::mem::take)
+        });
 
-        if let (None, None, None) = (&main, &lat, &poll) {
+        if let (None, None, None, None) = (&main, &lat, &poll, &sock) {
             None
         } else {
+            let lat = match (lat, sock) {
+                (Some(lat), Some(sock)) => [&lat, &sock].into_iter().sum(),
+                (lat, sock) => lat.or(sock).unwrap_or_default(),
+            };
             Some(IoStats::new(
                 main.unwrap_or_default(),
-                lat.unwrap_or_default(),
+                lat,
                 poll.unwrap_or_default(),
-                0,
             ))
         }
     }

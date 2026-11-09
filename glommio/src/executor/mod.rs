@@ -95,7 +95,7 @@ pub(crate) const DEFAULT_RECV_BUFFER_SIZE: usize = crate::net::Preallocated::DEF
 ///
 /// Whichever way, [`count`](Self::count) and [`size`](Self::size) say what
 /// was resolved, worth a line in the startup log, and
-/// [`IoStats::recv_buffers_exhausted`](crate::IoStats::recv_buffers_exhausted)
+/// [`RingIoStats::recv_buffers_exhausted`](crate::RingIoStats::recv_buffers_exhausted)
 /// says afterwards whether it was enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvBuffers {
@@ -826,10 +826,10 @@ impl LocalExecutorBuilder {
     /// it buys throughput with CPU the core would otherwise have idled, so
     /// measure before turning it on. [`RecvBuffers::for_connections`] does
     /// the arithmetic from the workload, [`RecvBuffers::budget`] from the
-    /// memory, and [`IoStats::recv_buffers_exhausted`] says afterwards
+    /// memory, and [`RingIoStats::recv_buffers_exhausted`] says afterwards
     /// whether the count was enough.
     ///
-    /// [`IoStats::recv_buffers_exhausted`]: crate::IoStats::recv_buffers_exhausted
+    /// [`RingIoStats::recv_buffers_exhausted`]: crate::RingIoStats::recv_buffers_exhausted
     ///
     /// [`TcpStream`]: crate::net::TcpStream
     /// [`UnixStream`]: crate::net::UnixStream

@@ -98,7 +98,11 @@ fn running_out_of_buffers_is_invisible_to_the_reader() {
         assert_eq!(&got, b"after");
         assert_eq!(buffers_held(), 0);
         assert!(
-            crate::executor().io_stats().recv_buffers_exhausted >= 1,
+            crate::executor()
+                .io_stats()
+                .all_rings()
+                .recv_buffers_exhausted()
+                >= 1,
             "running dry was not counted"
         );
     });
@@ -472,7 +476,10 @@ fn an_unread_connection_is_throttled_and_the_others_keep_their_buffers() {
             assert_eq!(got, [i; 32]);
         }
         assert_eq!(
-            crate::executor().io_stats().recv_buffers_exhausted,
+            crate::executor()
+                .io_stats()
+                .all_rings()
+                .recv_buffers_exhausted(),
             0,
             "the readers ran dry beside an unread connection"
         );

@@ -119,7 +119,7 @@ tail, no syscall.
 `budget(bytes)` from the memory to spend per executor, or `exact(count,
 size)` for a workload already measured. All three resolve to the same two
 numbers, readable back through `count()` and `size()` for the startup log,
-and `IoStats::recv_buffers_exhausted` counts, afterwards, every receive the
+and `RingIoStats::recv_buffers_exhausted` counts, afterwards, every receive the
 kernel ended for want of a buffer, which is the signal to raise the count. No one default fits a proxy pushing 64 KiB frames
 and a key-value store answering in 40 bytes, and the memory is per executor,
 so a pool of 64 shards multiplies it by 64. A builder that does not say gets

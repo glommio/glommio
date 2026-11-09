@@ -4186,7 +4186,6 @@ pub struct glommio::prelude::IoStats
 pub glommio::prelude::IoStats::latency_ring: glommio::RingIoStats
 pub glommio::prelude::IoStats::main_ring: glommio::RingIoStats
 pub glommio::prelude::IoStats::poll_ring: glommio::RingIoStats
-pub glommio::prelude::IoStats::recv_buffers_exhausted: u64
 impl glommio::IoStats
 pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
 impl core::fmt::Debug for glommio::IoStats
@@ -4430,6 +4429,7 @@ pub fn glommio::RingIoStats::files_opened(&self) -> u64
 pub fn glommio::RingIoStats::io_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
 pub fn glommio::RingIoStats::post_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
 pub fn glommio::RingIoStats::pre_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
+pub fn glommio::RingIoStats::recv_buffers_exhausted(&self) -> u64
 impl core::clone::Clone for glommio::RingIoStats
 pub fn glommio::RingIoStats::clone(&self) -> glommio::RingIoStats
 impl core::default::Default for glommio::RingIoStats
@@ -6120,7 +6120,6 @@ pub struct glommio::IoStats
 pub glommio::IoStats::latency_ring: glommio::RingIoStats
 pub glommio::IoStats::main_ring: glommio::RingIoStats
 pub glommio::IoStats::poll_ring: glommio::RingIoStats
-pub glommio::IoStats::recv_buffers_exhausted: u64
 impl glommio::IoStats
 pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
 impl core::fmt::Debug for glommio::IoStats
@@ -6488,6 +6487,7 @@ pub fn glommio::RingIoStats::files_opened(&self) -> u64
 pub fn glommio::RingIoStats::io_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
 pub fn glommio::RingIoStats::post_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
 pub fn glommio::RingIoStats::pre_reactor_io_scheduler_latency_us(&self) -> &sketches_ddsketch::ddsketch::DDSketch
+pub fn glommio::RingIoStats::recv_buffers_exhausted(&self) -> u64
 impl core::clone::Clone for glommio::RingIoStats
 pub fn glommio::RingIoStats::clone(&self) -> glommio::RingIoStats
 impl core::default::Default for glommio::RingIoStats

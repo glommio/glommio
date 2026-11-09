@@ -66,7 +66,12 @@ fn a_single_executor_takes_recv_buffers_and_reports_exhaustion() {
         .recv_buffers(RecvBuffers::exact(256, 16 * 1024))
         .make()
         .unwrap();
-    let exhausted = ex.run(async { glommio::executor().io_stats().recv_buffers_exhausted });
+    let exhausted = ex.run(async {
+        glommio::executor()
+            .io_stats()
+            .all_rings()
+            .recv_buffers_exhausted()
+    });
     assert_eq!(exhausted, 0);
 }
 

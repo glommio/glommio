@@ -197,9 +197,15 @@ mod mprotect {
 ///
 /// It issues a compiler fence, which disallows compiler optimizations across
 /// itself. It incurs basically no costs in run-time.
+///
+/// Under loom both barriers are a sequentially consistent fence, the closest
+/// thing loom models to a barrier that orders every thread at once.
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn light() {
+    if cfg!(loom) {
+        return super::sync::fence(atomic::Ordering::SeqCst);
+    }
     use self::Strategy::*;
     match *STRATEGY {
         Membarrier | Mprotect => atomic::compiler_fence(atomic::Ordering::SeqCst),
@@ -215,6 +221,9 @@ pub(crate) fn light() {
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn heavy() {
+    if cfg!(loom) {
+        return super::sync::fence(atomic::Ordering::SeqCst);
+    }
     use self::Strategy::*;
     match *STRATEGY {
         Membarrier => syscall::barrier(),

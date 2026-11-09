@@ -260,3 +260,24 @@ jobs:
 
       - name: Run public API compatibility test
         run: cargo test --package glommio --features version-compatibility public_api
+  loom:
+    name: Loom model checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # loom is a cfg(loom) dependency that never reaches a consumer, and its
+      # tree moves ahead of the MSRV: generator 0.8.12 already needs 1.95.
+      - name: Use stable Rust
+        run: rustup override set stable
+
+      - name: Cache setup
+        uses: ./.github/actions/cache-setup
+
+      - name: Run loom models
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --release --locked -p glommio --lib loom_tests

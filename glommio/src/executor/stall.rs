@@ -237,6 +237,8 @@ impl Drop for StallDetector {
     }
 }
 
+/// A signal can land after its guard has dropped, so each guard discards frames
+/// left from before it started and reports only a queue that ran over budget.
 pub(crate) struct StallDetectorGuard<'detector> {
     detector: &'detector StallDetector,
     queue_handle: TaskQueueHandle,
@@ -253,6 +255,7 @@ impl<'detector> StallDetectorGuard<'detector> {
         start: Instant,
         threshold: Duration,
     ) -> nix::Result<Self> {
+        while detector.rx.try_recv().is_ok() {}
         detector
             .arm(threshold)
             .expect("Unable to arm stall detector, giving up");
@@ -276,11 +279,11 @@ impl Drop for StallDetectorGuard<'_> {
         }
         let mut strace = backtrace::Backtrace::from(frames);
 
-        if strace.frames().is_empty() {
+        let elapsed = self.start.elapsed();
+        if strace.frames().is_empty() || elapsed < self.threshold {
             return;
         }
 
-        let elapsed = self.start.elapsed();
         strace.resolve();
         self.detector.stall_handler.stall(StallDetection {
             executor: self.detector.id,
@@ -297,7 +300,7 @@ impl Drop for StallDetectorGuard<'_> {
 mod test {
     use crate::{
         executor::{
-            stall::{StallDetection, StallDetectionHandler},
+            stall::{StallDetection, StallDetectionHandler, StallDetector},
             TaskQueueHandle,
         },
         timer::sleep,
@@ -306,7 +309,7 @@ mod test {
     use std::{
         sync::{Arc, RwLock},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[derive(Debug)]
@@ -492,5 +495,41 @@ mod test {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    /// A late signal is not reported against a queue within its budget.
+    fn late_signal_is_not_reported_against_a_queue_within_budget() {
+        let stall_handler = TestHandler::new(nix::libc::SIGUSR1 as u8);
+        LocalExecutorBuilder::default()
+            .detect_stalls(Some(Box::new(stall_handler.clone())))
+            .preempt_timer(Duration::from_millis(50))
+            .make()
+            .unwrap()
+            .run(async {
+                assert_eq!(unsafe { nix::libc::raise(nix::libc::SIGUSR1) }, 0);
+                crate::executor().yield_task_queue_now().await;
+                assert!(stall_handler.inner.read().unwrap().detections.is_empty());
+            });
+    }
+
+    #[test]
+    /// Frames from a signal outside any guard do not reach the next guard.
+    fn guard_starts_without_frames_from_an_earlier_signal() {
+        let handler = TestHandler::new(nix::libc::SIGUSR2 as u8);
+        let detector = StallDetector::new(0, Box::new(handler)).unwrap();
+        assert_eq!(unsafe { nix::libc::raise(nix::libc::SIGUSR2) }, 0);
+        assert!(!detector.rx.is_empty());
+
+        let guard = detector
+            .enter_task_queue(
+                TaskQueueHandle { index: 0 },
+                "queue".into(),
+                Instant::now(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(detector.rx.is_empty());
+        drop(guard);
     }
 }

@@ -168,6 +168,13 @@ impl BlockingThread {
     /// once every receiver has dropped, and a full bounded channel blocks
     /// instead of failing. Panicking there used to take the process with it
     /// under `panic = "abort"`.
+    ///
+    /// The loop does not guard against an unwinding operation, because none
+    /// can reach it. [`crate::executor::ExecutorProxy::spawn_blocking`]
+    /// catches where the closure is built, and the syscall operations answer
+    /// `EFAULT` rather than panicking. A guard here would have to assert
+    /// unwind safety over the caller's closure a second time, to protect
+    /// against something that cannot happen.
     pub(super) fn new(
         reactor_sleep_notifier: Arc<SleepNotifier>,
         rx: Arc<Receiver<BlockingThreadReq>>,

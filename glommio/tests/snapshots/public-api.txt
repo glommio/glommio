@@ -5068,8 +5068,8 @@ impl !core::marker::Send for glommio::timer::TimerActionRepeat
 impl !core::marker::Sync for glommio::timer::TimerActionRepeat
 impl core::marker::Unpin for glommio::timer::TimerActionRepeat
 impl core::marker::UnsafeUnpin for glommio::timer::TimerActionRepeat
-impl !core::panic::unwind_safe::RefUnwindSafe for glommio::timer::TimerActionRepeat
-impl !core::panic::unwind_safe::UnwindSafe for glommio::timer::TimerActionRepeat
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::timer::TimerActionRepeat
+impl core::panic::unwind_safe::UnwindSafe for glommio::timer::TimerActionRepeat
 impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::timer::TimerActionRepeat where ST: ?core::marker::Sized, DT: ?core::marker::Sized
 impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::timer::TimerActionRepeat where ST: ?core::marker::Sized, DT: ?core::marker::Sized
 impl<T, U> core::convert::Into<U> for glommio::timer::TimerActionRepeat where U: core::convert::From<T>

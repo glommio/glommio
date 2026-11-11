@@ -160,8 +160,15 @@ impl Reactor {
         ring_depth: usize,
         record_io_latencies: bool,
         blocking_thread: BlockingThreadPool,
+        recv_buffers: crate::executor::RecvBuffers,
     ) -> io::Result<Reactor> {
-        let sys = sys::Reactor::new(notifier, io_memory, ring_depth, blocking_thread)?;
+        let sys = sys::Reactor::new(
+            notifier,
+            io_memory,
+            ring_depth,
+            blocking_thread,
+            recv_buffers,
+        )?;
         let preempt_status = sys.preempt_status();
         Ok(Reactor {
             sys,
@@ -461,6 +468,47 @@ impl Reactor {
         self.sys.recv(&source, size, MsgFlags::empty());
         self.rush_dispatch(&source)?;
         Ok(source)
+    }
+
+    /// Arms a multishot receive on `fd`, or returns `None` when this
+    /// executor has no receive buffers or the kernel refused the flag.
+    /// `wanted` is how many bytes the owner can take at once, its own
+    /// buffer; the request is cancelled once it has queued more than that.
+    /// At least two kernel buffers, so a bundle can always land. One bundle
+    /// can still overshoot by what the socket held at that moment, which
+    /// the kernel bounds by the socket's receive queue, not by this.
+    pub(crate) fn recv_multi(&self, fd: RawFd, wanted: usize) -> Option<Source> {
+        let buffers = self.sys.recv_buffers()?;
+        let bundle = self.sys.recv_multi_bundles();
+        let ceiling = wanted.max(2 * buffers.borrow().size());
+        let source = self.new_source(
+            fd,
+            SourceType::RecvMulti(sys::RecvMultiState::new(buffers, bundle, ceiling)),
+            None,
+        );
+        self.sys.recv_multi(&source, bundle);
+        Some(source)
+    }
+
+    /// The kernel answered a multishot receive with EINVAL. If it was asking
+    /// for bundles, those are given up and the plain form is tried; if not,
+    /// multishot itself is given up on this executor.
+    pub(crate) fn refuse_recv_multi(&self, was_bundled: bool) {
+        if was_bundled {
+            self.sys.refuse_bundle()
+        } else {
+            self.sys.refuse_recv_multi()
+        }
+    }
+
+    /// See [`sys::Reactor::note_recv_buffers_exhausted`].
+    pub(crate) fn note_recv_buffers_exhausted(&self) {
+        self.sys.note_recv_buffers_exhausted()
+    }
+
+    /// See [`sys::Reactor::reap_socket_completions`].
+    pub(crate) fn reap_socket_completions(&self) -> io::Result<usize> {
+        self.sys.reap_socket_completions()
     }
 
     /// A completion-based read into `buffer`, which stays in the `Source`

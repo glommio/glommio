@@ -459,7 +459,8 @@ pub use crate::{
         stall::{DefaultStallDetectionHandler, StallDetection, StallDetectionHandler},
         yield_if_needed, CpuSet, ExecutorJoinHandle, ExecutorProxy, ExecutorStats, LocalExecutor,
         LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
-        PoolThreadHandles, ScopedTask, Task, TaskQueueHandle, TaskQueueStats,
+        PoolThreadHandles, RecvBuffers, RecvBuffersShape, ScopedTask, Task, TaskQueueHandle,
+        TaskQueueStats,
     },
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,
@@ -606,6 +607,7 @@ pub struct RingIoStats {
     pub(crate) file_bytes_written: u64,
     pub(crate) file_buffered_writes: u64,
     pub(crate) file_buffered_bytes_written: u64,
+    pub(crate) recv_buffers_exhausted: u64,
 
     pub(crate) pre_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch,
     pub(crate) io_latency_us: sketches_ddsketch::DDSketch,
@@ -627,6 +629,7 @@ impl Default for RingIoStats {
             file_bytes_written: 0,
             file_buffered_writes: 0,
             file_buffered_bytes_written: 0,
+            recv_buffers_exhausted: 0,
             pre_reactor_io_scheduler_latency_us: sketches_ddsketch::DDSketch::new(
                 sketches_ddsketch::Config::new(0.01, 2048, 1.0e-9),
             ),
@@ -658,6 +661,7 @@ impl Debug for RingIoStats {
                 "file_buffered_bytes_written",
                 &self.file_buffered_bytes_written,
             )
+            .field("recv_buffers_exhausted", &self.recv_buffers_exhausted)
             .finish_non_exhaustive()
     }
 }
@@ -744,6 +748,19 @@ impl RingIoStats {
     pub fn post_reactor_io_scheduler_latency_us(&self) -> &DDSketch {
         &self.post_reactor_io_scheduler_latency_us
     }
+
+    /// How many times a multishot receive ran out of
+    /// [`RecvBuffers`] and had to be re-armed, since the stats were last
+    /// taken. Each costs a submission and a plain read; a steady rate says
+    /// the count is too small for the connections and their arrivals.
+    /// Counted for the executor as a whole and reported under
+    /// [`IoStats::latency_ring`]: the reactor cannot say which task queue
+    /// a receive belongs to, so
+    /// [`task_queue_io_stats`](crate::ExecutorProxy::task_queue_io_stats)
+    /// reports zero here.
+    pub fn recv_buffers_exhausted(&self) -> u64 {
+        self.recv_buffers_exhausted
+    }
 }
 
 impl<'a> Sum<&'a RingIoStats> for RingIoStats {
@@ -761,6 +778,7 @@ impl<'a> Sum<&'a RingIoStats> for RingIoStats {
             a.file_bytes_written += b.file_bytes_written;
             a.file_buffered_writes += b.file_buffered_writes;
             a.file_buffered_bytes_written += b.file_buffered_bytes_written;
+            a.recv_buffers_exhausted += b.recv_buffers_exhausted;
             a.pre_reactor_io_scheduler_latency_us
                 .merge(&b.pre_reactor_io_scheduler_latency_us)
                 .unwrap();

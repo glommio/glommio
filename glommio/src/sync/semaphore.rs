@@ -14,6 +14,7 @@ use std::{
 use intrusive_collections::{
     container_of, linked_list::LinkOps, offset_of, Adapter, LinkedList, LinkedListLink, PointerOps,
 };
+use smallvec::SmallVec;
 use std::{marker::PhantomPinned, ptr::NonNull, rc::Rc};
 
 type Result<T> = crate::error::Result<T, ()>;
@@ -176,7 +177,7 @@ impl Future for Waiter<'_> {
 
         let waiter_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
 
-        waiter_node.woken.set(false);
+        let was_woken = waiter_node.woken.replace(false);
         let units = waiter_node.units;
         match sem_state.try_acquire(units) {
             Err(x) => {
@@ -189,6 +190,10 @@ impl Future for Waiter<'_> {
             }
             Ok(false) => {
                 Self::register_in_waiting_queue(waiter_node, &mut sem_state, cx.waker().clone());
+                drop(sem_state);
+                if was_woken {
+                    process_wakes(future_mut.semaphore, 0);
+                }
                 Poll::Pending
             }
         }
@@ -230,21 +235,21 @@ impl SemaphoreState {
         Ok(false)
     }
 
-    fn close(&mut self) {
+    /// Unlinks every waiter and returns their wakers, to be woken once the
+    /// state is no longer borrowed.
+    fn close(&mut self) -> Vec<Waker> {
         self.closed = true;
 
+        let mut wakers = Vec::new();
         let mut cursor = self.waiters_list.front_mut();
         while !cursor.is_null() {
             let node = cursor.remove().unwrap();
 
             let node = unsafe { Pin::new_unchecked(&*node.as_ptr()) };
             let waker = node.waker.borrow_mut().take();
-            if let Some(waker) = waker {
-                waker.wake();
-            } else {
-                panic!("Future is linked into the waiting list without a waker");
-            }
+            wakers.push(waker.expect("Future is linked into the waiting list without a waker"));
         }
+        wakers
     }
 
     fn signal(&mut self, units: u64) {
@@ -304,42 +309,38 @@ impl Drop for StaticPermit {
     }
 }
 
+/// Wakes the waiters the available units can satisfy, front to back. Each is
+/// unlinked before any is woken, and woken only once the state is no longer
+/// borrowed, so a waker can neither leave its waiter linked nor find the
+/// semaphore borrowed.
 fn process_wakes(sem: &Semaphore, units: u64) {
-    let mut state = sem.state.borrow_mut();
-    state.signal(units);
+    let mut wakers = SmallVec::<[Waker; 4]>::new();
+    {
+        let mut state = sem.state.borrow_mut();
+        state.signal(units);
 
-    let mut available_units = state.avail;
+        let mut available_units = state.avail;
 
-    let mut cursor = state.waiters_list.front_mut();
+        let mut cursor = state.waiters_list.front_mut();
 
-    //only tasks which will be able to proceed will be awaken
-    while available_units > 0 {
-        let mut waker = None;
-        if let Some(node) = cursor.get() {
-            let node = unsafe { Pin::new_unchecked(node) };
-
+        while available_units > 0 {
+            let Some(node) = cursor.get() else {
+                break;
+            };
             if node.units <= available_units {
-                let w = node.waker.borrow_mut().take();
-
-                if w.is_some() {
-                    waker = w;
-                } else {
-                    panic!("Future was linked into the waiting list without a waker");
-                }
-
-                node.woken.set(true);
                 available_units -= node.units;
+                node.woken.set(true);
+                let waker = node.waker.borrow_mut().take();
+                wakers
+                    .push(waker.expect("Future was linked into the waiting list without a waker"));
+                cursor.remove();
+            } else {
+                cursor.move_next();
             }
-        } else {
-            break;
         }
-
-        if let Some(waker) = waker {
-            waker.wake();
-            cursor.remove();
-        } else {
-            cursor.move_next();
-        }
+    }
+    for waker in wakers {
+        waker.wake();
     }
 }
 
@@ -679,8 +680,10 @@ impl Semaphore {
     /// });
     /// ```
     pub fn close(&self) {
-        let mut state = self.state.borrow_mut();
-        state.close();
+        let wakers = self.state.borrow_mut().close();
+        for waker in wakers {
+            waker.wake();
+        }
     }
 }
 
@@ -968,6 +971,97 @@ mod test {
         fn wake(self: Arc<Self>) {
             self.0.store(true, Ordering::Relaxed);
         }
+    }
+
+    fn flagged() -> (Arc<WakeFlag>, Waker) {
+        let flag = Arc::new(WakeFlag::default());
+        (flag.clone(), Waker::from(flag))
+    }
+
+    /// Guards against a woken waiter that cannot take its units going back
+    /// to sleep with the wakeup, while a waiter it could have handed it to
+    /// sleeps on.
+    #[test]
+    fn a_woken_waiter_that_sleeps_again_passes_the_wakeup_on() {
+        let sem = Semaphore::new(0);
+        let mut noop = Context::from_waker(Waker::noop());
+        let mut one = Box::pin(sem.acquire(1));
+        let mut two = Box::pin(sem.acquire(2));
+        let mut third = Box::pin(sem.acquire(1));
+        let (woken, waker) = flagged();
+        assert!(one.as_mut().poll(&mut noop).is_pending());
+        assert!(two.as_mut().poll(&mut noop).is_pending());
+        assert!(third
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        sem.signal(1);
+        sem.signal(1);
+        assert!(one.as_mut().poll(&mut noop).is_ready());
+        assert!(two.as_mut().poll(&mut noop).is_pending());
+        assert!(
+            woken.0.load(Ordering::Relaxed),
+            "a unit is free and the third waiter was never woken"
+        );
+    }
+
+    struct Panics;
+
+    impl Wake for Panics {
+        fn wake(self: Arc<Self>) {
+            panic!("this waker panics");
+        }
+    }
+
+    /// Guards against a waker that panics leaving its waiter linked, so
+    /// that dropping the waiter freed a node still in the list.
+    #[test]
+    fn a_panicking_waker_leaves_no_waiter_linked() {
+        let sem = Semaphore::new(0);
+        let mut waiter = Box::pin(sem.acquire(1));
+        let waker = Waker::from(Arc::new(Panics));
+        assert!(waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        let signalled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sem.signal(1)));
+        assert!(signalled.is_err());
+        drop(waiter);
+        assert!(
+            sem.state.borrow().waiters_list.is_empty(),
+            "a dropped waiter is still linked"
+        );
+    }
+
+    thread_local! {
+        static WATCHED: RefCell<Option<Rc<Semaphore>>> = const { RefCell::new(None) };
+    }
+
+    struct LooksAtTheSemaphore;
+
+    impl Wake for LooksAtTheSemaphore {
+        fn wake(self: Arc<Self>) {
+            WATCHED.with(|s| s.borrow().as_ref().unwrap().available());
+        }
+    }
+
+    /// Guards against waking while the semaphore is still borrowed, which
+    /// made a waker that looks at the semaphore panic.
+    #[test]
+    fn a_waker_can_look_at_the_semaphore() {
+        let sem = Rc::new(Semaphore::new(0));
+        WATCHED.with(|s| *s.borrow_mut() = Some(sem.clone()));
+        let waker = Waker::from(Arc::new(LooksAtTheSemaphore));
+        let mut cx = Context::from_waker(&waker);
+        let mut signalled = Box::pin(sem.acquire(1));
+        assert!(signalled.as_mut().poll(&mut cx).is_pending());
+        sem.signal(1);
+        assert!(signalled.as_mut().poll(&mut cx).is_ready());
+        let mut closed = Box::pin(sem.acquire(1));
+        assert!(closed.as_mut().poll(&mut cx).is_pending());
+        sem.close();
+        assert!(closed.as_mut().poll(&mut cx).is_ready());
+        WATCHED.with(|s| s.borrow_mut().take());
     }
 
     #[test]

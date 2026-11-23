@@ -83,7 +83,7 @@ impl AdvisoryLockStateHolder {
 
     fn mark_locking<'a>(&'a self, file: &Path) -> Result<AdvisoryLockStateGuard<'a>> {
         self.state
-            .compare_exchange_weak(
+            .compare_exchange(
                 AdvisoryLockState::Unlocked as u8,
                 AdvisoryLockState::Locking as u8,
                 std::sync::atomic::Ordering::Relaxed,
@@ -105,7 +105,7 @@ impl AdvisoryLockStateHolder {
 
     fn abort_locking(&self) {
         self.state
-            .compare_exchange_weak(
+            .compare_exchange(
                 AdvisoryLockState::Locking as u8,
                 AdvisoryLockState::Unlocked as u8,
                 std::sync::atomic::Ordering::Relaxed,
@@ -116,7 +116,7 @@ impl AdvisoryLockStateHolder {
 
     fn mark_locked(&self) {
         self.state
-            .compare_exchange_weak(
+            .compare_exchange(
                 AdvisoryLockState::Locking as u8,
                 AdvisoryLockState::Locked as u8,
                 std::sync::atomic::Ordering::Relaxed,
@@ -127,7 +127,7 @@ impl AdvisoryLockStateHolder {
 
     fn unlock(&self) {
         self.state
-            .compare_exchange_weak(
+            .compare_exchange(
                 AdvisoryLockState::Locked as u8,
                 AdvisoryLockState::Unlocked as u8,
                 std::sync::atomic::Ordering::Relaxed,
@@ -735,14 +735,14 @@ impl WeakGlommioFile {
         self.fd.strong_count()
     }
 
+    /// The lock state is upgraded first: the last owner can release it
+    /// before the fd, so an fd upgraded first could find it already gone.
     pub(crate) fn upgrade(&self) -> Option<OwnedGlommioFile> {
-        self.fd.upgrade().map(|fd| OwnedGlommioFile {
+        let lock_state = self.lock_state.upgrade()?;
+        let fd = self.fd.upgrade()?;
+        Some(OwnedGlommioFile {
             fd: Some(fd),
-            lock_state: Some(
-                self.lock_state
-                    .upgrade()
-                    .expect("If the FD is live then so should the advisory lock state be"),
-            ),
+            lock_state: Some(lock_state),
             path: self.path.clone(),
             inode: self.inode,
             dev_major: self.dev_major,
@@ -813,5 +813,48 @@ pub(crate) mod test {
             .filter_map(|f| std::fs::canonicalize(f.unwrap().path()).ok())
             .any(|f| f == path);
         assert!(!still_open, "file is gone");
+    }
+
+    #[test]
+    fn lock_state_transitions_do_not_fail_spuriously() {
+        let holder = AdvisoryLockStateHolder::default();
+        let path = Path::new("file");
+        for _ in 0..64 {
+            holder.mark_locking(path).unwrap().commit();
+            holder.unlock();
+            drop(holder.mark_locking(path).unwrap());
+        }
+        assert_eq!(holder.state(), AdvisoryLockState::Unlocked);
+    }
+
+    #[test]
+    fn upgrade_while_the_last_owner_discards() {
+        for _ in 0..32 {
+            let file = GlommioFile {
+                file: Some(Arc::new(OwnedFd::from(
+                    std::fs::File::open("/dev/null").unwrap(),
+                ))),
+                lock_state: Some(Arc::default()),
+                path: RefCell::new(None),
+                inode: 0,
+                dev_major: 0,
+                dev_minor: 0,
+                reactor: Weak::new(),
+                scheduler: RefCell::new(None),
+            };
+            let weak = file.downgrade();
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let upgrader = std::thread::spawn({
+                let start = start.clone();
+                move || {
+                    start.wait();
+                    drop(weak.upgrade())
+                }
+            });
+            start.wait();
+            let (fd, _) = file.discard();
+            upgrader.join().unwrap();
+            drop(fd.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
     }
 }

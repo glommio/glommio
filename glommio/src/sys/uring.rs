@@ -2276,7 +2276,8 @@ fn queue_request_into_ring(
     }
 }
 
-/// Closes the descriptors `async_close` queued that never reached a ring.
+/// Closes the descriptors whose close never reached a ring. Whoever queued
+/// a close has already given the descriptor up, so nothing else will.
 impl Drop for Reactor {
     fn drop(&mut self) {
         let queues = [
@@ -2286,7 +2287,7 @@ impl Drop for Reactor {
         ];
         for queue in queues {
             for op in queue.borrow().submissions.iter() {
-                if let (UringOpDescriptor::Close, 0) = (&op.args, op.user_data) {
+                if let UringOpDescriptor::Close = &op.args {
                     let _ = nix::unistd::close(op.fd);
                 }
             }

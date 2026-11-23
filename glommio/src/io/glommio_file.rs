@@ -785,6 +785,28 @@ pub(crate) mod test {
         });
     }
 
+    /// Guards against a cancelled `close()` still queued when its executor
+    /// exits being dropped with the reactor instead of closed.
+    #[test]
+    fn a_cancelled_close_is_closed_when_the_executor_exits() {
+        let dir = make_tmp_test_directory("a_cancelled_close_is_closed_when_the_executor_exits");
+        let path = std::fs::canonicalize(&dir.path).unwrap().join("file");
+        let opened = path.clone();
+        crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let file = GlommioFile::open_at(-1, &opened, libc::O_CREAT | libc::O_RDWR, 0o644)
+                    .await
+                    .unwrap();
+                let close = file.close();
+                futures_lite::pin!(close);
+                assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(open_fds_on(&path), 0, "the queued close was dropped");
+    }
+
     /// Guards against an open that completed after its future was polled for
     /// the last time leaking the descriptor it created.
     #[test]

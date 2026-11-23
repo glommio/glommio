@@ -765,11 +765,20 @@ where
             return Some(false);
         }
 
-        let src = source_map
-            .borrow_mut()
-            .consume_source(from_user_data(value.user_data()));
+        let id = from_user_data(value.user_data());
+        let orphaned = matches!(
+            source_map.borrow()[id].borrow().enqueued,
+            Some(EnqueuedSource {
+                status: EnqueuedStatus::Canceled,
+                ..
+            })
+        );
+        let src = source_map.borrow_mut().consume_source(id);
 
         let result = value.result();
+        if orphaned && result >= 0 && src.borrow().source_type.creates_fd() {
+            super::source::close_orphaned_fd(result as usize);
+        }
 
         let mut woke = false;
         if try_process(src.borrow()).is_none() {

@@ -220,7 +220,7 @@ impl GlommioFile {
         };
 
         let source = reactor.open_at(dir, &path, flags, mode);
-        let fd = source.collect_rw().await?;
+        let fd = source.collect_fd().await?;
 
         let mut file = GlommioFile {
             file: Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as _) })),
@@ -756,6 +756,53 @@ pub(crate) mod test {
     use super::*;
     use crate::{test_utils::*, timer::sleep};
     use std::time::Duration;
+
+    fn open_fds_on(path: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|f| std::fs::canonicalize(f.unwrap().path()).ok())
+            .filter(|f| f == path)
+            .count()
+    }
+
+    /// Guards against a `close()` dropped before submission never closing.
+    #[test]
+    fn a_cancelled_close_still_closes_the_file() {
+        test_executor!(async move {
+            let dir = make_tmp_test_directory("a_cancelled_close_still_closes_the_file");
+            let path = std::fs::canonicalize(&dir.path).unwrap().join("file");
+            let file = GlommioFile::open_at(-1, &path, libc::O_CREAT | libc::O_RDWR, 0o644)
+                .await
+                .unwrap();
+            assert_eq!(open_fds_on(&path), 1);
+            {
+                let close = file.close();
+                futures_lite::pin!(close);
+                assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+            }
+            sleep(Duration::from_millis(20)).await;
+            assert_eq!(open_fds_on(&path), 0, "the cancelled close leaked the fd");
+        });
+    }
+
+    /// Guards against an open that completed after its future was polled for
+    /// the last time leaking the descriptor it created.
+    #[test]
+    fn a_cancelled_open_does_not_leak_the_new_fd() {
+        test_executor!(async move {
+            let dir = make_tmp_test_directory("a_cancelled_open_does_not_leak_the_new_fd");
+            let path = std::fs::canonicalize(&dir.path).unwrap().join("file");
+            std::fs::write(&path, b"hello").unwrap();
+            {
+                let open = GlommioFile::open_at(-1, &path, libc::O_RDONLY, 0);
+                futures_lite::pin!(open);
+                assert!(futures_lite::future::poll_once(&mut open).await.is_none());
+                sleep(Duration::from_millis(20)).await;
+            }
+            sleep(Duration::from_millis(20)).await;
+            assert_eq!(open_fds_on(&path), 0, "the cancelled open leaked the fd");
+        });
+    }
 
     /// The `let _ = { gf };` moves scope and drops, and the sleep forces the
     /// reactor to run, which will drop the file.

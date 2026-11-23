@@ -185,7 +185,7 @@ impl TcpListener {
     ///
     /// [`shared_accept`]: TcpListener::shared_accept
     pub fn poll_shared_accept(&self, cx: &mut Context<'_>) -> Poll<Result<AcceptedTcpStream>> {
-        let mut poll_source = |source: Source| match source.poll_collect_rw(cx) {
+        let mut poll_source = |source: Source| match source.poll_collect_fd(cx) {
             Poll::Ready(Ok(fd)) => Poll::Ready(Ok(AcceptedTcpStream { fd: fd as RawFd })),
             Poll::Ready(Err(err)) => Poll::Ready(Err(GlommioError::IoError(err))),
             Poll::Pending => {

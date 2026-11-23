@@ -18,7 +18,7 @@ use std::{
     ffi::CString,
     fmt,
     mem::MaybeUninit,
-    os::unix::io::RawFd,
+    os::unix::io::{FromRawFd, OwnedFd, RawFd},
     path::PathBuf,
     pin::Pin,
     rc::Rc,
@@ -70,6 +70,21 @@ pub(crate) enum SourceType {
     CopyFileRange(RawFd, u64, usize),
     #[cfg(feature = "bench")]
     Noop,
+}
+
+impl SourceType {
+    /// Whether a successful completion is a new file descriptor, which must
+    /// be closed if nobody is left to take it.
+    pub(crate) fn creates_fd(&self) -> bool {
+        matches!(self, SourceType::Open(_) | SourceType::Accept(_))
+    }
+}
+
+/// Closes a descriptor the kernel created for an operation whose owner is
+/// gone. Nothing else can hold it: only `collect_fd` hands one out, and it
+/// never ran.
+pub(crate) fn close_orphaned_fd(fd: usize) {
+    drop(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
 }
 
 impl TryFrom<SourceType> for Statx {
@@ -313,6 +328,20 @@ impl Source {
         future::poll_fn(|cx| self.poll_collect_rw(cx)).await
     }
 
+    /// Like [`collect_rw`](Self::collect_rw), for an operation that creates
+    /// a file descriptor: the caller owns the one returned, and a source
+    /// dropped without returning one closes it.
+    pub(crate) async fn collect_fd(&self) -> io::Result<RawFd> {
+        future::poll_fn(|cx| self.poll_collect_fd(cx)).await
+    }
+
+    /// Poll version of [`collect_fd`](Self::collect_fd).
+    pub(crate) fn poll_collect_fd(&self, cx: &mut Context<'_>) -> Poll<io::Result<RawFd>> {
+        let result = futures_lite::ready!(self.poll_collect_rw(cx));
+        self.inner.borrow_mut().wakers.result = None;
+        Poll::Ready(result.map(|fd| fd as RawFd))
+    }
+
     pub(crate) fn poll_collect_rw(&self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         if let Some(result) = self.result() {
             return Poll::Ready(result);
@@ -335,11 +364,21 @@ impl Drop for Source {
     ///   might be using the buffers right now, so `consume_source` is delayed
     ///   until the corresponding event is consumed from the completion queue.
     ///   Marking it `Canceled` is not necessary, but useful for correctness.
+    /// * A close is never cancelled: the descriptor is no longer owned by
+    ///   anything else, so this is the last chance to close it.
+    /// * A completed operation that created a descriptor nobody collected
+    ///   closes it.
     fn drop(&mut self) {
         let mut inner = self.inner.borrow_mut();
-        let enqueued = inner.enqueued.as_mut();
-        if let Some(EnqueuedSource { id, queue, status }) = enqueued {
-            match status {
+        let InnerSource {
+            enqueued,
+            source_type,
+            wakers,
+            ..
+        } = &mut *inner;
+        match enqueued.as_mut() {
+            Some(_) if matches!(source_type, SourceType::Close) => {}
+            Some(EnqueuedSource { id, queue, status }) => match status {
                 EnqueuedStatus::Enqueued => {
                     *status = EnqueuedStatus::Canceled;
                 }
@@ -348,7 +387,13 @@ impl Drop for Source {
                     *status = EnqueuedStatus::Canceled;
                 }
                 EnqueuedStatus::Canceled => unreachable!(),
+            },
+            None if source_type.creates_fd() => {
+                if let Some(Ok(fd)) = wakers.result.take() {
+                    close_orphaned_fd(fd);
+                }
             }
+            None => {}
         }
     }
 }

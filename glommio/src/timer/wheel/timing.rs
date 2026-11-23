@@ -546,8 +546,14 @@ impl<T, P: Policy> TimingWheel<T, P> {
     }
 
     /// The next tick at or before `limit` at which the wheel has work: the
-    /// finest level's next occupied slot, or the boundary where an occupied
-    /// coarser level breaks down.
+    /// finest level's next occupied slot, or the boundary where a coarser
+    /// level's next occupied slot breaks down.
+    ///
+    /// The search at a coarse level starts one past the cursor, as in
+    /// `next_in_level`: the cursor's own slot holds entries a revolution
+    /// ahead, which break down when the cursor comes round to it again.
+    /// The search is skipped when even the next boundary lies past `limit`,
+    /// which is every call that does not cross one.
     fn next_work_tick(&self, limit: u64) -> Option<u64> {
         let finest = &self.levels[0];
         let from = ((self.current_tick + 1) & finest.wrap as u64) as usize;
@@ -557,10 +563,20 @@ impl<T, P: Policy> TimingWheel<T, P> {
             .map(|offset| self.current_tick + 1 + offset as u64);
 
         let cascade = (1..self.levels.len())
-            .filter(|level| !self.levels[*level].mask.is_empty())
-            .map(|level| {
-                let span = 1u64 << self.levels[level].shift;
-                (self.current_tick / span + 1) * span
+            .filter_map(|level| {
+                let l = &self.levels[level];
+                if l.mask.is_empty() {
+                    return None;
+                }
+                let cursor = self.current_tick >> l.shift;
+                let boundary = (cursor + 1) << l.shift;
+                if boundary > limit {
+                    return Some(boundary);
+                }
+                let from = ((cursor + 1) as usize) & l.wrap;
+                l.mask
+                    .distance_to_next(from)
+                    .map(|offset| (cursor + 1 + offset as u64) << l.shift)
             })
             .min();
 
@@ -839,6 +855,32 @@ mod tests {
     #[test]
     fn an_entry_rounding_to_the_reach_waits_in_overflow() {
         overflow_stays_put_until_its_tick_is_in_reach::<Closest>(Duration::from_micros(250));
+    }
+
+    #[test]
+    fn idling_skips_to_the_occupied_coarse_slot() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        wheel.insert(start + ms(10 * 3_600_000), ());
+        assert_eq!(wheel.next_work_tick(u64::MAX), Some(34 << 20));
+
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        wheel.insert(start + ms(10_000), ());
+        assert_eq!(wheel.next_work_tick(u64::MAX), Some(39 << 8));
+    }
+
+    #[test]
+    fn a_coarse_slot_a_revolution_ahead_breaks_down_when_the_cursor_returns() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        wheel.advance_to(start + ms(100));
+        let key = wheel.insert(start + ms(16_400), ());
+        assert_eq!(slot_of(&wheel, key), (1, 0));
+        assert_eq!(wheel.next_work_tick(u64::MAX), Some(64 << 8));
+
+        wheel.advance_to(start + ms(16_400));
+        let fired: Vec<Key> = wheel.drain_expired().map(|(key, ())| key).collect();
+        assert_eq!(fired, vec![key]);
     }
 
     #[test]

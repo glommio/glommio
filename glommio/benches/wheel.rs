@@ -141,6 +141,34 @@ fn idle_gap(c: &mut Criterion) {
     group.finish();
 }
 
+/// Waking after a long idle, with one entry a coarse level holds far beyond it.
+///
+/// The empty boundaries crossed on the way carry no work, so the cost should
+/// not grow with how many there are.
+fn idle_past_empty_boundaries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("idle_past_empty_boundaries");
+    for &(label, idle_ms, parked_ms) in &[
+        ("level2_60s", 60_000u64, 1_000_000u64),
+        ("level3_9h", 32_400_000, 36_000_000),
+    ] {
+        group.bench_function(label, |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let start = Instant::now();
+                    let mut wheel: TimingWheel<usize, Millis> = TimingWheel::starting_at(start);
+                    wheel.insert(start + Duration::from_millis(parked_ms), 0);
+                    let began = Instant::now();
+                    wheel.advance_to(black_box(start + Duration::from_millis(idle_ms)));
+                    total += began.elapsed();
+                }
+                total
+            })
+        });
+    }
+    group.finish();
+}
+
 /// A poll that finds nothing due, with `n` entries a whole revolution ahead in
 /// the slot a coarse level's cursor sits on.
 ///
@@ -433,6 +461,7 @@ criterion_group!(
     next_expiry,
     cancel_with_query,
     idle_gap,
+    idle_past_empty_boundaries,
     advance_beside_wrapped
 );
 criterion_main!(benches);

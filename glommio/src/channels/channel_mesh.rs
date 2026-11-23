@@ -375,6 +375,7 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 state.ready = true;
             }
         } else {
+            let registration = scopeguard::guard((), |()| self.withdraw(exec_id));
             // Wait until last joiner finishes building
             loop {
                 let ready = {
@@ -388,6 +389,7 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
 
                 futures_lite::future::yield_now().await;
             }
+            scopeguard::ScopeGuard::into_inner(registration);
         }
 
         let state = self.state.lock().unwrap();
@@ -404,6 +406,37 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
             .count();
 
         Ok((peer_id, role_id))
+    }
+
+    /// Takes back the registration of a join dropped while waiting for the
+    /// mesh to fill: the seat is freed if the mesh is not complete yet, and
+    /// otherwise the peer's channels are dropped so the others see them
+    /// closed. A poisoned mesh is left as it is.
+    fn withdraw(&self, exec_id: usize) {
+        let (senders, receivers): (Vec<_>, Vec<_>) = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let Ok(index) = state
+                .peers
+                .binary_search_by(|p| p.executor_id.cmp(&exec_id))
+            else {
+                return;
+            };
+            if !state.ready {
+                state.peers.remove(index);
+                return;
+            }
+            (0..self.nr_peers)
+                .map(|i| {
+                    (
+                        state.senders[index][i].take(),
+                        state.receivers[i][index].take(),
+                    )
+                })
+                .unzip()
+        };
+        drop((senders, receivers));
     }
 
     async fn join_with(self, role: Role) -> Result<(Senders<T>, Receivers<T>), ()> {
@@ -487,6 +520,74 @@ mod tests {
     use crate::{enclose, prelude::*};
 
     use super::*;
+
+    fn join_within(
+        mesh: MeshBuilder<u32, Full>,
+    ) -> impl std::future::Future<Output = Result<(), ()>> {
+        crate::timer::timeout(std::time::Duration::from_secs(2), async move {
+            mesh.join().await.map(drop)
+        })
+    }
+
+    /// Guards against a cancelled join keeping its seat, so the peer can
+    /// never join again.
+    #[test]
+    fn a_peer_can_rejoin_after_cancelling_its_join() {
+        let mesh = MeshBuilder::<u32, _>::full(2, 4);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let a = LocalExecutorBuilder::default()
+            .spawn(enclose! { (mesh) move || async move {
+                {
+                    let join = mesh.clone().join();
+                    futures_lite::pin!(join);
+                    assert!(futures_lite::future::poll_once(&mut join).await.is_none());
+                }
+                cancelled_tx.send(()).unwrap();
+                join_within(mesh).await.expect("the rejoin failed");
+            }})
+            .unwrap();
+        let b = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                cancelled_rx.recv().unwrap();
+                join_within(mesh)
+                    .await
+                    .expect("the other peer never joined");
+            })
+            .unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+    }
+
+    /// Guards against a join cancelled after the mesh filled leaving the
+    /// other peers waiting forever on channels nobody will connect.
+    #[test]
+    fn a_join_cancelled_after_the_mesh_filled_does_not_strand_the_others() {
+        let mesh = MeshBuilder::<u32, _>::full(2, 4);
+        let (registered_tx, registered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let a = LocalExecutorBuilder::default()
+            .spawn(enclose! { (mesh) move || async move {
+                {
+                    let join = mesh.join();
+                    futures_lite::pin!(join);
+                    assert!(futures_lite::future::poll_once(&mut join).await.is_none());
+                    registered_tx.send(()).unwrap();
+                    crate::timer::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                done_rx.recv().unwrap();
+            }})
+            .unwrap();
+        let b = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                registered_rx.recv().unwrap();
+                let joined = join_within(mesh).await;
+                done_tx.send(()).unwrap();
+                joined.expect("stranded by the cancelled join");
+            })
+            .unwrap();
+        b.join().unwrap();
+        a.join().unwrap();
+    }
 
     #[test]
     fn test_channel_mesh() {

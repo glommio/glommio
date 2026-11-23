@@ -946,7 +946,9 @@ pub(crate) trait UringCommon {
     fn flush_cancellations(&mut self, woke: &mut usize) {
         let mut cnt = 0;
         loop {
-            if self.consume_cancellation_queue().is_ok() {
+            if self.consume_cancellation_queue().is_ok()
+                && self.submission_queue().borrow().cancellations.is_empty()
+            {
                 break;
             }
             self.consume_completion_queue(woke);
@@ -1304,6 +1306,12 @@ impl SleepableRing {
                     .push(&entry)
                     .expect("submission queue was checked to have room");
             }
+            link.inner
+                .borrow_mut()
+                .enqueued
+                .as_mut()
+                .expect("the source was added to the map above")
+                .status = EnqueuedStatus::Dispatched;
 
             if self
                 .submit_sqes()
@@ -2357,6 +2365,100 @@ mod tests {
             _ => "seccomp",
         };
         assert!(err.contains(expected), "{err}");
+    }
+
+    #[test]
+    fn cancellations_beyond_one_ring_flush_together() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+
+        let timers: Vec<Source> = (0..3 * 128)
+            .map(|_| {
+                let timer = Source::new(
+                    IoRequirements::default(),
+                    -1,
+                    SourceType::Timeout(TimeSpec64::try_from(Duration::from_secs(60)).unwrap(), 0),
+                    None,
+                    None,
+                );
+                let op = match &*timer.source_type() {
+                    SourceType::Timeout(ts, events) => {
+                        UringOpDescriptor::Timeout(&ts.raw as *const _, *events)
+                    }
+                    _ => unreachable!(),
+                };
+                queue_request_into_ring(
+                    &mut *reactor.ring_for_source(&timer),
+                    &timer,
+                    op,
+                    &mut reactor.source_map.borrow_mut(),
+                );
+                timer
+            })
+            .collect();
+        let mut main_ring = reactor.main_ring.borrow_mut();
+        let queue = main_ring.submission_queue();
+        while !queue.borrow().submissions.is_empty() {
+            main_ring.poll(&mut 0).unwrap();
+        }
+
+        drop(timers);
+        assert_eq!(queue.borrow().cancellations.len(), 3 * 128);
+        main_ring.flush_cancellations(&mut 0);
+
+        assert!(queue.borrow().cancellations.is_empty());
+    }
+
+    #[test]
+    fn sleeping_does_not_leave_ring_links_behind() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+
+        let sleep_until_a_timer_fires = || {
+            let timer = Source::new(
+                IoRequirements::default(),
+                -1,
+                SourceType::Timeout(TimeSpec64::try_from(Duration::from_millis(5)).unwrap(), 0),
+                None,
+                None,
+            );
+            let op = match &*timer.source_type() {
+                SourceType::Timeout(ts, events) => {
+                    UringOpDescriptor::Timeout(&ts.raw as *const _, *events)
+                }
+                _ => unreachable!(),
+            };
+            queue_request_into_ring(
+                &mut *reactor.ring_for_source(&timer),
+                &timer,
+                op,
+                &mut reactor.source_map.borrow_mut(),
+            );
+            reactor.wait(|| None, None, 0, || 0).unwrap();
+            assert!(timer.result().is_some());
+        };
+        let settled_sources = || {
+            let mut last = usize::MAX;
+            for _ in 0..100 {
+                let now = reactor.source_map.borrow().occupied();
+                if now == last {
+                    break;
+                }
+                last = now;
+                reactor.poll_io(&mut 0).unwrap();
+            }
+            last
+        };
+
+        sleep_until_a_timer_fires();
+        let after_one_sleep = settled_sources();
+        for _ in 0..4 {
+            sleep_until_a_timer_fires();
+        }
+
+        assert_eq!(settled_sources(), after_one_sleep);
     }
 
     /// Dropping the in-flight `slow` timer mid-test cancels it.

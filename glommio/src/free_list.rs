@@ -70,6 +70,14 @@ impl<T> FreeList<T> {
             }
         }
     }
+    #[cfg(test)]
+    pub(crate) fn occupied(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| matches!(slot, Slot::Full { .. }))
+            .count()
+    }
+
     pub(crate) fn dealloc(&mut self, idx: Idx<T>) -> T {
         let slot = Slot::Free {
             next_free: Option::replace(&mut self.first_free, idx),

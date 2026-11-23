@@ -19,7 +19,7 @@ fn pin_to_cpu(cpu: usize) {
 }
 
 fn bench_spsc(capacity: usize, cpu_producer: usize, cpu_consumer: usize) {
-    let (sender, receiver) = spsc_queue::make::<u32>(capacity);
+    let (mut sender, mut receiver) = spsc_queue::make::<u32>(capacity);
 
     let consumer = thread::spawn(move || {
         pin_to_cpu(cpu_consumer);

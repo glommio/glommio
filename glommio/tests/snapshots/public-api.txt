@@ -638,7 +638,7 @@ pub struct glommio::channels::spsc_queue::Consumer<T>
 impl<T> glommio::channels::spsc_queue::Consumer<T>
 pub fn glommio::channels::spsc_queue::Consumer<T>::disconnect(&self) -> bool
 pub fn glommio::channels::spsc_queue::Consumer<T>::producer_disconnected(&self) -> bool
-pub fn glommio::channels::spsc_queue::Consumer<T>::try_pop(&self) -> core::option::Option<T>
+pub fn glommio::channels::spsc_queue::Consumer<T>::try_pop(&mut self) -> core::option::Option<T>
 impl<T> core::fmt::Debug for glommio::channels::spsc_queue::Consumer<T>
 pub fn glommio::channels::spsc_queue::Consumer<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::channels::spsc_queue::Consumer<T>
@@ -681,7 +681,7 @@ impl<T> glommio::channels::spsc_queue::Producer<T>
 pub fn glommio::channels::spsc_queue::Producer<T>::consumer_disconnected(&self) -> bool
 pub fn glommio::channels::spsc_queue::Producer<T>::disconnect(&self) -> bool
 pub fn glommio::channels::spsc_queue::Producer<T>::free_space(&self) -> usize
-pub fn glommio::channels::spsc_queue::Producer<T>::try_push(&self, v: T) -> core::option::Option<T>
+pub fn glommio::channels::spsc_queue::Producer<T>::try_push(&mut self, v: T) -> core::option::Option<T>
 impl<T> core::fmt::Debug for glommio::channels::spsc_queue::Producer<T>
 pub fn glommio::channels::spsc_queue::Producer<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::channels::spsc_queue::Producer<T>

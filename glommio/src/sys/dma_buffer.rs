@@ -25,7 +25,7 @@ impl SysAlloc {
             None
         } else {
             let layout = Layout::from_size_align(size, 4096).unwrap();
-            let data = unsafe { alloc::alloc::alloc(layout) };
+            let data = unsafe { alloc::alloc::alloc_zeroed(layout) };
             let data = ptr::NonNull::new(data)?;
             Some(SysAlloc { data, layout })
         }
@@ -185,5 +185,19 @@ impl From<ReadResult> for DmaBuffer {
             size: value.len(),
             storage: BufferStorage::ReadResult(value),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_buffer_does_not_expose_freed_memory() {
+        let mut first = DmaBuffer::new(1 << 16).unwrap();
+        first.as_bytes_mut().fill(0xab);
+        drop(first);
+        let second = DmaBuffer::new(1 << 16).unwrap();
+        assert!(second.as_bytes().iter().all(|&b| b == 0));
     }
 }

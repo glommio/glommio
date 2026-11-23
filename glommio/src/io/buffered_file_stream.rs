@@ -597,7 +597,7 @@ impl AsyncBufRead for StreamReader {
                 }
             }
             None => {
-                if self.buffer.remaining_unconsumed_bytes() > 0 {
+                if self.buffer.remaining_unconsumed_bytes() > 0 || self.file_pos >= self.max_pos {
                     let this = self.project();
                     Poll::Ready(Ok(this.buffer.unconsumed_bytes()))
                 } else {
@@ -840,6 +840,30 @@ mod test {
 
             let err = reader.seek(SeekFrom::Current(-10_000)).await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            reader.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn reading_past_the_end_position_is_end_of_file() {
+        let dir = make_test_directories("read-past-end").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("f");
+            std::fs::write(&path, [7u8; 4096]).unwrap();
+            let mut rest = Vec::new();
+
+            let mut reader = StreamReaderBuilder::new(BufferedFile::open(&path).await.unwrap())
+                .with_end_pos(10)
+                .build();
+            reader.seek(SeekFrom::Start(100)).await.unwrap();
+            assert_eq!(reader.read_to_end(&mut rest).await.unwrap(), 0);
+            reader.close().await.unwrap();
+
+            let mut reader = StreamReaderBuilder::new(BufferedFile::open(&path).await.unwrap())
+                .with_start_pos(100)
+                .with_end_pos(10)
+                .build();
+            assert_eq!(reader.read_to_end(&mut rest).await.unwrap(), 0);
             reader.close().await.unwrap();
         });
     }

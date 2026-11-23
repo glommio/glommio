@@ -434,26 +434,21 @@ impl StreamWriter {
         }
     }
 
+    /// Gives up the file before submitting its close, so that nothing can
+    /// close the descriptor again once the close is under way.
     fn poll_inner_close(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
         match self.source.take() {
             None => {
-                let source = self
-                    .reactor
-                    .upgrade()
-                    .unwrap()
-                    .close(self.file.as_ref().unwrap().as_raw_fd());
-                source.add_waiter_single(cx.waker());
-                self.source = Some(source);
-                Poll::Pending
-            }
-            Some(source) => {
-                let res = source.result().unwrap();
                 let file = self.file.take().unwrap();
                 let fd = file.as_raw_fd();
                 let (last_fd, _) = file.discard();
                 assert!(last_fd.is_some(), "Handling inner close for fd {fd} but it's still owned - fd reuse is a real risk");
-                Poll::Ready(res.map(|_| ()))
+                let source = self.reactor.upgrade().unwrap().close(fd);
+                source.add_waiter_single(cx.waker());
+                self.source = Some(source);
+                Poll::Pending
             }
+            Some(source) => Poll::Ready(source.result().unwrap().map(|_| ())),
         }
     }
 
@@ -468,7 +463,7 @@ impl StreamWriter {
     }
 
     fn do_poll_close(&mut self, cx: &Context<'_>) -> Poll<io::Result<()>> {
-        while self.file.is_some() {
+        while self.file.is_some() || self.source.is_some() {
             match self.file_status {
                 FileStatus::Open => {
                     let res = ready!(self.do_poll_flush(cx));
@@ -720,6 +715,59 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Guards against a cancelled `close()` leaving the writer to close its
+    /// descriptor a second time, after another file has reused the number.
+    #[test]
+    fn a_cancelled_close_does_not_close_a_reused_fd() {
+        let dir = make_test_directories("cancelled-close-reused-fd").remove(0);
+        test_executor!(async move {
+            let other = dir.path.join("other");
+            std::fs::write(&other, b"other").unwrap();
+            let mut writer =
+                StreamWriterBuilder::new(BufferedFile::create(dir.path.join("out")).await.unwrap())
+                    .with_sync_on_close_disabled(true)
+                    .build();
+            {
+                let close = writer.close();
+                futures_lite::pin!(close);
+                assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+            }
+            crate::timer::sleep(Duration::from_millis(20)).await;
+            let other = BufferedFile::open(&other).await.unwrap();
+            drop(writer);
+            crate::timer::sleep(Duration::from_millis(20)).await;
+            assert!(
+                other.read_at(0, 5).await.is_ok(),
+                "dropping the writer closed another file's descriptor"
+            );
+        });
+    }
+
+    /// Guards against `close()` returning before reading the result of the
+    /// close it submitted.
+    #[test]
+    fn close_reports_the_result_of_the_close_itself() {
+        let dir = make_test_directories("close-reports-close-result").remove(0);
+        test_executor!(async move {
+            let file = BufferedFile::create(dir.path.join("out")).await.unwrap();
+            let fd = file.as_raw_fd();
+            let mut writer = StreamWriterBuilder::new(file)
+                .with_sync_on_close_disabled(true)
+                .build();
+            let close = writer.close();
+            futures_lite::pin!(close);
+            assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+            crate::timer::sleep(Duration::from_millis(20)).await;
+            let closed = close.await;
+            assert_eq!(
+                closed.map_err(|e| e.raw_os_error()),
+                Err(Some(libc::EBADF)),
+                "the failed close went unreported"
+            );
+        });
+    }
 
     #[test]
     fn small_writes_are_batched() {

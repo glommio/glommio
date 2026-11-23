@@ -101,9 +101,9 @@ impl UringBufferAllocator {
     fn new(size: usize) -> Self {
         let layout = Layout::from_size_align(size, 4096).unwrap();
         let (data, allocator) = unsafe {
-            let data = alloc::alloc::alloc(layout);
+            let data = alloc::alloc::alloc_zeroed(layout);
             let data = std::ptr::NonNull::new(data).unwrap();
-            let allocator = BuddyAlloc::new(BuddyAllocParam::new(
+            let allocator = BuddyAlloc::new(BuddyAllocParam::new_with_zero_filled(
                 data.as_ptr(),
                 layout.size(),
                 layout.align(),
@@ -2410,6 +2410,23 @@ mod tests {
         reactor.wait(|| None, None, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
         assert!((300..350).contains(&elapsed_ms));
+    }
+
+    #[test]
+    fn arena_does_not_expose_freed_memory() {
+        const BUDDY_FREE_LIST_LINKS: usize = 2 * std::mem::size_of::<usize>();
+        let layout = Layout::from_size_align(65536, 4096).unwrap();
+        unsafe {
+            let dirty = alloc::alloc::alloc(layout);
+            dirty.write_bytes(0xab, layout.size());
+            alloc::alloc::dealloc(dirty, layout);
+        }
+        let allocator = Rc::new(UringBufferAllocator::new(layout.size()));
+        let buf = allocator.new_buffer(4096).unwrap();
+        assert!(allocator.as_bytes().as_ptr_range().contains(&buf.as_ptr()));
+        assert!(buf.as_bytes()[BUDDY_FREE_LIST_LINKS..]
+            .iter()
+            .all(|&b| b == 0));
     }
 
     #[test]

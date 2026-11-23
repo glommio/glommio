@@ -634,15 +634,33 @@ impl<T, P: Policy> TimingWheel<T, P> {
             return;
         };
         for level in 0..self.levels.len() {
+            if !self.may_hold_due(level, rounded) {
+                continue;
+            }
             let slot = ((rounded >> self.levels[level].shift) as usize) & self.levels[level].wrap;
             self.expire_due_in(level, slot, now);
         }
+    }
+
+    /// Whether the slot `rounded` falls into at `level` can hold an entry that
+    /// is already due.
+    ///
+    /// At a coarse level only when `rounded` is the tick that slot begins at.
+    /// Otherwise the slot began at or before the current tick and was broken
+    /// down then, so all it can hold is entries a whole revolution away, and
+    /// checking them would walk them on every poll.
+    fn may_hold_due(&self, level: usize, rounded: u64) -> bool {
+        level == 0 || rounded.is_multiple_of(1u64 << self.levels[level].shift)
     }
 
     /// Expires everything in one slot whose real deadline has passed.
     ///
     /// The cached minimum is never later than the truth, so one later than
     /// `now` proves nothing here is due and the walk is skipped.
+    ///
+    /// Survivors are compacted in place, in their original order, so the slot
+    /// keeps its buffer and only an entry that actually moved has its position
+    /// rewritten. A walk that expires nothing therefore writes nothing.
     fn expire_due_in(&mut self, level: usize, slot: usize, now: Instant) {
         if self
             .earliest_cell(level, slot)
@@ -652,43 +670,48 @@ impl<T, P: Policy> TimingWheel<T, P> {
             return;
         }
 
-        let held = std::mem::take(&mut self.levels[level].slots[slot]);
+        let mut held = std::mem::take(&mut self.levels[level].slots[slot]);
         if held.is_empty() {
+            self.levels[level].slots[slot] = held;
             return;
         }
         let mut survivor_min: Option<Instant> = None;
-        let mut retained = Vec::with_capacity(held.len());
-        for index in held {
+        let mut kept = 0;
+        for read in 0..held.len() {
+            let index = held[read];
             let Some(key) = self.slab.id_at(index) else {
                 continue;
             };
-            let due = self.slab.get(key).is_some_and(|e| e.expires_at <= now);
-            if due {
+            let Some(expires_at) = self.slab.get(key).map(|e| e.expires_at) else {
+                continue;
+            };
+            if expires_at <= now {
                 self.expired.push(index);
                 let at = Position::Expired {
                     index: self.expired.len() - 1,
                 };
                 self.record(key, at);
-            } else {
-                if let Some(entry) = self.slab.get(key) {
-                    survivor_min = Some(match survivor_min {
-                        Some(m) => m.min(entry.expires_at),
-                        None => entry.expires_at,
-                    });
-                }
-                retained.push(index);
-                let at = Position::Slot {
-                    level,
-                    slot,
-                    index: retained.len() - 1,
-                };
-                self.record(key, at);
+                continue;
             }
+            survivor_min = Some(survivor_min.map_or(expires_at, |m| m.min(expires_at)));
+            if kept != read {
+                held[kept] = index;
+                self.record(
+                    key,
+                    Position::Slot {
+                        level,
+                        slot,
+                        index: kept,
+                    },
+                );
+            }
+            kept += 1;
         }
-        if retained.is_empty() {
+        held.truncate(kept);
+        if held.is_empty() {
             self.levels[level].mask.clear(slot);
         }
-        self.levels[level].slots[slot] = retained;
+        self.levels[level].slots[slot] = held;
         if let Some(cell) = self.earliest_cell(level, slot) {
             cell.set(survivor_min);
         }
@@ -752,5 +775,83 @@ impl<T, P: Policy> TimingWheel<T, P> {
         let mut out = Vec::new();
         self.drain_expired_into(&mut out);
         out.into_iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::timer::wheel::policy::Millis;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn slot_of<T, P: Policy>(wheel: &TimingWheel<T, P>, key: Key) -> (usize, usize) {
+        match wheel.slab.get(key).unwrap().at {
+            Position::Slot { level, slot, .. } => (level, slot),
+            other => panic!("expected a slot, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_coarse_slot_starting_now_can_hold_a_due_entry() {
+        let wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(Instant::now());
+        assert!(wheel.may_hold_due(0, 257));
+        assert!(wheel.may_hold_due(1, 256));
+        assert!(!wheel.may_hold_due(1, 257));
+        assert!(!wheel.may_hold_due(1, 511));
+        assert!(wheel.may_hold_due(2, 16_384));
+        assert!(!wheel.may_hold_due(2, 16_640));
+        assert!(wheel.may_hold_due(3, 0));
+        assert!(!wheel.may_hold_due(3, 16_384));
+    }
+
+    #[test]
+    fn idle_polls_leave_a_slot_of_wrapped_entries_alone() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        wheel.advance_to(start + ms(100));
+        let key = wheel.insert(start + ms(16_400), ());
+        let (level, slot) = slot_of(&wheel, key);
+        assert_eq!(
+            (level, slot),
+            (1, 0),
+            "a revolution ahead, in the cursor's slot"
+        );
+        let buffer = wheel.levels[level].slots[slot].as_ptr();
+
+        for step in 1..=10 {
+            wheel.advance_to(start + ms(100) + Duration::from_micros(step * 50));
+        }
+
+        assert_eq!(wheel.levels[level].slots[slot].as_ptr(), buffer);
+        assert!(wheel.remove(key).is_some());
+    }
+
+    #[test]
+    fn expiring_part_of_a_slot_keeps_its_buffer_and_order() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        wheel.advance_to(start + ms(10));
+        let at = |micros: u64| start + ms(10) + Duration::from_micros(micros);
+        let early = wheel.insert(at(300), ());
+        let late = wheel.insert(at(900), ());
+        let due = wheel.insert(at(200), ());
+        let later = wheel.insert(at(800), ());
+        let (level, slot) = slot_of(&wheel, early);
+        let buffer = wheel.levels[level].slots[slot].as_ptr();
+
+        wheel.advance_to(at(500));
+
+        assert_eq!(wheel.levels[level].slots[slot].as_ptr(), buffer);
+        let expired: Vec<Key> = wheel.drain_expired().map(|(key, ())| key).collect();
+        assert_eq!(expired.len(), 2);
+        assert!(expired.contains(&early) && expired.contains(&due));
+        let order: Vec<SlotIndex> = wheel.levels[level].slots[slot].clone();
+        assert_eq!(order, vec![late.slot(), later.slot()]);
+        assert!(wheel.remove(later).is_some());
+        assert!(wheel.remove(late).is_some());
+        assert!(wheel.is_empty());
     }
 }

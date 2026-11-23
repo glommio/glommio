@@ -141,6 +141,48 @@ fn idle_gap(c: &mut Criterion) {
     group.finish();
 }
 
+/// A poll that finds nothing due, with `n` entries a whole revolution ahead in
+/// the slot a coarse level's cursor sits on.
+///
+/// Every reactor poll advances the wheel, so this is paid per poll. Those
+/// entries cannot come due before the cursor goes round again, and the cost
+/// should not grow with how many of them there are.
+fn advance_beside_wrapped(c: &mut Criterion) {
+    let mut group = c.benchmark_group("advance_beside_wrapped");
+    for &n in &[0usize, 64, 4_096, 65_536] {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| {
+                let build = || {
+                    let start = Instant::now();
+                    let mut wheel: TimingWheel<usize, Millis> = TimingWheel::starting_at(start);
+                    let from = start + Duration::from_millis(100);
+                    wheel.advance_to(from);
+                    for i in 0..n {
+                        wheel.insert(
+                            start + Duration::from_millis(16_400) + Duration::from_nanos(i as u64),
+                            i,
+                        );
+                    }
+                    (wheel, from)
+                };
+                let (mut wheel, mut now) = build();
+                let mut total = Duration::ZERO;
+                for i in 0..iters {
+                    if i % 100_000 == 99_999 {
+                        (wheel, now) = build();
+                    }
+                    now += Duration::from_micros(1);
+                    let began = Instant::now();
+                    wheel.advance_to(black_box(now));
+                    total += began.elapsed();
+                }
+                total
+            })
+        });
+    }
+    group.finish();
+}
+
 /// Cancelling earliest-first while asking what is due next, which is the case
 /// the two coarse-query policies exist to trade between.
 ///
@@ -390,6 +432,7 @@ criterion_group!(
     cancel_earliest_first,
     next_expiry,
     cancel_with_query,
-    idle_gap
+    idle_gap,
+    advance_beside_wrapped
 );
 criterion_main!(benches);

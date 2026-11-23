@@ -132,6 +132,7 @@ impl<T: BufferHalf> Future for Connector<T> {
                 reactor.add_shared_channel_connection_waker(cx.waker().clone());
                 Poll::Pending
             }
+            #[allow(no_comments_allowed)]
             // usize::MAX (the disconnected) always has a placeholder notifier that never
             // returns its fd. So if the other side disconnected it will unblock us here
             id => Poll::Ready(sys::get_sleep_notifier_for(id).unwrap_or_else(|| {
@@ -226,15 +227,16 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// [`WouldBlock`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.WouldBlock
     /// [`Other`]: https://doc.rust-lang.org/std/io/enum.ErrorKind.html#variant.Other
     /// [`GlommioError`]: ../../struct.GlommioError.html
+    #[allow(no_comments_allowed)]
     pub fn try_send(&self, item: T) -> Result<(), T> {
-        // This is a shared channel so state can change under our noses.
+        // This is a shared channel, so state can change under our noses.
         // We test if the buffer is disconnected before sending to avoid
         // sending a value that will not be received (otherwise we would only
-        // receive WouldBlock when the buffer capacity fills).
+        // receive `WouldBlock` when the buffer capacity fills).
         //
-        // However after we try_push(), we can still fail because the buffer
-        // disconnected between now and then. That's okay as all we're trying to
-        // do here is prevent unnecessary sends.
+        // However after we `try_push()`, we can still fail because the buffer
+        // disconnected between now and then. That's okay, as all we're trying
+        // to do here is prevent unnecessary sends.
         //
         // Note that we check `producer_disconnected` because:
         // (1) senders can be referenced by multiple tasks simultaneously
@@ -315,7 +317,13 @@ impl<T: Send + Sized> ConnectedSender<T> {
         }
     }
 
-    /// Close the sender
+    /// Close the sender.
+    ///
+    /// Wakes other tasks `awaiting` the same sender, letting them know the
+    /// sender is closed; we don't `unregister_shared_channel` here because
+    /// another task could still be `await`ing this sender, in which case we
+    /// need to be able to `wake` it.
+    #[allow(no_comments_allowed)]
     pub fn close(&self) {
         if !self.state.buffer.disconnect() {
             if let Some(r) = self.reactor.upgrade() {
@@ -415,6 +423,7 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
                 if disconnected {
                     Poll::Ready(None)
                 } else if self.state.buffer.producer_disconnected() {
+                    #[allow(no_comments_allowed)]
                     // Double check in case the producer sent the last message and
                     // disconnected right after a `None` is returned from `try_pop`
                     self.do_recv_one(cx, true)
@@ -443,9 +452,9 @@ impl<T: Send + Sized> Stream for ConnectedReceiver<T> {
 }
 
 impl<T: Send + Sized> Drop for SharedSender<T> {
+    /// If it was never connected, we must connect ourselves.
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            // Never connected, we must connect ourselves.
             if !state.buffer.disconnect() {
                 let id = state.buffer.peer_id();
                 if let Some(notifier) = sys::get_sleep_notifier_for(id) {
@@ -457,9 +466,9 @@ impl<T: Send + Sized> Drop for SharedSender<T> {
 }
 
 impl<T: Send + Sized> Drop for SharedReceiver<T> {
+    /// If it was never connected, we must connect ourselves.
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            // Never connected, we must connect ourselves.
             if !state.buffer.disconnect() {
                 let id = state.buffer.peer_id();
                 if let Some(notifier) = sys::get_sleep_notifier_for(id) {
@@ -626,10 +635,13 @@ mod test {
         let ex1 = LocalExecutorBuilder::default()
             .spawn(move || async move {
                 let sender = sender.connect().await;
-                // This will go right away because the channel fits 1 element
-                sender.try_send(1).unwrap();
-                // This will sleep. The consumer should unblock us
-                sender.send(1).await.unwrap();
+                sender
+                    .try_send(1)
+                    .expect("this will go right away because the channel fits 1 element");
+                sender
+                    .send(1)
+                    .await
+                    .expect("this will sleep; the consumer should unblock us");
             })
             .unwrap();
 
@@ -709,9 +721,7 @@ mod test {
                 let sender: ConnectedSender<usize> = sender.connect().await;
                 match sender.send(0).await {
                     Ok(_) => panic!("Should not have sent"),
-                    Err(GlommioError::Closed(ResourceType::Channel(_))) => {
-                        // all good
-                    }
+                    Err(GlommioError::Closed(ResourceType::Channel(_))) => {}
                     Err(other_err) => {
                         panic!("incorrect error type: '{other_err}' for channel send")
                     }
@@ -876,9 +886,11 @@ mod test {
         ex1.join().unwrap();
         ex2.join().unwrap();
 
-        // make sure that our total is always 0, to ensure we have dropped all entries,
-        // despite differing conditions.
-        assert_eq!(original.load(Ordering::Relaxed), 0usize);
+        assert_eq!(
+            original.load(Ordering::Relaxed),
+            0usize,
+            "our total must always be 0, to ensure we have dropped all entries, despite differing conditions"
+        );
     }
 
     #[test]
@@ -913,9 +925,11 @@ mod test {
         ex2.join().unwrap();
         ex1.join().unwrap();
 
-        // make sure that our total is always 0, to ensure we have dropped all entries,
-        // despite differing conditions.
-        assert_eq!(original.load(Ordering::Relaxed), 0usize);
+        assert_eq!(
+            original.load(Ordering::Relaxed),
+            0usize,
+            "our total must always be 0, to ensure we have dropped all entries, despite differing conditions"
+        );
     }
 
     #[test]
@@ -946,12 +960,15 @@ mod test {
         ex2.join().unwrap();
         ex1.join().unwrap();
 
-        // make sure that our total is always 0, to ensure we have dropped all entries,
-        // despite differing conditions.
-        assert_eq!(original.load(Ordering::Relaxed), 0usize);
+        assert_eq!(
+            original.load(Ordering::Relaxed),
+            0usize,
+            "our total must always be 0, to ensure we have dropped all entries, despite differing conditions"
+        );
     }
 
     #[test]
+    #[allow(no_comments_allowed)]
     fn shared_drop_cascade_drop_executor_reverse() {
         let (sender, receiver) = new_bounded(100);
         let (connected_tx, connected_rx) = mpsc::channel();
@@ -992,9 +1009,11 @@ mod test {
         drop(ex1);
         ex2.join().unwrap();
 
-        // make sure that our total is always 0, to ensure we have dropped all entries,
-        // despite differing conditions.
-        assert_eq!(original.load(Ordering::Relaxed), 0usize);
+        assert_eq!(
+            original.load(Ordering::Relaxed),
+            0usize,
+            "our total must always be 0, to ensure we have dropped all entries, despite differing conditions"
+        );
     }
 
     #[test]
@@ -1055,6 +1074,7 @@ mod test {
         ex2.join().unwrap();
     }
 
+    #[allow(no_comments_allowed)]
     #[test]
     fn peer_connect_after_canceled_connection_and_retained_task_waker() {
         let (sender, receiver) = new_bounded::<u8>(1);

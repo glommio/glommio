@@ -58,6 +58,7 @@ struct Guarded<'a, Fut> {
 impl<Fut: Future> Future for Guarded<'_, Fut> {
     type Output = Fut::Output;
 
+    #[allow(no_comments_allowed)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Fut::Output> {
         // Safety: `inner` is pinned structurally and never moved out of, and
         // `flag` is a shared reference that needs no pinning.
@@ -85,6 +86,7 @@ struct RefusingReentry<'a, Fut> {
 impl<Fut: Future> Future for RefusingReentry<'_, Fut> {
     type Output = Fut::Output;
 
+    #[allow(no_comments_allowed)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Fut::Output> {
         // Safety: as in `Guarded`.
         let this = unsafe { self.get_unchecked_mut() };
@@ -446,6 +448,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(no_comments_allowed)]
     fn a_caller_waiting_behind_a_failed_init_runs_its_own() {
         LocalExecutor::default().run(async {
             let cell = Rc::new(OnceCell::new());
@@ -490,6 +493,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(no_comments_allowed)]
     fn a_concurrent_get_or_init_waits_rather_than_initialising_again() {
         LocalExecutor::default().run(async {
             let cell = Rc::new(OnceCell::new());
@@ -577,6 +581,7 @@ mod write_once {
     /// already holds a reference to, or be dropped; holding the permit across
     /// the await means neither can arise.
     #[test]
+    #[allow(no_comments_allowed)]
     fn set_is_refused_while_an_initialiser_holds_the_permit() {
         LocalExecutor::default().run(async {
             let cell: Rc<OnceCell<u32>> = Rc::new(OnceCell::new());
@@ -744,6 +749,7 @@ mod std_trait_tests {
     /// The value is not published yet, so the clone is empty and initialises
     /// itself independently rather than blocking on the original's semaphore.
     #[test]
+    #[allow(no_comments_allowed)]
     fn a_clone_taken_mid_initialisation_is_empty_and_independent() {
         LocalExecutor::default().run(async {
             let cell: Rc<OnceCell<u32>> = Rc::new(OnceCell::new());
@@ -801,6 +807,7 @@ mod reentrancy_tests {
     /// never make progress, so it panics rather than waiting for itself.
     #[test]
     #[should_panic(expected = "re-entered its own cell")]
+    #[allow(no_comments_allowed)]
     fn a_reentrant_initialiser_panics() {
         LocalExecutor::default().run(async {
             let cell: Rc<OnceCell<u32>> = Rc::new(OnceCell::new());
@@ -817,6 +824,7 @@ mod reentrancy_tests {
     /// initialiser is suspended. It must wait, not panic, and the initialiser
     /// must still run exactly once.
     #[test]
+    #[allow(no_comments_allowed)]
     fn a_second_task_waits_rather_than_panicking() {
         LocalExecutor::default().run(async {
             let cell: Rc<OnceCell<u32>> = Rc::new(OnceCell::new());

@@ -15,6 +15,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The largest buffer an emptied slot keeps for its next entries.
+///
+/// Reusing a slot's buffer saves an allocation and a free each time the slot
+/// fills and empties. Past this size a buffer is released instead, so that one
+/// burst does not pin its peak in every slot it passed through for the life of
+/// the wheel.
+const RETAINED_SLOT_CAPACITY: usize = 256;
+
 /// Where an entry currently sits, so that cancelling it goes straight there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Position {
@@ -274,7 +282,8 @@ impl<T, P: Policy> TimingWheel<T, P> {
     /// finest level whose reach still covers it.
     ///
     /// A slot's cached minimum is only ever tightened here. An unknown one
-    /// stays unknown, since an earlier entry may already be in the slot.
+    /// stays unknown, since an earlier entry may already be in the slot,
+    /// unless the slot is empty, when the new entry is its minimum.
     fn place_at(&mut self, key: Key, deadline: Option<u64>) {
         let expires_at = self
             .slab
@@ -309,9 +318,12 @@ impl<T, P: Policy> TimingWheel<T, P> {
             .unwrap_or(self.levels.len() - 1);
         let slot = ((deadline >> self.levels[level].shift) as usize) & self.levels[level].wrap;
 
+        let was_empty = self.levels[level].slots[slot].is_empty();
         if let Some(cell) = self.earliest_cell(level, slot) {
-            if let Some(current) = cell.get() {
-                cell.set(Some(current.min(expires_at)));
+            match cell.get() {
+                Some(current) => cell.set(Some(current.min(expires_at))),
+                None if was_empty => cell.set(Some(expires_at)),
+                None => {}
             }
         }
 
@@ -607,12 +619,12 @@ impl<T, P: Policy> TimingWheel<T, P> {
 
     /// Everything in a slot of the finest level is due.
     fn expire_slot(&mut self, slot: usize) {
-        let due = std::mem::take(&mut self.levels[0].slots[slot]);
+        let mut due = std::mem::take(&mut self.levels[0].slots[slot]);
         self.levels[0].mask.clear(slot);
         if let Some(cell) = self.earliest_cell(0, slot) {
             cell.set(None);
         }
-        for index in due {
+        for &index in &due {
             self.expired.push(index);
             let at = Position::Expired {
                 index: self.expired.len() - 1,
@@ -621,19 +633,37 @@ impl<T, P: Policy> TimingWheel<T, P> {
                 self.record(key, at);
             }
         }
+        self.return_buffer(0, slot, &mut due);
     }
 
     /// Breaks a coarser level's slot down into finer ones.
+    ///
+    /// Everything in the slot is due within its own span, so it all lands in
+    /// finer levels and nothing is placed back into the slot being emptied.
     fn cascade(&mut self, level: usize, slot: usize) {
-        let moving = std::mem::take(&mut self.levels[level].slots[slot]);
+        let mut moving = std::mem::take(&mut self.levels[level].slots[slot]);
         self.levels[level].mask.clear(slot);
         if let Some(cell) = self.earliest_cell(level, slot) {
             cell.set(None);
         }
-        for index in moving {
+        for &index in &moving {
             if let Some(key) = self.slab.id_at(index) {
                 self.place(key);
             }
+        }
+        self.return_buffer(level, slot, &mut moving);
+    }
+
+    /// Hands an emptied slot its buffer back, so the next entries placed there
+    /// do not allocate, unless it grew past [`RETAINED_SLOT_CAPACITY`].
+    fn return_buffer(&mut self, level: usize, slot: usize, buffer: &mut Vec<SlotIndex>) {
+        debug_assert!(
+            self.levels[level].slots[slot].is_empty(),
+            "nothing is placed into a slot while it is being emptied"
+        );
+        if buffer.capacity() <= RETAINED_SLOT_CAPACITY {
+            buffer.clear();
+            std::mem::swap(&mut self.levels[level].slots[slot], buffer);
         }
     }
 
@@ -881,6 +911,42 @@ mod tests {
         wheel.advance_to(start + ms(16_400));
         let fired: Vec<Key> = wheel.drain_expired().map(|(key, ())| key).collect();
         assert_eq!(fired, vec![key]);
+    }
+
+    #[test]
+    fn the_first_entry_in_a_slot_is_its_known_minimum() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        let expires_at = start + ms(5) + Duration::from_micros(300);
+        let key = wheel.insert(expires_at, ());
+        let (level, slot) = slot_of(&wheel, key);
+        assert_eq!(
+            wheel.earliest_cell(level, slot).unwrap().get(),
+            Some(expires_at)
+        );
+    }
+
+    #[test]
+    fn emptied_slots_keep_their_buffers_unless_they_grew_large() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        let small = wheel.insert(start + ms(5), ());
+        let (_, small_slot) = slot_of(&wheel, small);
+        for i in 0..=RETAINED_SLOT_CAPACITY as u64 {
+            wheel.insert(start + ms(7) + Duration::from_nanos(i + 1), ());
+        }
+        let cascading = wheel.insert(start + ms(1_000), ());
+        let (cascading_level, cascading_slot) = slot_of(&wheel, cascading);
+        assert_eq!(cascading_level, 1);
+
+        wheel.advance_to(start + ms(5));
+        assert!(wheel.levels[0].slots[small_slot].capacity() > 0);
+        wheel.advance_to(start + ms(8));
+        assert_eq!(wheel.levels[0].slots[8].capacity(), 0);
+        wheel.advance_to(start + ms(800));
+        assert!(wheel.levels[cascading_level].slots[cascading_slot].capacity() > 0);
+        wheel.advance_to(start + ms(1_000));
+        assert_eq!(wheel.drain_expired().count(), RETAINED_SLOT_CAPACITY + 3);
     }
 
     #[test]

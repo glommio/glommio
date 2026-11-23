@@ -44,7 +44,16 @@ use intrusive_collections::{
 };
 
 use crate::{GlommioError, ResourceType};
+use smallvec::SmallVec;
 use std::{marker::PhantomPinned, ptr::NonNull};
+
+type Wakers = SmallVec<[Waker; 4]>;
+
+fn wake_all(wakers: Wakers) {
+    for waker in wakers {
+        waker.wake();
+    }
+}
 
 /// A type alias for the result of a lock method which can be suspended.
 pub type LockResult<T> = Result<T, GlommioError<()>>;
@@ -274,8 +283,8 @@ impl<T> Future for Waiter<'_, T> {
         let future_mut = unsafe { self.get_unchecked_mut() };
         let pinned_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
 
-        pinned_node.woken.set(false);
-        match pinned_node.kind {
+        let was_woken = pinned_node.woken.replace(false);
+        let polled = match pinned_node.kind {
             WaiterKind::Writer => {
                 if rw.try_write()? {
                     Self::remove_from_waiting_queue(pinned_node, &mut rw);
@@ -305,7 +314,13 @@ impl<T> Future for Waiter<'_, T> {
                     Poll::Pending
                 }
             }
+        };
+        if was_woken && polled.is_pending() {
+            let wakers = RwLock::<T>::wake_up_fibers(&mut rw);
+            drop(rw);
+            wake_all(wakers);
         }
+        polled
     }
 }
 
@@ -314,7 +329,9 @@ impl<T> Drop for Waiter<'_, T> {
         if self.node.woken.get() {
             let mut state = self.rw.state.borrow_mut();
             if !state.closed {
-                RwLock::<T>::wake_up_fibers(&mut state);
+                let wakers = RwLock::<T>::wake_up_fibers(&mut state);
+                drop(state);
+                wake_all(wakers);
             }
         } else if self.node.link.is_linked() {
             // If node is lined them future is already pinned
@@ -398,7 +415,9 @@ impl<T> Drop for RwLockReadGuard<'_, T> {
             debug_assert!(state.readers > 0);
             state.readers -= 1;
 
-            RwLock::<T>::wake_up_fibers(&mut state);
+            let wakers = RwLock::<T>::wake_up_fibers(&mut state);
+            drop(state);
+            wake_all(wakers);
         }
     }
 }
@@ -446,7 +465,9 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
             debug_assert!(state.writers > 0);
             state.writers -= 1;
 
-            RwLock::<T>::wake_up_fibers(&mut state);
+            let wakers = RwLock::<T>::wake_up_fibers(&mut state);
+            drop(state);
+            wake_all(wakers);
         }
     }
 }
@@ -757,7 +778,10 @@ impl<T> RwLock<T> {
 
         state.closed = true;
 
-        Self::wake_up_all_fibers(&mut state);
+        let mut wakers = Wakers::new();
+        Self::wake_up_all_fibers(&mut state, &mut wakers);
+        drop(state);
+        wake_all(wakers);
         Ok(())
     }
 
@@ -799,7 +823,11 @@ impl<T> RwLock<T> {
         Ok(value)
     }
 
-    fn wake_up_fibers(rw: &mut State) {
+    /// Unlinks the waiters to wake and returns their wakers, to be woken once
+    /// the state is no longer borrowed: a waker can then neither leave its
+    /// waiter linked nor find the lock borrowed.
+    fn wake_up_fibers(rw: &mut State) -> Wakers {
+        let mut wakers = Wakers::new();
         // Created with assumption in mind that waker will trigger delayed execution of
         // fibers such behaviour supports users intuition about tasks.
 
@@ -810,29 +838,30 @@ impl<T> RwLock<T> {
             if rw.queued_writers == 0 {
                 // Only readers are waiting in the queue and no one holding a lock
                 // wake up all of them
-                Self::wake_up_all_fibers(rw);
+                Self::wake_up_all_fibers(rw, &mut wakers);
             } else {
                 // There are some writers waiting into the queue so wake up all readers and
                 // single writer no one holding the lock, so likely they will be
                 // executed in order so all will have a chance to proceed
-                Self::wake_up_readers_and_first_writer(rw);
+                Self::wake_up_readers_and_first_writer(rw, &mut wakers);
             }
         } else if rw.writers == 0 {
             if rw.queued_writers == 0 {
                 // Only readers in the waiting queue and some readers holding the lock
                 // wake up all of them
-                Self::wake_up_all_fibers(rw);
+                Self::wake_up_all_fibers(rw, &mut wakers);
             } else {
                 // There are both readers and writers in the queue
                 // so only readers are awakened
-                Self::wake_up_all_readers_till_first_writer(rw);
+                Self::wake_up_all_readers_till_first_writer(rw, &mut wakers);
             }
         }
         // The only option left that some writers still holding the lock
         // so no reason to try to wake up anyone.
+        wakers
     }
 
-    fn wake_up_all_readers_till_first_writer(rw: &mut State) {
+    fn wake_up_all_readers_till_first_writer(rw: &mut State, wakers: &mut Wakers) {
         let mut cursor = rw.waiters_queue.front_mut();
         while !cursor.is_null() {
             {
@@ -843,18 +872,14 @@ impl<T> RwLock<T> {
 
                 let waker = node.waker.borrow_mut().take();
                 node.woken.set(true);
-                if let Some(waker) = waker {
-                    waker.wake();
-                } else {
-                    panic!("Future was linked in waiting list without an a waker");
-                }
+                wakers.push(waker.expect("Future was linked in waiting list without an a waker"));
             }
 
             cursor.remove();
         }
     }
 
-    fn wake_up_readers_and_first_writer(rw: &mut State) {
+    fn wake_up_readers_and_first_writer(rw: &mut State, wakers: &mut Wakers) {
         let mut cursor = rw.waiters_queue.front_mut();
         // We need to remove writer from the list too,
         // so we use flag instead of execution of break
@@ -866,11 +891,7 @@ impl<T> RwLock<T> {
 
                 let waker = node.waker.borrow_mut().take();
                 node.woken.set(true);
-                if let Some(waker) = waker {
-                    waker.wake();
-                } else {
-                    panic!("Future was linked in waiting list without an a waker");
-                }
+                wakers.push(waker.expect("Future was linked in waiting list without an a waker"));
 
                 if node.kind == WaiterKind::Writer {
                     rw.queued_writers -= 1;
@@ -882,17 +903,13 @@ impl<T> RwLock<T> {
         }
     }
 
-    fn wake_up_all_fibers(rw: &mut State) {
+    fn wake_up_all_fibers(rw: &mut State, wakers: &mut Wakers) {
         let mut cursor = rw.waiters_queue.front_mut();
         while !cursor.is_null() {
             let node = unsafe { cursor.remove().unwrap().as_ref() };
             let waker = node.waker.borrow_mut().take();
             node.woken.set(true);
-            if let Some(waker) = waker {
-                waker.wake();
-            } else {
-                panic!("Future was linked in waiting list without an a waker");
-            }
+            wakers.push(waker.expect("Future was linked in waiting list without an a waker"));
         }
     }
 }
@@ -985,6 +1002,108 @@ mod test {
     fn flagged() -> (Arc<WakeFlag>, Waker) {
         let flag = Arc::new(WakeFlag::default());
         (flag.clone(), Waker::from(flag))
+    }
+
+    fn ready<F: Future>(f: Pin<&mut F>) -> bool {
+        f.poll(&mut Context::from_waker(Waker::noop())).is_ready()
+    }
+
+    /// Guards against a woken writer that cannot take the lock going back
+    /// to sleep with the wakeup, while a reader that could take it sleeps on.
+    #[test]
+    fn a_woken_writer_that_sleeps_again_passes_the_wakeup_on() {
+        let rw = RwLock::new(());
+        let held = rw.try_write().unwrap();
+        let mut r0 = Box::pin(rw.read());
+        let mut w1 = Box::pin(rw.write());
+        let mut r1 = Box::pin(rw.read());
+        let (woken, waker) = flagged();
+        assert!(!ready(r0.as_mut()));
+        assert!(!ready(w1.as_mut()));
+        assert!(r1
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        drop(held);
+        let Poll::Ready(reading) = r0.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("the first reader was not let in");
+        };
+        let _reading = reading.unwrap();
+        assert!(!ready(w1.as_mut()));
+        assert!(
+            woken.0.load(Ordering::Relaxed),
+            "a reader that could take the lock was never woken"
+        );
+    }
+
+    struct Panics;
+
+    impl Wake for Panics {
+        fn wake(self: Arc<Self>) {
+            panic!("this waker panics");
+        }
+    }
+
+    /// Guards against a waker that panics leaving its waiter linked, so
+    /// that dropping the waiter freed a node still in the queue.
+    #[test]
+    fn a_panicking_waker_leaves_no_waiter_linked() {
+        let rw = RwLock::new(());
+        let held = rw.try_write().unwrap();
+        let mut waiter = Box::pin(rw.read());
+        let mut writer = Box::pin(rw.write());
+        let waker = Waker::from(Arc::new(Panics));
+        assert!(waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        assert!(!ready(writer.as_mut()));
+        let released = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(held)));
+        assert!(released.is_err());
+        drop(waiter);
+        drop(writer);
+        assert!(
+            rw.state.borrow().waiters_queue.is_empty(),
+            "a dropped waiter is still linked"
+        );
+    }
+
+    thread_local! {
+        static WATCHED: RefCell<Option<Rc<RwLock<()>>>> = const { RefCell::new(None) };
+    }
+
+    struct LooksAtTheLock;
+
+    impl Wake for LooksAtTheLock {
+        fn wake(self: Arc<Self>) {
+            WATCHED.with(|l| l.borrow().as_ref().unwrap().is_closed());
+        }
+    }
+
+    /// Guards against waking while the lock is still borrowed, which made a
+    /// waker that looks at the lock panic.
+    #[test]
+    fn a_waker_can_look_at_the_lock() {
+        let rw = Rc::new(RwLock::new(()));
+        WATCHED.with(|l| *l.borrow_mut() = Some(rw.clone()));
+        let waker = Waker::from(Arc::new(LooksAtTheLock));
+        let mut cx = Context::from_waker(&waker);
+
+        let writing = rw.try_write().unwrap();
+        let mut reader = Box::pin(rw.read());
+        assert!(reader.as_mut().poll(&mut cx).is_pending());
+        drop(writing);
+        assert!(reader.as_mut().poll(&mut cx).is_ready());
+        drop(reader);
+
+        let reading = rw.try_read().unwrap();
+        let mut writer = Box::pin(rw.write());
+        assert!(writer.as_mut().poll(&mut cx).is_pending());
+        drop(reading);
+        assert!(writer.as_mut().poll(&mut cx).is_ready());
+        drop(writer);
+
+        WATCHED.with(|l| l.borrow_mut().take());
     }
 
     #[test]

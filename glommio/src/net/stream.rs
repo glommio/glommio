@@ -271,7 +271,6 @@ impl Timeout {
     fn check(&self, reactor: &Reactor) -> io::Result<()> {
         if let Some(handle) = self.handle.get() {
             if !reactor.timer_exists(handle) {
-                reactor.remove_timer(handle);
                 self.handle.take();
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,

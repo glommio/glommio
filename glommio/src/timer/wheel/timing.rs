@@ -719,15 +719,21 @@ impl<T, P: Policy> TimingWheel<T, P> {
 
     /// Pulls overflow entries that have come within the wheel's reach.
     ///
-    /// Only those strictly earlier than the threshold placement evicts at.
-    /// Reclaiming the boundary itself would hand back an entry that placement
-    /// returns at once, on every call for as long as the cursor sits there.
+    /// Only those whose rounded tick placement would keep, judged by the same
+    /// rounding placement applies. An entry that rounds up onto the reach
+    /// would be handed straight back, on every call for as long as the cursor
+    /// sits on its tick.
     fn check_overflow(&mut self) {
         if self.overflow.is_empty() {
             return;
         }
-        let threshold = self.current_time() + Duration::from_millis(self.reach);
-        let due: Vec<Instant> = self.overflow.range(..threshold).map(|(k, _)| *k).collect();
+        let limit = self.current_tick.saturating_add(self.reach);
+        let due: Vec<Instant> = self
+            .overflow
+            .keys()
+            .take_while(|key| self.tick_for(**key).is_none_or(|tick| tick < limit))
+            .copied()
+            .collect();
         for key in due {
             if let Some(bucket) = self.overflow.remove(&key) {
                 for index in bucket {
@@ -794,6 +800,47 @@ mod tests {
         }
     }
 
+    struct Closest;
+    impl Policy for Closest {
+        const SLOTS: &'static [usize] = Millis::SLOTS;
+        const RESOLUTION: &'static [u64] = Millis::RESOLUTION;
+        const ROUNDING: Rounding = Rounding::Nearest;
+    }
+
+    fn overflow_stays_put_until_its_tick_is_in_reach<P: Policy>(short_of_reach: Duration) {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), P> = TimingWheel::starting_at(start);
+        let expires_at = start + ms(wheel.reach) - short_of_reach;
+        let key = wheel.insert(expires_at, ());
+        assert!(matches!(
+            wheel.slab.get(key).unwrap().at,
+            Position::Overflow { .. }
+        ));
+        let bucket = wheel.overflow[&expires_at].as_ptr();
+
+        for step in 1..=10 {
+            wheel.advance_to(start + Duration::from_micros(step * 50));
+            assert_eq!(wheel.overflow[&expires_at].as_ptr(), bucket);
+        }
+
+        wheel.advance_to(start + ms(1));
+        assert!(matches!(
+            wheel.slab.get(key).unwrap().at,
+            Position::Slot { .. }
+        ));
+        assert!(wheel.overflow.is_empty());
+    }
+
+    #[test]
+    fn an_entry_rounding_up_onto_the_reach_waits_in_overflow() {
+        overflow_stays_put_until_its_tick_is_in_reach::<Millis>(Duration::from_nanos(1));
+    }
+
+    #[test]
+    fn an_entry_rounding_to_the_reach_waits_in_overflow() {
+        overflow_stays_put_until_its_tick_is_in_reach::<Closest>(Duration::from_micros(250));
+    }
+
     #[test]
     fn only_a_coarse_slot_starting_now_can_hold_a_due_entry() {
         let wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(Instant::now());
@@ -823,9 +870,8 @@ mod tests {
 
         for step in 1..=10 {
             wheel.advance_to(start + ms(100) + Duration::from_micros(step * 50));
+            assert_eq!(wheel.levels[level].slots[slot].as_ptr(), buffer);
         }
-
-        assert_eq!(wheel.levels[level].slots[slot].as_ptr(), buffer);
         assert!(wheel.remove(key).is_some());
     }
 

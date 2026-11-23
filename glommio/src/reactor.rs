@@ -94,6 +94,10 @@ impl Timers {
         self.wheel.remove(id)
     }
 
+    fn update_waker(&mut self, id: TimerId, waker: &Waker) -> Option<Option<Waker>> {
+        self.wheel.update_waker(id, waker)
+    }
+
     fn exists(&self, id: TimerId) -> bool {
         self.wheel.contains(id)
     }
@@ -789,6 +793,15 @@ impl Reactor {
     pub(crate) fn remove_timer(&self, id: TimerId) -> Option<Waker> {
         let mut timers = self.timers.borrow_mut();
         timers.remove(id)
+    }
+
+    /// Points a registered timer at `waker`, as
+    /// [`ReactorTimers::update_waker`](crate::timer::reactor_adapter::ReactorTimers::update_waker)
+    /// describes. The displaced waker is returned after the `timers` borrow
+    /// has ended.
+    pub(crate) fn update_timer_waker(&self, id: TimerId, waker: &Waker) -> Option<Option<Waker>> {
+        let mut timers = self.timers.borrow_mut();
+        timers.update_waker(id, waker)
     }
 
     /// Whether a handle still names a registered timer.

@@ -97,6 +97,39 @@ fn cancel(c: &mut Criterion) {
     group.finish();
 }
 
+/// Polling a timer that is already armed, from the task that armed it, which
+/// a `select!` loop does on every pass something else woke.
+///
+/// Nothing about the timer changed, so this should cost no more than
+/// noticing that.
+fn repoll(c: &mut Criterion) {
+    let ex = Glommio::default();
+    let mut group = c.benchmark_group("timer/repoll");
+    group.sample_size(10).warm_up_time(Duration::from_secs(1));
+
+    for &n in POPULATIONS {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
+            b.iter_custom(|iters| {
+                ex.0.run(async {
+                    let mut parked: Vec<Timer> = (0..n).map(|_| Timer::new(PARKED)).collect();
+                    for timer in parked.iter_mut() {
+                        poll_once(timer).await;
+                    }
+                    let mut timer = Timer::new(PARKED);
+                    poll_once(&mut timer).await;
+
+                    let started = Instant::now();
+                    for _ in 0..iters {
+                        black_box(poll_once(&mut timer).await);
+                    }
+                    started.elapsed()
+                })
+            })
+        });
+    }
+    group.finish();
+}
+
 /// A short sleep with a population already waiting.
 ///
 /// Two things show up here. A structure that answers "what is due next" by
@@ -427,6 +460,7 @@ criterion_group!(
     benches,
     arm,
     cancel,
+    repoll,
     idle_gap,
     short_sleep_under_population,
     expire,

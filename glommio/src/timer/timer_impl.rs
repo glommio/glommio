@@ -178,15 +178,16 @@ impl Future for Timer {
             }
             Poll::Ready(when)
         } else {
-            if let Some(stale) = inner.id.take() {
-                inner.reactor.upgrade().unwrap().remove_timer(stale);
+            let reactor = inner.reactor.upgrade().unwrap();
+            if let Some(id) = inner.id.take() {
+                if let Some(displaced) = reactor.update_timer_waker(id, cx.waker()) {
+                    inner.id = Some(id);
+                    drop(inner);
+                    drop(displaced);
+                    return Poll::Pending;
+                }
             }
-            let id = inner
-                .reactor
-                .upgrade()
-                .unwrap()
-                .insert_timer(when, cx.waker().clone());
-            inner.id = Some(id);
+            inner.id = Some(reactor.insert_timer(when, cx.waker().clone()));
             Poll::Pending
         }
     }
@@ -774,6 +775,63 @@ mod test {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+
+    struct CountWakes(std::sync::atomic::AtomicUsize);
+
+    impl futures::task::ArcWake for CountWakes {
+        fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+            arc_self
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn counting_waker() -> (std::sync::Arc<CountWakes>, std::task::Waker) {
+        let count = std::sync::Arc::new(CountWakes(Default::default()));
+        let waker = futures::task::waker(count.clone());
+        (count, waker)
+    }
+
+    #[test]
+    fn repolling_an_armed_timer_keeps_its_registration() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_secs(10));
+            let (_, waker) = counting_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            let armed = timer.inner.borrow().id;
+            assert!(armed.is_some());
+
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            assert_eq!(timer.inner.borrow().id, armed);
+
+            let (_, other) = counting_waker();
+            let mut cx = Context::from_waker(&other);
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            assert_eq!(timer.inner.borrow().id, armed);
+        });
+    }
+
+    #[test]
+    fn a_repolled_timer_wakes_the_task_that_polled_it_last() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_millis(5));
+            let (first_count, first) = counting_waker();
+            let (second_count, second) = counting_waker();
+            assert!(Pin::new(&mut timer)
+                .poll(&mut Context::from_waker(&first))
+                .is_pending());
+            assert!(Pin::new(&mut timer)
+                .poll(&mut Context::from_waker(&second))
+                .is_pending());
+
+            crate::timer::sleep(Duration::from_millis(20)).await;
+
+            use std::sync::atomic::Ordering::Relaxed;
+            assert_eq!(first_count.0.load(Relaxed), 0);
+            assert_eq!(second_count.0.load(Relaxed), 1);
+        });
+    }
 
     #[test]
     fn duration_max_waits_forever() {

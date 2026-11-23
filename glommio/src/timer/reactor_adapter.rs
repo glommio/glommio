@@ -43,6 +43,21 @@ impl ReactorTimers {
         self.wheel.remove(id)
     }
 
+    /// Points a registered timer at `waker`.
+    ///
+    /// `None` when the handle no longer names a timer. Otherwise the waker it
+    /// displaced, if any: none when the timer already wakes the same task,
+    /// which is a re-poll from it and costs neither a clone nor a drop. The
+    /// displaced waker is handed back rather than dropped here, since dropping
+    /// a task's last waker can run code that reaches for these timers.
+    pub(crate) fn update_waker(&mut self, id: Key, waker: &Waker) -> Option<Option<Waker>> {
+        let current = self.wheel.get_mut(id)?;
+        if current.will_wake(waker) {
+            return Some(None);
+        }
+        Some(Some(std::mem::replace(current, waker.clone())))
+    }
+
     /// Whether a handle still names a live timer.
     pub(crate) fn contains(&self, id: Key) -> bool {
         self.wheel.contains(id)

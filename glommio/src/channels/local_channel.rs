@@ -341,8 +341,10 @@ impl<T> State<T> {
         }
     }
 
+    /// Ready once there is room, or once the receiver is gone and the send
+    /// can only fail.
     fn wait_for_room(&mut self) -> PollResult<()> {
-        if !self.is_full() {
+        if !self.is_full() || self.recv_waiters.is_none() {
             PollResult::Ready(())
         } else {
             PollResult::Pending(WaiterKind::Sender)
@@ -937,6 +939,40 @@ mod test {
 
     fn noop() -> Context<'static> {
         Context::from_waker(Waker::noop())
+    }
+
+    fn is_closed<T>(sent: Poll<Result<(), GlommioError<T>>>) -> bool {
+        matches!(sent, Poll::Ready(Err(GlommioError::Closed(_))))
+    }
+
+    /// Guards against a send to a full channel waiting forever for a
+    /// receiver that is already gone.
+    #[test]
+    fn sending_to_a_full_channel_fails_once_the_receiver_is_gone() {
+        let (sender, receiver) = new_bounded(1);
+        sender.try_send(0).unwrap();
+        drop(receiver);
+        let mut send = Box::pin(sender.send(1));
+        assert!(is_closed(send.as_mut().poll(&mut noop())));
+    }
+
+    /// Guards against a send waiting on a full channel being woken by the
+    /// receiver going away, only to wait again.
+    #[test]
+    fn a_waiting_send_fails_when_the_receiver_goes() {
+        let (sender, receiver) = new_bounded(1);
+        sender.try_send(0).unwrap();
+        let (woken, waker) = flagged();
+        let mut send = Box::pin(sender.send(1));
+        assert!(send
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        drop(receiver);
+        assert!(woken.0.load(Ordering::Relaxed));
+        assert!(is_closed(
+            send.as_mut().poll(&mut Context::from_waker(&waker))
+        ));
     }
 
     #[test]

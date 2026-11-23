@@ -52,7 +52,7 @@ impl Directory {
         let path = path.as_ref().to_owned();
         let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
         let reactor = crate::executor().reactor();
-        let source = reactor.open_at(-1, &path, flags, 0o755);
+        let source = reactor.open_at(libc::AT_FDCWD, &path, flags, 0o755);
         let fd = source.collect_rw().await.map_err(|source| {
             GlommioError::create_enhanced(source, "Opening directory", Some(&path), None)
         })?;
@@ -149,5 +149,30 @@ fn contains_dir(path: &Path) -> bool {
     match iter.next() {
         Some(std::path::Component::Normal(_)) => iter.next().is_some(),
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// A path relative to the working directory that leads to `target`.
+    fn relative_to_cwd(target: &Path) -> std::path::PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative: std::path::PathBuf =
+            (1..cwd.components().count()).map(|_| "..").collect();
+        relative.push(target.strip_prefix("/").unwrap());
+        relative
+    }
+
+    #[test]
+    fn open_and_create_take_relative_paths() {
+        test_executor!(async move {
+            Directory::open(".").await.expect("open(\".\") failed");
+            let dir = std::env::temp_dir().join(format!("glommio-rel-dir-{}", std::process::id()));
+            let created = Directory::create(relative_to_cwd(&dir)).await;
+            let _ = std::fs::remove_dir(&dir);
+            created.expect("create() with a relative path failed");
+        });
     }
 }

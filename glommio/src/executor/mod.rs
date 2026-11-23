@@ -584,10 +584,11 @@ impl LocalExecutorBuilder {
     /// concurrency. A higher ring depth allows a shard to submit a
     /// greater number of IO requests to the kernel at once.
     ///
-    /// Values above zero are valid and the default is 128.
+    /// The smallest valid depth is 2, since an operation and its linked
+    /// timeout must fit in the ring together. The default is 128.
     #[must_use = "The builder must be built to be useful"]
     pub fn ring_depth(mut self, ring_depth: usize) -> LocalExecutorBuilder {
-        assert!(ring_depth > 0, "ring depth should be strictly positive");
+        assert!(ring_depth >= 2, "ring depth should be at least 2");
         self.ring_depth = ring_depth;
         self
     }
@@ -894,7 +895,7 @@ impl LocalExecutorPoolBuilder {
     /// details.  The setting is applied to all executors in the pool.
     #[must_use = "The builder must be built to be useful"]
     pub fn ring_depth(mut self, ring_depth: usize) -> Self {
-        assert!(ring_depth > 0, "ring depth should be strictly positive");
+        assert!(ring_depth >= 2, "ring depth should be at least 2");
         self.ring_depth = ring_depth;
         self
     }
@@ -3013,6 +3014,29 @@ mod test {
             }
             await_eventfd_count(initial_eventfds, "after 100 rounds");
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "ring depth should be at least 2")]
+    fn ring_depth_below_the_longest_link_chain_is_rejected() {
+        let _ = LocalExecutorBuilder::default().ring_depth(1);
+    }
+
+    #[test]
+    #[should_panic(expected = "ring depth should be at least 2")]
+    fn pool_ring_depth_below_the_longest_link_chain_is_rejected() {
+        let _ = LocalExecutorPoolBuilder::new(PoolPlacement::Unbound(1)).ring_depth(1);
+    }
+
+    #[test]
+    fn smallest_ring_depth_runs() {
+        let ex = LocalExecutorBuilder::default()
+            .ring_depth(2)
+            .make()
+            .unwrap();
+        ex.run(async {
+            crate::timer::sleep(Duration::from_millis(1)).await;
+        });
     }
 
     #[test]

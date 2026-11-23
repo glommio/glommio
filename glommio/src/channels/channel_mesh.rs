@@ -347,13 +347,8 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
 
             state.peers.insert(index, Peer::new(role));
 
-            (state.peers.len() == self.nr_peers, exec_id)
-        };
-
-        if is_last {
-            // If this was the last joiner, build the channels
-            let mut state = self.state.lock().unwrap();
-            if !state.ready {
+            let is_last = state.peers.len() == self.nr_peers;
+            if is_last {
                 let n = state.peers.len();
                 for from_idx in 0..n {
                     for to_idx in 0..n {
@@ -374,7 +369,11 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
 
                 state.ready = true;
             }
-        } else {
+
+            (is_last, exec_id)
+        };
+
+        if !is_last {
             let registration = scopeguard::guard((), |()| self.withdraw(exec_id));
             // Wait until last joiner finishes building
             loop {
@@ -412,6 +411,9 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
     /// mesh to fill: the seat is freed if the mesh is not complete yet, and
     /// otherwise the peer's channels are dropped so the others see them
     /// closed. A poisoned mesh is left as it is.
+    ///
+    /// Relies on the last joiner building the channels under the same lock
+    /// that seats it, so a mesh is never full without being ready.
     fn withdraw(&self, exec_id: usize) {
         let (senders, receivers): (Vec<_>, Vec<_>) = {
             let Ok(mut state) = self.state.lock() else {
@@ -568,11 +570,13 @@ mod tests {
         let a = LocalExecutorBuilder::default()
             .spawn(enclose! { (mesh) move || async move {
                 {
-                    let join = mesh.join();
+                    let join = mesh.clone().join();
                     futures_lite::pin!(join);
                     assert!(futures_lite::future::poll_once(&mut join).await.is_none());
                     registered_tx.send(()).unwrap();
-                    crate::timer::sleep(std::time::Duration::from_millis(100)).await;
+                    while !mesh.state.lock().unwrap().ready {
+                        crate::timer::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                 }
                 done_rx.recv().unwrap();
             }})

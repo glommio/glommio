@@ -987,6 +987,7 @@ impl LocalExecutorPoolBuilder {
             match self.spawn_thread(&mut cpu_set_gen, &latch, fut_gen.clone()) {
                 Ok(handle) => handles.push(handle),
                 Err(err) => {
+                    let _ = latch.cancel();
                     handles.join_all();
                     return Err(err);
                 }

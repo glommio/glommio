@@ -12,6 +12,7 @@ use crate::{
     GlommioError, ResourceType,
 };
 use futures_lite::{future, stream::Stream};
+use scopeguard::ScopeGuard;
 use std::{
     fmt,
     future::Future,
@@ -146,6 +147,19 @@ impl<T: BufferHalf> Future for Connector<T> {
     }
 }
 
+/// Unregisters a half when dropped, so a `connect` cancelled while waiting
+/// for its peer does not leave the registration behind.
+fn unregister_on_drop(
+    reactor: Weak<Reactor>,
+    id: u64,
+) -> ScopeGuard<Weak<Reactor>, impl FnOnce(Weak<Reactor>)> {
+    scopeguard::guard(reactor, move |reactor| {
+        if let Some(r) = reactor.upgrade() {
+            r.unregister_shared_channel(id);
+        }
+    })
+}
+
 /// Creates a new `shared_channel` returning its sender and receiver
 /// endpoints.
 ///
@@ -166,9 +180,12 @@ impl<T: 'static + Send + Sized> SharedSender<T> {
     /// Connects this sender, returning a [`ConnectedSender`] that can be used
     /// to send data into this channel
     ///
+    /// Dropping the returned future before it completes disconnects this
+    /// sender, as dropping it unconnected would.
+    ///
     /// [`ConnectedSender`]: struct.ConnectedSender.html
     pub async fn connect(mut self) -> ConnectedSender<T> {
-        let state = self.state.take().unwrap();
+        let state = self.state.clone().unwrap();
         let reactor = crate::executor().reactor();
         state.buffer.connect(reactor.id());
         let id = reactor.register_shared_channel(Box::new(enclose! {(state) move || {
@@ -180,8 +197,11 @@ impl<T: 'static + Send + Sized> SharedSender<T> {
         }}));
 
         let reactor = Rc::downgrade(&reactor);
+        let registration = unregister_on_drop(reactor.clone(), id);
         let peer = Connector::new(state.buffer.clone_internal(), reactor.clone());
         let notifier = peer.await;
+        ScopeGuard::into_inner(registration);
+        self.state = None;
         ConnectedSender {
             id,
             state,
@@ -334,10 +354,13 @@ impl<T: 'static + Send + Sized> SharedReceiver<T> {
     /// Connects this receiver, returning a [`ConnectedReceiver`] that can be
     /// used to send data into this channel
     ///
+    /// Dropping the returned future before it completes disconnects this
+    /// receiver, as dropping it unconnected would.
+    ///
     /// [`ConnectedReceiver`]: struct.ConnectedReceiver.html
     pub async fn connect(mut self) -> ConnectedReceiver<T> {
         let reactor = crate::executor().reactor();
-        let state = self.state.take().unwrap();
+        let state = self.state.clone().unwrap();
         state.buffer.connect(reactor.id());
         let id = reactor.register_shared_channel(Box::new(enclose! { (state) move || {
             if state.buffer.producer_disconnected() {
@@ -348,8 +371,11 @@ impl<T: 'static + Send + Sized> SharedReceiver<T> {
         }}));
 
         let reactor = Rc::downgrade(&reactor);
+        let registration = unregister_on_drop(reactor.clone(), id);
         let peer = Connector::new(state.buffer.clone_internal(), reactor.clone());
         let notifier = peer.await;
+        ScopeGuard::into_inner(registration);
+        self.state = None;
         ConnectedReceiver {
             id,
             state,
@@ -472,22 +498,26 @@ impl<T: Send + Sized> Drop for SharedReceiver<T> {
 
 impl<T: Send + Sized> Drop for ConnectedReceiver<T> {
     fn drop(&mut self) {
-        if !self.state.buffer.disconnect() {
-            if let Some(r) = self.reactor.upgrade() {
+        let already_disconnected = self.state.buffer.disconnect();
+        if let Some(r) = self.reactor.upgrade() {
+            if !already_disconnected {
                 self.notifier.notify(false);
-                r.unregister_shared_channel(self.id);
             }
+            r.unregister_shared_channel(self.id);
         }
     }
 }
 
 impl<T: Send + Sized> Drop for ConnectedSender<T> {
+    /// Unregisters even after [`close`](Self::close), which keeps the
+    /// registration for tasks still waiting on this sender.
     fn drop(&mut self) {
-        if !self.state.buffer.disconnect() {
-            if let Some(r) = self.reactor.upgrade() {
+        let already_disconnected = self.state.buffer.disconnect();
+        if let Some(r) = self.reactor.upgrade() {
+            if !already_disconnected {
                 self.notifier.notify(false);
-                r.unregister_shared_channel(self.id)
             }
+            r.unregister_shared_channel(self.id);
         }
     }
 }
@@ -524,6 +554,135 @@ mod test {
             .unwrap();
         receiver.join().unwrap();
         sender.join().unwrap();
+    }
+
+    /// Guards against `close()` followed by a drop keeping the buffer, and
+    /// anything still in it, alive until the sender's executor exits.
+    #[test]
+    fn a_closed_sender_releases_the_buffer_when_dropped() {
+        let (tx, rx) = new_bounded(4);
+        let live = Arc::new(AtomicUsize::new(0));
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel::<()>();
+        let (released_tx, released_rx) = std::sync::mpsc::channel::<()>();
+        let counted = live.clone();
+        let sender = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let tx = tx.connect().await;
+                counted.fetch_add(1, Ordering::Relaxed);
+                tx.try_send(WithDrop(counted.clone(), 1)).ok().unwrap();
+                tx.close();
+                drop(tx);
+                dropped_tx.send(()).unwrap();
+                released_rx.recv().unwrap();
+                assert_eq!(
+                    counted.load(Ordering::Relaxed),
+                    0,
+                    "the unreceived item outlived both halves"
+                );
+            })
+            .unwrap();
+        let receiver = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let rx = rx.connect().await;
+                dropped_rx.recv().unwrap();
+                drop(rx);
+                released_tx.send(()).unwrap();
+            })
+            .unwrap();
+        receiver.join().unwrap();
+        sender.join().unwrap();
+        assert_eq!(live.load(Ordering::Relaxed), 0);
+    }
+
+    /// Guards against a receiver attaching to a sender whose `connect()` was
+    /// cancelled, and then waiting forever for messages that cannot come.
+    #[test]
+    fn a_receiver_sees_a_cancelled_sender_connect_as_closed() {
+        let (tx, rx) = new_bounded::<u32>(4);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let sender = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let registered = crate::executor().reactor().registered_shared_channels();
+                let connected = crate::timer::timeout(Duration::from_millis(20), async {
+                    tx.connect().await;
+                    Ok(())
+                })
+                .await;
+                assert_eq!(
+                    crate::executor().reactor().registered_shared_channels(),
+                    registered,
+                    "the cancelled connect left its registration behind"
+                );
+                assert!(connected.is_err(), "the receiver was not there to connect");
+                cancelled_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            })
+            .unwrap();
+        let receiver = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                cancelled_rx.recv().unwrap();
+                let received = crate::timer::timeout(Duration::from_secs(5), async {
+                    Ok(rx.connect().await.recv().await)
+                })
+                .await
+                .expect("recv waited on a sender that no longer exists");
+                assert_eq!(received, None);
+                done_tx.send(()).unwrap();
+            })
+            .unwrap();
+        receiver.join().unwrap();
+        sender.join().unwrap();
+    }
+
+    /// Guards against a sender attaching to a receiver whose `connect()` was
+    /// cancelled, and then filling a buffer nobody will drain.
+    #[test]
+    fn a_sender_sees_a_cancelled_receiver_connect_as_closed() {
+        let (tx, rx) = new_bounded::<u32>(1);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let receiver = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let registered = crate::executor().reactor().registered_shared_channels();
+                let connected = crate::timer::timeout(Duration::from_millis(20), async {
+                    rx.connect().await;
+                    Ok(())
+                })
+                .await;
+                assert_eq!(
+                    crate::executor().reactor().registered_shared_channels(),
+                    registered,
+                    "the cancelled connect left its registration behind"
+                );
+                assert!(connected.is_err(), "the sender was not there to connect");
+                cancelled_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            })
+            .unwrap();
+        let sender = crate::LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                cancelled_rx.recv().unwrap();
+                let sent = crate::timer::timeout(Duration::from_secs(5), async {
+                    let tx = tx.connect().await;
+                    let first = tx.send(1).await;
+                    let second = tx.send(2).await;
+                    Ok((first, second))
+                })
+                .await
+                .expect("send waited on a receiver that no longer exists");
+                assert!(
+                    matches!(
+                        sent,
+                        (Err(GlommioError::Closed(_)), _) | (_, Err(GlommioError::Closed(_)))
+                    ),
+                    "{sent:?}"
+                );
+                done_tx.send(()).unwrap();
+            })
+            .unwrap();
+        sender.join().unwrap();
+        receiver.join().unwrap();
     }
     use crate::LocalExecutor;
     use crate::{

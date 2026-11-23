@@ -232,6 +232,12 @@ impl Reactor {
         id
     }
 
+    /// How many shared channel halves are registered with this reactor.
+    #[cfg(test)]
+    pub(crate) fn registered_shared_channels(&self) -> usize {
+        self.shared_channels.borrow().wakers_map.len()
+    }
+
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
         let removed = self.shared_channels.borrow_mut().wakers_map.remove(&id);
         drop(removed);

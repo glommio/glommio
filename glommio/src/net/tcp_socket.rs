@@ -357,9 +357,8 @@ pub struct AcceptedTcpStream {
 impl AcceptedTcpStream {
     /// Returns the socket address of the remote peer
     pub fn peer_addr(&self) -> Result<SocketAddr> {
-        let socket = unsafe { Socket::from_raw_fd(self.fd) };
-        let sock_addr = socket.peer_addr()?;
-        let _ = socket.into_raw_fd();
+        let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(self.fd) };
+        let sock_addr = socket2::SockRef::from(&fd).peer_addr()?;
         Ok(sock_addr.as_socket().unwrap())
     }
 
@@ -1049,6 +1048,31 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    /// Guards against a failed `peer_addr` closing the descriptor the
+    /// accepted stream still holds.
+    #[test]
+    fn a_failed_peer_addr_keeps_the_descriptor() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let accepted = listener.shared_accept().await.unwrap();
+            socket2::SockRef::from(&client)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(client);
+            Timer::new(Duration::from_millis(20)).await;
+            assert!(
+                accepted.peer_addr().is_err(),
+                "the reset peer still had an address"
+            );
+            let stream = accepted.bind_to_executor();
+            assert_ne!(
+                unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) },
+                -1,
+                "peer_addr closed the descriptor"
+            );
+        });
+    }
     #[test]
     fn tcp_listener_ttl() {
         test_executor!(async move {

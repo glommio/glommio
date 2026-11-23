@@ -16,6 +16,7 @@ use futures_lite::{
     ready,
     stream::{self, StreamExt},
 };
+use scopeguard::ScopeGuard;
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -737,15 +738,32 @@ impl DmaStreamWriterFlushState {
     }
 
     fn take_pending_handles(&mut self) -> Vec<task::JoinHandle<()>> {
-        let mut handles = Vec::with_capacity(self.pending_flush_count);
-        for (_, status) in &mut self.flushes {
+        self.take_pending_flushes()
+            .into_iter()
+            .map(|(_, handle)| handle)
+            .collect()
+    }
+
+    fn take_pending_flushes(&mut self) -> VecDeque<(u64, task::JoinHandle<()>)> {
+        let mut handles = VecDeque::with_capacity(self.pending_flush_count);
+        for (pos, status) in &mut self.flushes {
             if let FlushStatus::Pending(handle) = status {
                 if let Some(h) = handle.take() {
-                    handles.push(h);
+                    handles.push_back((*pos, h));
                 }
             }
         }
         handles
+    }
+
+    /// Puts back a handle taken by [`Self::take_pending_flushes`] and not
+    /// awaited to the end. One whose flush is no longer tracked has finished.
+    fn restore_pending_flush(&mut self, flush_pos: u64, handle: task::JoinHandle<()>) {
+        if let Some((_, FlushStatus::Pending(slot @ None))) =
+            self.flushes.iter_mut().find(|(pos, _)| *pos == flush_pos)
+        {
+            *slot = Some(handle);
+        }
     }
 
     fn on_start(&mut self, flush_pos: u64, handle: task::JoinHandle<()>) {
@@ -931,6 +949,14 @@ impl DmaStreamWriterState {
 
     fn take_pending_handles(&mut self) -> Vec<task::JoinHandle<()>> {
         self.flush_state.take_pending_handles()
+    }
+
+    fn take_pending_flushes(&mut self) -> VecDeque<(u64, task::JoinHandle<()>)> {
+        self.flush_state.take_pending_flushes()
+    }
+
+    fn restore_pending_flush(&mut self, flush_pos: u64, handle: task::JoinHandle<()>) {
+        self.flush_state.restore_pending_flush(flush_pos, handle)
     }
 
     fn flush_padded(&mut self, state: Rc<RefCell<Self>>, file: Rc<DmaFile>) -> bool {
@@ -1127,8 +1153,11 @@ impl DmaStreamWriter {
         self.state.borrow().flushed_pos()
     }
 
+    /// Waits on the pending flushes through a guard that hands back those
+    /// not yet awaited, so that a cancelled flush leaves them for `close`
+    /// and `drop`.
     async fn flush_inner(&self, partial: bool) -> Result<u64> {
-        let (target_pos, mut pending) = {
+        let (target_pos, pending) = {
             let mut state = self.state.borrow_mut();
             let pos = if partial && state.buffer_pos > 0 {
                 state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
@@ -1136,11 +1165,19 @@ impl DmaStreamWriter {
             } else {
                 state.aligned_pos
             };
-            (pos, state.take_pending_handles())
+            (pos, state.take_pending_flushes())
         };
-        for flush in pending.drain(..) {
+        let mut pending = scopeguard::guard(pending, |rest| {
+            let mut state = self.state.borrow_mut();
+            for (flush_pos, handle) in rest {
+                state.restore_pending_flush(flush_pos, handle);
+            }
+        });
+        while let Some((_, flush)) = pending.front_mut() {
             flush.await;
+            pending.pop_front();
         }
+        drop(ScopeGuard::into_inner(pending));
         let mut state = self.state.borrow_mut();
         if let Some(err) = state.current_error() {
             return err;
@@ -1580,6 +1617,21 @@ mod test {
         writer.write_all(b"after").await.unwrap();
         writer.close().await.unwrap();
         assert_eq!(std::fs::read(&filename).unwrap(), b"after");
+    });
+
+    file_stream_write_test!(close_after_a_cancelled_flush, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_write_behind(2)
+            .build();
+        writer.write_all(&[0xAB; 4096]).await.unwrap();
+        {
+            let flush = writer.flush_aligned();
+            futures_lite::pin!(flush);
+            assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+        }
+        writer.close().await.unwrap();
+        assert_eq!(std::fs::read(&filename).unwrap(), vec![0xAB; 4096]);
     });
 
     file_stream_write_test!(write_more_than_write_behind, path, _k, filename, file, {

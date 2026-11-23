@@ -53,7 +53,7 @@ impl Directory {
         let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
         let reactor = crate::executor().reactor();
         let source = reactor.open_at(libc::AT_FDCWD, &path, flags, 0o755);
-        let fd = source.collect_rw().await.map_err(|source| {
+        let fd = source.collect_fd().await.map_err(|source| {
             GlommioError::create_enhanced(source, "Opening directory", Some(&path), None)
         })?;
         let file = unsafe { GlommioFile::from_raw_fd(fd as _) }.with_path(Some(path));

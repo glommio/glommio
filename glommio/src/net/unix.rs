@@ -137,7 +137,7 @@ impl UnixListener {
     pub async fn shared_accept(&self) -> Result<AcceptedUnixStream> {
         let reactor = self.reactor.upgrade().unwrap();
         let source = reactor.accept(self.listener.as_raw_fd());
-        let fd = source.collect_rw().await?;
+        let fd = source.collect_fd().await?;
         Ok(AcceptedUnixStream { fd: fd as RawFd })
     }
 
@@ -879,6 +879,63 @@ impl UnixDatagram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Connects to `listener` while an `accept` is in flight, then drops the
+    /// accept, letting its completion be reaped before the drop or after it.
+    /// Returns whether the client saw its connection closed.
+    async fn cancel_accept_with_a_client_waiting(name: &str, reaped_before_drop: bool) -> bool {
+        let sock = std::env::temp_dir().join(format!("glommio-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let mut client = {
+            let accept = listener.accept();
+            futures_lite::pin!(accept);
+            assert!(futures_lite::future::poll_once(&mut accept).await.is_none());
+            crate::timer::sleep(std::time::Duration::from_millis(10)).await;
+            let client = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+            if reaped_before_drop {
+                crate::timer::sleep(std::time::Duration::from_millis(10)).await;
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            client
+        };
+        crate::timer::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = std::fs::remove_file(&sock);
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        loop {
+            match std::io::Read::read(&mut client, &mut [0u8; 1]) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                read => return matches!(read, Ok(0)),
+            }
+        }
+    }
+
+    /// Guards against an accept that completed before its future was dropped
+    /// keeping the connection it took open.
+    #[test]
+    fn a_cancelled_accept_closes_a_connection_it_already_took() {
+        test_executor!(async move {
+            assert!(
+                cancel_accept_with_a_client_waiting("accept-reaped", true).await,
+                "the connection stayed open"
+            );
+        });
+    }
+
+    /// Guards against an accept whose completion arrives after its future was
+    /// dropped keeping the connection it took open.
+    #[test]
+    fn a_cancelled_accept_closes_a_connection_that_completes_later() {
+        test_executor!(async move {
+            assert!(
+                cancel_accept_with_a_client_waiting("accept-late", false).await,
+                "the connection stayed open"
+            );
+        });
+    }
 
     #[test]
     fn recv_from_an_unnamed_peer_that_had_not_sent_yet() {

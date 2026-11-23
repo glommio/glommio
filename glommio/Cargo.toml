@@ -58,11 +58,11 @@ rustc_version = "0.4.1"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["async", "cargo_bench_support"] }
+env_logger = "0.11"
 fastrand = "2.3"
 futures = "0.3"
 hdrhistogram = "7.5"
 nix = { version = "0.30", features = ["resource"] }
-pretty_env_logger = "0.5"
 public-api       = "0.51.0"
 rand             = "0.9"
 rustdoc-json     = "0.9.9"

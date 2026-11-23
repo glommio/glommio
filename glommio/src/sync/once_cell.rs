@@ -193,7 +193,6 @@ impl<T> OnceCell<T> {
     ///     assert_eq!(*value, 42);
     /// });
     /// ```
-    #[allow(no_comments_allowed)]
     pub async fn get_or_try_init<F, Fut, E>(&self, init: F) -> Result<&T, E>
     where
         F: FnOnce() -> Fut,
@@ -268,7 +267,6 @@ impl<T> OnceCell<T> {
     /// .await;
     /// # });
     /// ```
-    #[allow(no_comments_allowed)]
     pub async fn get_or_init<F, Fut>(&self, init: F) -> &T
     where
         F: FnOnce() -> Fut,

@@ -933,7 +933,6 @@ mod test {
     }
 
     #[test]
-    #[allow(no_comments_allowed)]
     fn shared_drop_cascade_drop_executor() {
         let (sender, receiver) = new_bounded(100);
 

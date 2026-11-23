@@ -49,7 +49,7 @@ mod ref_count {
     }
 
     fn init_logger() {
-        pretty_env_logger::try_init().ok();
+        env_logger::try_init().ok();
     }
 
     #[test]

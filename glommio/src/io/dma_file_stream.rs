@@ -1387,7 +1387,7 @@ impl AsyncWrite for &DmaStreamWriter {
             }
         }
 
-        if written == 0 {
+        if written == 0 && !buf.is_empty() {
             state.add_waker(cx.waker().clone());
             Poll::Pending
         } else {
@@ -1554,6 +1554,19 @@ mod test {
             _ => panic!("unexpected success"),
         }
         reader.close().await.unwrap();
+    });
+
+    file_stream_write_test!(write_nothing, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file).build();
+        let wrote = crate::timer::timeout(Duration::from_secs(1), async {
+            Ok(writer.write(&[]).await)
+        })
+        .await
+        .expect("an empty write never returned");
+        assert_eq!(wrote.unwrap(), 0);
+        writer.write_all(b"after").await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(std::fs::read(&filename).unwrap(), b"after");
     });
 
     file_stream_write_test!(write_more_than_write_behind, path, _k, filename, file, {

@@ -744,14 +744,34 @@ mod test {
         });
     }
 
+    /// A duplicate of `file` near the top of the process's descriptor limit,
+    /// for a test that closes a descriptor out from under its owner and
+    /// expects the owner's close to fail. The kernel gives out the lowest
+    /// free number, so no other test's open takes this one in the meantime.
+    fn a_descriptor_nobody_else_gets(file: std::fs::File) -> std::os::fd::RawFd {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let top = limit.rlim_cur.min(1 << 20) as libc::c_int;
+        let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, top - 32) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        fd
+    }
+
     /// Guards against `close()` returning before reading the result of the
     /// close it submitted.
     #[test]
     fn close_reports_the_result_of_the_close_itself() {
         let dir = make_test_directories("close-reports-close-result").remove(0);
         test_executor!(async move {
-            let file = BufferedFile::create(dir.path.join("out")).await.unwrap();
-            let fd = file.as_raw_fd();
+            let fd =
+                a_descriptor_nobody_else_gets(std::fs::File::create(dir.path.join("out")).unwrap());
+            let file = unsafe { <BufferedFile as std::os::fd::FromRawFd>::from_raw_fd(fd) };
             let mut writer = StreamWriterBuilder::new(file)
                 .with_sync_on_close_disabled(true)
                 .build();

@@ -723,8 +723,10 @@ enum FileStatus {
     Open,
     /// We are closing it.
     Closing,
-    /// It was closed, but the poll may still need to wake the writer to
-    /// deliver the final result.
+    /// The close or seal has finished, and its result is waiting for the
+    /// poll to collect it.
+    Finished,
+    /// It was closed, and the result was handed to the caller.
     Closed,
 }
 
@@ -897,6 +899,7 @@ impl DmaStreamWriterState {
 
             defer! {
                 let mut state = state.borrow_mut();
+                state.file_status = FileStatus::Finished;
                 if let Some(waker) = state.waker.take() {
                     drop(state);
                     waker.wake();
@@ -960,6 +963,18 @@ impl DmaStreamWriterState {
 
     fn flushed_pos(&self) -> u64 {
         self.flush_state.flushed_pos
+    }
+
+    /// Whether a write of the partly filled block at `aligned_pos` is still
+    /// in flight. Any further write to that block waits for it: two Direct
+    /// I/O writes to one offset can complete in either order, and the older,
+    /// shorter one landing last would put its zero padding over the newer
+    /// bytes.
+    fn partial_flush_in_flight(&self) -> bool {
+        matches!(
+            self.flush_state.flushes.back(),
+            Some((pos, FlushStatus::Pending(_))) if *pos > self.aligned_pos
+        )
     }
 
     fn pending_flush_count(&mut self) -> usize {
@@ -1346,24 +1361,23 @@ impl DmaStreamWriter {
         cx: &Context<'_>,
     ) -> Poll<io::Result<DmaStreamReaderBuilder>> {
         let mut state = self.state.borrow_mut();
-        let previous_waker = state.waker.take();
         match state.file_status {
             FileStatus::Open => {
-                assert!(
-                    previous_waker.is_none(),
-                    "Cannot seal while flushing / writing"
-                );
                 let file = ensure_not_closed!(self.file.clone());
+                let displaced = state.waker.take();
                 state.add_waker(cx.waker().clone());
                 state.initiate_close(self.state.clone(), file, false);
+                drop(state);
+                if let Some(waker) = displaced {
+                    waker.wake();
+                }
                 Poll::Pending
             }
             FileStatus::Closing => {
-                if previous_waker.is_some() {
-                    state.add_waker(cx.waker().clone());
-                    return Poll::Pending;
-                }
-
+                state.add_waker(cx.waker().clone());
+                Poll::Pending
+            }
+            FileStatus::Finished => {
                 state.file_status = FileStatus::Closed;
                 let file = ensure_not_closed!(self.file);
 
@@ -1410,13 +1424,13 @@ impl AsyncWrite for &DmaStreamWriter {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut state = self.state.borrow_mut();
-        let previous_waker = state.waker.take();
-
+        if !matches!(state.file_status, FileStatus::Open) {
+            return already_closed!();
+        }
         if let Some(err) = state.current_error() {
             return Poll::Ready(err);
         }
-
-        if previous_waker.is_some() {
+        if !buf.is_empty() && state.partial_flush_in_flight() {
             state.add_waker(cx.waker().clone());
             return Poll::Pending;
         }
@@ -1466,40 +1480,45 @@ impl AsyncWrite for &DmaStreamWriter {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.state.borrow_mut();
-        let previous_waker = state.waker.take();
+        if matches!(
+            state.file_status,
+            FileStatus::Closing | FileStatus::Finished
+        ) {
+            return already_closed!();
+        }
         if let Some(err) = state.current_error() {
             return Poll::Ready(err);
         }
         if state.flushed_pos() == state.current_pos() {
             return Poll::Ready(Ok(()));
         }
-        state.add_waker(cx.waker().clone());
-        if previous_waker.is_none() {
-            state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
+        if !matches!(state.file_status, FileStatus::Open) {
+            return already_closed!();
         }
+        state.add_waker(cx.waker().clone());
+        state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
         Poll::Pending
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.state.borrow_mut();
-        let previous_waker = state.waker.take();
         match state.file_status {
             FileStatus::Open => {
-                assert!(
-                    previous_waker.is_none(),
-                    "Cannot close while flushing / writing"
-                );
+                let displaced = state.waker.take();
                 state.add_waker(cx.waker().clone());
                 let file = self.file.borrow_mut().take();
                 state.initiate_close(self.state.clone(), file.unwrap(), true);
+                drop(state);
+                if let Some(waker) = displaced {
+                    waker.wake();
+                }
                 Poll::Pending
             }
             FileStatus::Closing => {
-                if previous_waker.is_some() {
-                    state.add_waker(cx.waker().clone());
-                    return Poll::Pending;
-                }
-
+                state.add_waker(cx.waker().clone());
+                Poll::Pending
+            }
+            FileStatus::Finished => {
                 state.file_status = FileStatus::Closed;
                 match state.current_error() {
                     Some(err) => Poll::Ready(err),
@@ -1516,7 +1535,7 @@ impl AsyncWrite for &DmaStreamWriter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{io::dma_file::align_up, test_utils::make_test_directories, timer::Timer};
+    use crate::{enclose, io::dma_file::align_up, test_utils::make_test_directories, timer::Timer};
     use futures::{task::noop_waker_ref, AsyncRead, AsyncReadExt, AsyncWriteExt};
     use std::{io::ErrorKind, path::Path, time::Duration};
 
@@ -2349,6 +2368,215 @@ mod test {
         assert_eq!(writer.current_flushed_pos(), 10000);
         assert_eq!(file_size(&filename), 10000);
     });
+
+    file_stream_write_test!(close_after_cancelled_write, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_write_behind(1)
+            .build();
+
+        let data = [7u8; 3 * 4096];
+        {
+            let mut write = Box::pin(writer.write_all(&data));
+            assert!(futures_lite::future::poll_once(&mut write).await.is_none());
+        }
+        writer.close().await.unwrap();
+
+        assert_eq!(writer.current_flushed_pos(), 4096);
+        assert_eq!(file_size(&filename), 4096);
+    });
+
+    file_stream_write_test!(write_after_close, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .build();
+
+        writer.write_all(&[1u8; 10]).await.unwrap();
+        writer.close().await.unwrap();
+
+        writer.write(&[1u8; 10]).await.unwrap_err();
+        writer.flush().await.unwrap();
+        assert_eq!(file_size(&filename), 10);
+    });
+
+    file_stream_write_test!(close_while_another_task_writes, path, _k, filename, file, {
+        let writer = Rc::new(
+            DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .with_write_behind(1)
+                .build(),
+        );
+
+        let other = crate::spawn_local(enclose! { (writer) async move {
+            (&*writer).write_all(&[7u8; 3 * 4096]).await
+        }});
+        crate::executor().yield_task_queue_now().await;
+
+        crate::timer::timeout(Duration::from_secs(1), async move {
+            (&*writer).close().await.unwrap();
+            other.await.unwrap_err();
+            Ok(())
+        })
+        .await
+        .expect("closing next to a waiting writer hung");
+        assert_eq!(file_size(&filename), 4096);
+    });
+
+    file_stream_write_test!(
+        close_while_another_task_flushes,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let writer = Rc::new(
+                DmaStreamWriterBuilder::new(file)
+                    .with_buffer_size(4096)
+                    .build(),
+            );
+            (&*writer).write_all(&[7u8; 10]).await.unwrap();
+
+            let other = crate::spawn_local(enclose! { (writer) async move {
+                (&*writer).flush().await
+            }});
+            crate::executor().yield_task_queue_now().await;
+
+            let close = crate::spawn_local(async move { (&*writer).close().await });
+            crate::timer::timeout(Duration::from_secs(1), async move {
+                close.await.unwrap();
+                let _ = other.await;
+                Ok(())
+            })
+            .await
+            .expect("closing next to a waiting flush hung");
+            assert_eq!(file_size(&filename), 10);
+        }
+    );
+
+    file_stream_write_test!(write_after_cancelled_flush, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .build();
+
+        writer.write_all(&[7u8; 10]).await.unwrap();
+        {
+            let mut flush = Box::pin(writer.flush());
+            assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+        }
+        assert_eq!(writer.write(&[7u8; 10]).await.unwrap(), 10);
+
+        writer.close().await.unwrap();
+        assert_eq!(std::fs::read(&filename).unwrap(), [7u8; 20]);
+    });
+
+    file_stream_write_test!(
+        a_write_waits_for_the_padded_flush_of_its_block,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let mut writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build();
+            writer.write_all(&[1u8; 10]).await.unwrap();
+            {
+                let mut flush = Box::pin(writer.flush());
+                assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+            }
+            let fill = vec![2u8; 4086];
+            {
+                let mut write = Box::pin(writer.write(&fill));
+                assert!(
+                    futures_lite::future::poll_once(&mut write).await.is_none(),
+                    "a write to the block went out beside the padded flush still writing it"
+                );
+                assert_eq!(write.await.unwrap(), 4086);
+            }
+            writer.close().await.unwrap();
+            let mut expected = vec![1u8; 10];
+            expected.extend_from_slice(&fill);
+            assert_eq!(std::fs::read(&filename).unwrap(), expected);
+        }
+    );
+
+    file_stream_write_test!(
+        a_flush_during_close_leaves_close_its_error,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let mut writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build();
+            writer.write_all(&[1u8; 10]).await.unwrap();
+            {
+                let mut close = Box::pin(writer.close());
+                assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+            }
+            while !matches!(writer.state.borrow().file_status, FileStatus::Finished) {
+                Timer::new(Duration::from_millis(1)).await;
+            }
+            writer.state.borrow_mut().error = Some(io::Error::other("the close failed"));
+            assert!((&writer).flush().await.is_err());
+            assert!(
+                writer.close().await.is_err(),
+                "a flush during the close took the close's error"
+            );
+        }
+    );
+
+    thread_local! {
+        static WOKEN_STATE: RefCell<Option<Rc<RefCell<DmaStreamWriterState>>>> =
+            const { RefCell::new(None) };
+        static STATE_FREE_ON_WAKE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    struct BorrowOnWake;
+
+    impl futures::task::ArcWake for BorrowOnWake {
+        fn wake_by_ref(_: &std::sync::Arc<Self>) {
+            let free = WOKEN_STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|state| state.try_borrow_mut().is_ok())
+            });
+            STATE_FREE_ON_WAKE.with(|cell| cell.set(free));
+        }
+    }
+
+    file_stream_write_test!(
+        close_wakes_a_displaced_waiter_outside_the_borrow,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let mut writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build();
+            writer.write_all(&[1u8; 10]).await.unwrap();
+            {
+                let mut flush = Box::pin(writer.flush());
+                assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+            }
+            WOKEN_STATE.with(|state| *state.borrow_mut() = Some(writer.state.clone()));
+            let waker = futures::task::waker(std::sync::Arc::new(BorrowOnWake));
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut &writer)
+                .poll_write(&mut cx, &[2u8; 5])
+                .is_pending());
+            {
+                let mut close = Box::pin(writer.close());
+                assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+            }
+            WOKEN_STATE.with(|state| state.borrow_mut().take());
+            assert_eq!(STATE_FREE_ON_WAKE.with(std::cell::Cell::get), Some(true));
+            writer.close().await.unwrap();
+        }
+    );
 
     #[test]
     fn flushstate() {

@@ -170,6 +170,35 @@ fn read_timeout_fires_while_waiting_on_the_request() {
     });
 }
 
+/// A read that waited, then was served through the socket because the
+/// kernel ran out of buffers, cancels its timeout like any other: a later
+/// read must not time out on a deadline left over from the earlier wait.
+#[test]
+fn a_read_served_after_running_dry_cancels_its_timeout() {
+    executor(1, 64).run(async {
+        let (mut hog_writer, _hog) = pair(Preallocated::default()).await;
+        hog_writer.write_all(b"x").await.unwrap();
+        Timer::new(Duration::from_millis(20)).await;
+        assert_eq!(buffers_held(), 1);
+
+        let (mut writer, mut reader) = pair(Preallocated::default()).await;
+        reader
+            .set_read_timeout(Some(Duration::from_millis(60)))
+            .unwrap();
+        let mut got = [0u8; 1];
+        assert!(poll_once(reader.read(&mut got)).await.is_none());
+        writer.write_all(b"y").await.unwrap();
+        Timer::new(Duration::from_millis(20)).await;
+        assert_eq!(reader.read(&mut got).await.unwrap(), 1);
+
+        Timer::new(Duration::from_millis(100)).await;
+        assert!(
+            poll_once(reader.read(&mut got)).await.is_none(),
+            "the read timed out on the deadline of a read already served"
+        );
+    });
+}
+
 /// Dropping a stream with arrivals still queued gives their buffers back.
 #[test]
 fn dropping_a_stream_returns_its_queued_buffers() {

@@ -1224,7 +1224,11 @@ pub(crate) struct ProvidedBuffers {
     lent: Vec<u64>,
     /// The buffers in the order the kernel will take them, which is the
     /// order they were given back in. A bundled completion names only its
-    /// first buffer; the rest are the next entries here.
+    /// first buffer; the rest are the entries after it here. Completions
+    /// usually arrive in this order, but one the kernel batches, such as a
+    /// request's last, can be posted after a later selection's, so a
+    /// completion's buffers are found where they are rather than at the
+    /// front.
     order: std::collections::VecDeque<u16>,
 }
 
@@ -1323,29 +1327,26 @@ impl ProvidedBuffers {
     }
 
     /// Records that the kernel filled `len` bytes starting at buffer
-    /// `first`, over as many consecutive buffers as that takes, and returns
-    /// them in order. They are the receiver's to give back.
+    /// `first`, over as many consecutive ring entries as that takes, and
+    /// returns them in order. They are the receiver's to give back.
     fn lent(&mut self, first: u16, len: usize) -> smallvec::SmallVec<[u16; 4]> {
         let needed = if len == 0 { 1 } else { len.div_ceil(self.size) };
-        let mut bids = smallvec::SmallVec::new();
-        for i in 0..needed {
-            let bid = self
-                .order
-                .pop_front()
-                .expect("the kernel filled a buffer it was never given");
-            if i == 0 {
-                assert_eq!(
-                    bid, first,
-                    "a completion named a buffer out of ring order: the kernel and the ring \
-                     disagree on which buffers hold whose bytes"
-                );
-            }
+        let at = self
+            .order
+            .iter()
+            .position(|&bid| bid == first)
+            .expect("the kernel filled a buffer it was never given");
+        assert!(
+            at + needed <= self.order.len(),
+            "a completion spans more buffers than the ring holds after its first"
+        );
+        let bids: smallvec::SmallVec<[u16; 4]> = self.order.drain(at..at + needed).collect();
+        for &bid in &bids {
             assert!(
                 !self.is_lent(bid),
                 "the kernel filled buffer {bid} while it was still lent out"
             );
             self.lent[bid as usize / 64] |= 1 << (bid % 64);
-            bids.push(bid);
         }
         bids
     }
@@ -1469,6 +1470,18 @@ struct SleepableRing {
     task_queue_stats: AHashMap<TaskQueueHandle, RingIoStats>,
     source_map: Rc<RefCell<SourceMap>>,
     in_kernel: usize,
+}
+
+impl Drop for SleepableRing {
+    /// Takes the buffer ring back from the kernel while the ring is still
+    /// open, as liburing's own teardown does, so nothing the kernel finishes
+    /// after the ring closes can select a buffer from memory about to be
+    /// freed.
+    fn drop(&mut self) {
+        if self.provided_buffers.is_some() {
+            let _ = self.ring.submitter().unregister_buf_ring(RECV_BUFFER_GROUP);
+        }
+    }
 }
 
 impl SleepableRing {
@@ -2859,7 +2872,7 @@ impl Reactor {
                 sock_ring.inline_enter_spent = false;
                 sock_ring.run_deferred_work()?;
                 consume_rings!(into &mut woke; sock_ring);
-                should_sleep = woke == 0;
+                should_sleep = woke == 0 && sock_ring.can_sleep();
             }
         }
 
@@ -3255,6 +3268,59 @@ mod tests {
                 b"aaaabbbbcccc",
                 "the third buffer was not usable"
             );
+        });
+    }
+
+    /// The entry just before a sleep can deliver enough to an unread
+    /// connection to throttle it. That cancellation is queued, not sent, so
+    /// the pass must not sleep on it while the kernel keeps filling buffers.
+    #[test]
+    fn a_throttle_queued_just_before_a_sleep_is_not_slept_on() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap();
+        ex.run(async {
+            let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            let reactor = crate::executor().reactor();
+            let source = reactor.recv_multi(reader.as_raw_fd(), 16).unwrap();
+            settle(&reactor);
+            std::io::Write::write_all(&mut writer, &[7u8; 200]).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let started = Instant::now();
+            let slept = reactor
+                .sys
+                .wait(|| None, Some(Duration::from_millis(500)), true, 0, || 0)
+                .unwrap();
+            assert!(
+                !slept && started.elapsed() < Duration::from_millis(250),
+                "slept {:?} with the throttle's cancellation queued",
+                started.elapsed()
+            );
+            drop(source);
+        });
+    }
+
+    /// A completion the kernel batches can be posted after one for a buffer
+    /// it selected later, so the buffers a completion names are found where
+    /// they sit in the ring's order, not assumed to be at its front.
+    #[test]
+    fn a_completion_for_a_later_buffer_may_come_first() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(4, 16))
+            .make()
+            .unwrap();
+        ex.run(async {
+            let buffers = crate::executor().reactor().sys.recv_buffers().unwrap();
+            let mut buffers = buffers.borrow_mut();
+            let (first, second) = (buffers.order[0], buffers.order[1]);
+            assert_eq!(buffers.lent(second, 16).as_slice(), &[second]);
+            assert_eq!(buffers.lent(first, 16).as_slice(), &[first]);
+            buffers.give_back(first);
+            buffers.give_back(second);
+            buffers.publish();
+            assert_eq!(buffers.held(), 0);
         });
     }
 

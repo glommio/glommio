@@ -697,14 +697,28 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// the backpressure a connection nobody reads is given. The reactor
     /// reports a cancelled request as timed out, since before this the only
     /// thing that cancelled a request was a timeout, and this stream has no
-    /// timeout of its own on the request, so that is the value to match.
+    /// timeout of its own on the request, so that is the value to match, on
+    /// a request the reactor did throttle: the kernel ends a receive with a
+    /// real `ETIMEDOUT` as well, from a TCP user or keepalive timeout, and
+    /// that one is the reader's.
+    ///
+    /// Every way this returns ready cancels the read timeout, which a wait
+    /// before it may have armed.
     fn poll_fill_multishot(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
+        let polled = self.poll_fill_multishot_inner(cx);
+        if polled.is_ready() {
+            let reactor = self.stream.reactor.upgrade().unwrap();
+            self.stream.read_timeout.cancel_timer(&reactor);
+        }
+        polled
+    }
+
+    fn poll_fill_multishot_inner(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
         let reactor = self.stream.reactor.upgrade().unwrap();
         let mut reaped = false;
         loop {
             let taken = self.take_arrivals();
             if taken > 0 {
-                self.stream.read_timeout.cancel_timer(&reactor);
                 return Poll::Ready(Ok(taken));
             }
             let multi = self.rx_multi.as_ref().unwrap();
@@ -722,8 +736,8 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                     .maybe_set_timer(&reactor, cx.waker());
                 return Poll::Pending;
             };
-            let was_bundled = match &*multi.source_type() {
-                SourceType::RecvMulti(state) => state.bundled,
+            let (was_bundled, was_throttled) = match &*multi.source_type() {
+                SourceType::RecvMulti(state) => (state.bundled, state.throttled),
                 _ => unreachable!("rx_multi holds a multishot receive"),
             };
             self.rx_multi = None;
@@ -734,7 +748,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
                     reactor.note_recv_buffers_exhausted()
                 }
-                Err(err) if err.raw_os_error() == Some(libc::ETIMEDOUT) => {}
+                Err(err) if was_throttled && err.raw_os_error() == Some(libc::ETIMEDOUT) => {}
                 Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
                     reactor.refuse_recv_multi(was_bundled);
                     if was_bundled {
@@ -752,8 +766,10 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             }
             let fd = self.stream.stream.as_raw_fd();
             if let Some(result) = self.stream.poll_read_speculative(self.rx_buf.unfilled()) {
-                self.rx_multi = reactor.recv_multi(fd, self.rx_buf.buffer_size());
                 let result = poll_err!(result);
+                if result > 0 {
+                    self.rx_multi = reactor.recv_multi(fd, self.rx_buf.buffer_size());
+                }
                 self.rx_buf.handle_result(result);
                 return Poll::Ready(Ok(result));
             }

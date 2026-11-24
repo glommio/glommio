@@ -1195,6 +1195,15 @@ mod tests {
                 .await
                 .expect("the reset hid the buffered bytes");
             assert_eq!(&got[..peeked], b"bc");
+
+            let mut rest = [0u8; 2];
+            reader.read_exact(&mut rest).await.unwrap();
+            assert_eq!(&rest, b"bc");
+            let err = reader
+                .read(&mut got)
+                .await
+                .expect_err("the peek consumed the reset, so the read saw end of file");
+            assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
         });
     }
 

@@ -534,6 +534,12 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// otherwise waits on the request. A peek may return fewer bytes than
     /// asked for, so stopping at the queued ones is within its contract.
     /// Only a request the kernel has dropped leaves the socket to be peeked.
+    ///
+    /// Bytes already in the receive buffer come back without looking at the
+    /// socket. Linux hands a pending socket error to a `MSG_PEEK` receive
+    /// and clears it there, so peeking past buffered bytes would take an
+    /// error that belongs to the read after them, which would then see a
+    /// clean end of file.
     pub(crate) async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(source) = self.rx_source.as_ref() {
             let read = std::future::poll_fn(|cx| match source.result() {
@@ -596,23 +602,16 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 .await;
             }
         }
-        let mut pos = self.rx_buf.peek(buf);
-        if pos < buf.len() && !self.rx_done.get() {
-            if let Some(result) = self.stream.try_peek(&mut buf[pos..]) {
-                match result {
-                    Err(_) if pos > 0 => {}
-                    Err(e) => return Err(e),
-                    Ok(len) => {
-                        pos += len;
-                        if len == 0 {
-                            self.rx_done.set(true);
-                        }
-                    }
-                }
-            }
-        }
-        if pos > 0 || self.rx_done.get() {
+        let pos = self.rx_buf.peek(buf);
+        if pos > 0 || buf.is_empty() || self.rx_done.get() {
             return Ok(pos);
+        }
+        if let Some(result) = self.stream.try_peek(buf) {
+            let len = result?;
+            if len == 0 {
+                self.rx_done.set(true);
+            }
+            return Ok(len);
         }
         self.stream.peek(buf).await
     }

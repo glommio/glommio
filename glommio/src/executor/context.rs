@@ -119,7 +119,14 @@ impl ExecutorContext {
     /// Activates the owning executor's queue even while another executor runs.
     #[inline]
     pub(super) fn schedule(&self, queue: Rc<RefCell<TaskQueue>>, runnable: multitask::Runnable) {
-        queue.borrow_mut().runnables.push_back(runnable);
+        {
+            let mut queue = queue.borrow_mut();
+            if super::is_foreign_wake() {
+                queue.foreign_runnables.push_back(runnable);
+            } else {
+                queue.runnables.push_back(runnable);
+            }
+        }
         self.queues.borrow_mut().maybe_activate(queue);
     }
 

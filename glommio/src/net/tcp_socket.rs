@@ -1272,6 +1272,15 @@ mod tests {
         });
     }
 
+    /// A receive buffer with no room cannot buffer anything: a fill reads
+    /// nothing and is taken for the end of the stream, and a multishot
+    /// arrival never fits. It is refused where it is made.
+    #[test]
+    #[should_panic(expected = "a stream's receive buffer needs room")]
+    fn a_receive_buffer_needs_room() {
+        let _ = Preallocated::new(0);
+    }
+
     /// Guards against a failed `peer_addr` closing the descriptor the
     /// accepted stream still holds.
     #[test]

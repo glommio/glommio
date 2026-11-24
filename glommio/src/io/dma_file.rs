@@ -81,7 +81,7 @@ impl AdvisoryLockGuard {
                     still_locked
                         .path
                         .as_ref()
-                        .map_or("path has already been taken!".to_string(), |p| {
+                        .map_or("the file has no path".to_string(), |p| {
                             p.to_string_lossy().to_string()
                         }),
                 ),
@@ -2132,6 +2132,48 @@ pub(crate) mod test {
         assert_eq!(f1.stat().await.unwrap().file_size, 512);
     });
 
+    dma_file_test!(a_tmpfile_has_no_path_to_rename, path, _k, {
+        let parent = path.join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .tmpfile(true)
+            .dma_open(&parent)
+            .await
+            .unwrap();
+
+        assert!(file.path().is_none(), "an unnamed file has no path");
+        file.rename(path.join("moved"))
+            .await
+            .expect_err("an unnamed file cannot be renamed");
+        assert!(parent.is_dir(), "the parent directory stays where it was");
+        assert!(!path.join("moved").exists());
+    });
+
+    dma_file_test!(a_tmpfile_can_be_locked, path, _k, {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .tmpfile(true)
+            .dma_open(&path)
+            .await
+            .unwrap();
+
+        file.try_lock_exclusive()
+            .await
+            .unwrap()
+            .unlock()
+            .await
+            .unwrap();
+        file.try_lock_shared()
+            .await
+            .unwrap()
+            .unlock()
+            .await
+            .unwrap();
+    });
+
     dma_file_test!(resize_dma_buf, path, _k, {
         let file = OpenOptions::new()
             .create_new(true)
@@ -2351,11 +2393,11 @@ pub(crate) mod test {
     });
 
     dma_file_test!(close_fails_if_clone_exists, path, _k, {
+        let path = path.join("cloned");
         let file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
-            .tmpfile(true)
             .dma_open(&path)
             .await
             .unwrap();

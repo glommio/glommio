@@ -81,7 +81,10 @@ impl AdvisoryLockStateHolder {
         Self::map_state(self.state.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    fn mark_locking<'a>(&'a self, file: &Path) -> Result<AdvisoryLockStateGuard<'a>> {
+    /// Marks the lock as being taken. `file` only names the file in the
+    /// error, and an unnamed file has no path to give.
+    fn mark_locking<'a>(&'a self, file: Option<&Path>) -> Result<AdvisoryLockStateGuard<'a>> {
+        let file = file.map_or_else(|| "an unnamed file".to_string(), |p| format!("{p:?}"));
         self.state
             .compare_exchange(
                 AdvisoryLockState::Unlocked as u8,
@@ -92,13 +95,13 @@ impl AdvisoryLockStateHolder {
             .map(|_| AdvisoryLockStateGuard(self, true))
             .map_err(|state| match Self::map_state(state) {
                 AdvisoryLockState::Unlocked => crate::GlommioError::WouldBlock(ResourceType::File(
-                    format!("Failed to acquire lock but current state is unlocked on {file:?}?"),
+                    format!("Failed to acquire lock but current state is unlocked on {file}?"),
                 )),
                 AdvisoryLockState::Locking => crate::GlommioError::WouldBlock(ResourceType::File(
-                    format!("The lock is already trying to be acquired on {file:?}"),
+                    format!("The lock is already trying to be acquired on {file}"),
                 )),
                 AdvisoryLockState::Locked => crate::GlommioError::WouldBlock(ResourceType::File(
-                    format!("The lock is already acquired on {file:?}"),
+                    format!("The lock is already acquired on {file}"),
                 )),
             })
     }
@@ -204,6 +207,10 @@ impl AsFd for GlommioFile {
 }
 
 impl GlommioFile {
+    /// Opens `path` relative to `dir`.
+    ///
+    /// An `O_TMPFILE` file is left without a path: the one given names its
+    /// parent directory, not the file, which has no name to rename or remove.
     pub(crate) async fn open_at(
         dir: RawFd,
         path: &Path,
@@ -221,11 +228,12 @@ impl GlommioFile {
 
         let source = reactor.open_at(dir, &path, flags, mode);
         let fd = source.collect_fd().await?;
+        let unnamed = flags & libc::O_TMPFILE == libc::O_TMPFILE;
 
         let mut file = GlommioFile {
             file: Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as _) })),
             lock_state: Some(Arc::new(Default::default())),
-            path: RefCell::new(Some(path)),
+            path: RefCell::new((!unnamed).then_some(path)),
             inode: 0,
             dev_major: 0,
             dev_minor: 0,
@@ -368,11 +376,9 @@ impl GlommioFile {
             Ok(())
         } else {
             Err(GlommioError::CanNotBeClosed(
-                ResourceType::File(
-                    path.map_or("path has already been taken!".to_string(), |p| {
-                        p.to_string_lossy().to_string()
-                    }),
-                ),
+                ResourceType::File(path.map_or("the file has no path".to_string(), |p| {
+                    p.to_string_lossy().to_string()
+                })),
                 "Another clone of this file exists somewhere - cannot close fd",
             ))
         }
@@ -383,7 +389,7 @@ impl GlommioFile {
             .lock_state
             .as_ref()
             .unwrap()
-            .mark_locking(self.path.borrow().as_ref().unwrap())?;
+            .mark_locking(self.path.borrow().as_deref())?;
 
         let res = unsafe { libc::flock(self.as_raw_fd(), flags) };
         if res == -1 {
@@ -894,9 +900,9 @@ pub(crate) mod test {
         let holder = AdvisoryLockStateHolder::default();
         let path = Path::new("file");
         for _ in 0..64 {
-            holder.mark_locking(path).unwrap().commit();
+            holder.mark_locking(Some(path)).unwrap().commit();
             holder.unlock();
-            drop(holder.mark_locking(path).unwrap());
+            drop(holder.mark_locking(Some(path)).unwrap());
         }
         assert_eq!(holder.state(), AdvisoryLockState::Unlocked);
     }

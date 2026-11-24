@@ -193,11 +193,36 @@ impl BlockingThread {
     }
 }
 
+type Sources = Rc<RefCell<AHashMap<u64, Pin<Rc<RefCell<InnerSource>>>>>>;
+
+/// Takes a request's source back out of the table if the request's future is
+/// dropped before the request is sent, since no response will ever do it.
+struct Unsent {
+    sources: Sources,
+    id: Option<u64>,
+}
+
+impl Unsent {
+    /// The request reached the pool, so its response removes the source.
+    fn sent(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for Unsent {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            let source = self.sources.borrow_mut().remove(&id);
+            drop(source);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct BlockingThreadPool {
     tx: Rc<Sender<BlockingThreadReq>>,
     rx: Receiver<BlockingThreadResp>,
-    sources: RefCell<AHashMap<u64, Pin<Rc<RefCell<InnerSource>>>>>,
+    sources: Sources,
     requests: Cell<u64>,
     _threads: Vec<BlockingThread>,
 }
@@ -240,7 +265,7 @@ impl BlockingThreadPool {
             _threads: threads,
             tx: Rc::new(in_tx),
             rx: out_rx,
-            sources: RefCell::new(Default::default()),
+            sources: Default::default(),
             requests: Cell::new(0),
         })
     }
@@ -257,17 +282,24 @@ impl BlockingThreadPool {
             id,
             latency_sensitive: source.borrow().latency_sensitive,
         };
-        let mut waiters = self.sources.borrow_mut();
-        assert!(waiters.insert(id, source).is_none());
+        assert!(self.sources.borrow_mut().insert(id, source).is_none());
+        let unsent = Unsent {
+            sources: self.sources.clone(),
+            id: Some(id),
+        };
         let tx = self.tx.clone();
 
         async move {
             tx.send_async(req)
                 .await
                 .expect("failed to enqueue blocking operation");
+            unsent.sent();
         }
     }
 
+    /// A response can arrive for a source that is gone: dropping a send that
+    /// was still pending does not withdraw a request the pool has already
+    /// taken, but [`Unsent`] withdraws the source.
     pub(super) fn flush(&self) -> usize {
         let mut woke = 0;
         let mut waiters = self.sources.borrow_mut();
@@ -275,7 +307,9 @@ impl BlockingThreadPool {
             let id = x.id;
             let res = x.res;
 
-            let src = waiters.remove(&id).unwrap();
+            let Some(src) = waiters.remove(&id) else {
+                continue;
+            };
             let mut inner_source = src.borrow_mut();
             inner_source.wakers.result.replace(
                 res.try_into()
@@ -286,5 +320,76 @@ impl BlockingThreadPool {
             woke += 1;
         }
         woke
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        sys::{self, Source, SourceType},
+        IoRequirements,
+    };
+    use std::time::{Duration, Instant};
+
+    fn pool() -> BlockingThreadPool {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier).unwrap()
+    }
+
+    fn source() -> Source {
+        Source::new(
+            IoRequirements::default(),
+            -1,
+            SourceType::BlockingFn,
+            None,
+            None,
+        )
+    }
+
+    fn wait_for_response(pool: &BlockingThreadPool) {
+        let start = Instant::now();
+        while pool.rx.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no response");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A sent request keeps its source until the response arrives.
+    #[test]
+    fn sent_request_is_answered() {
+        let pool = pool();
+        let source = source();
+        futures_lite::future::block_on(
+            pool.push(BlockingThreadOp::Fn(Box::new(|| {})), source.inner.clone()),
+        );
+        wait_for_response(&pool);
+        assert_eq!(1, pool.flush());
+        assert!(source.inner.borrow().wakers.result.is_some());
+    }
+
+    /// A request dropped before it is sent never gets a response, so nothing
+    /// else would take its source out of the table.
+    #[test]
+    fn unsent_request_leaves_no_source_behind() {
+        let pool = pool();
+        let source = source();
+        drop(pool.push(BlockingThreadOp::Fn(Box::new(|| {})), source.inner.clone()));
+        assert!(pool.sources.borrow().is_empty());
+    }
+
+    /// A dropped send the pool had already taken still gets a response,
+    /// after its source is gone.
+    #[test]
+    fn response_without_a_source_is_ignored() {
+        let pool = pool();
+        let source = source();
+        futures_lite::future::block_on(
+            pool.push(BlockingThreadOp::Fn(Box::new(|| {})), source.inner.clone()),
+        );
+        pool.sources.borrow_mut().clear();
+
+        wait_for_response(&pool);
+        assert_eq!(0, pool.flush());
     }
 }

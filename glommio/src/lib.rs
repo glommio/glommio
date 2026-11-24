@@ -460,7 +460,7 @@ pub use crate::{
         yield_if_needed, CpuSet, ExecutorJoinHandle, ExecutorProxy, ExecutorStats, LocalExecutor,
         LocalExecutorBuilder, LocalExecutorPoolBuilder, Placement, PoolPlacement,
         PoolThreadHandles, RecvBuffers, RecvBuffersShape, ScopedTask, Task, TaskQueueHandle,
-        TaskQueueStats,
+        TaskQueueStats, UnobservedPanic,
     },
     shares::{Shares, SharesManager},
     sys::hardware_topology::CpuLocation,

@@ -53,6 +53,7 @@ use std::{
     future::Future,
     io,
     marker::PhantomData,
+    mem,
     ops::Deref,
     pin::Pin,
     rc::Rc,
@@ -727,6 +728,7 @@ pub struct LocalExecutorBuilder {
     detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
     /// Receive buffers lent to the kernel for multishot receive
     recv_buffers: RecvBuffers,
+    on_unobserved_panic: UnobservedPanic,
 }
 
 impl LocalExecutorBuilder {
@@ -738,6 +740,7 @@ impl LocalExecutorBuilder {
     pub fn new(placement: Placement) -> LocalExecutorBuilder {
         LocalExecutorBuilder {
             placement: placement.clone(),
+            on_unobserved_panic: UnobservedPanic::default(),
             spin_before_park: None,
             name: String::from(DEFAULT_EXECUTOR_NAME),
             io_memory: DEFAULT_IO_MEMORY,
@@ -754,6 +757,18 @@ impl LocalExecutorBuilder {
     #[must_use = "The builder must be built to be useful"]
     pub fn spin_before_park(mut self, spin: Duration) -> LocalExecutorBuilder {
         self.spin_before_park = Some(spin);
+        self
+    }
+
+    /// Chooses what happens to a blocking closure's panic that no task is
+    /// waiting for.
+    ///
+    /// Defaults to [`UnobservedPanic::Ignore`], which is what `tokio` does for
+    /// a task whose handle has been dropped. [`UnobservedPanic::Abort`] gives
+    /// `rayon`'s behaviour instead.
+    #[must_use = "The builder must be built to be useful"]
+    pub fn unobserved_panic(mut self, policy: UnobservedPanic) -> Self {
+        self.on_unobserved_panic = policy;
         self
     }
 
@@ -922,6 +937,7 @@ impl LocalExecutorBuilder {
                 thread_pool_placement: self.blocking_thread_pool_placement,
                 detect_stalls: self.detect_stalls,
                 recv_buffers: self.recv_buffers,
+                on_unobserved_panic: self.on_unobserved_panic,
             },
         )?;
         le.init();
@@ -986,6 +1002,7 @@ impl LocalExecutorBuilder {
         let preempt_timer_duration = self.preempt_timer_duration;
         let spin_before_park = self.spin_before_park;
         let detect_stalls = self.detect_stalls;
+        let on_unobserved_panic = self.on_unobserved_panic;
         let record_io_latencies = self.record_io_latencies;
         let blocking_thread_pool_placement = self.blocking_thread_pool_placement;
         let recv_buffers = self.recv_buffers;
@@ -1005,6 +1022,7 @@ impl LocalExecutorBuilder {
                         thread_pool_placement: blocking_thread_pool_placement,
                         detect_stalls,
                         recv_buffers,
+                        on_unobserved_panic,
                     },
                 )?;
                 le.init();
@@ -1044,6 +1062,8 @@ impl Default for LocalExecutorBuilder {
 /// handles.join_all();
 /// ```
 pub struct LocalExecutorPoolBuilder {
+    /// What to do with a blocking panic no task is waiting for.
+    on_unobserved_panic: UnobservedPanic,
     /// Spin for duration before parking a reactor
     spin_before_park: Option<Duration>,
     /// A name for the thread-to-be (if any), for identification in panic
@@ -1103,6 +1123,7 @@ impl LocalExecutorPoolBuilder {
     /// how many and which CPUs to use.
     pub fn new(placement: PoolPlacement) -> Self {
         Self {
+            on_unobserved_panic: UnobservedPanic::default(),
             spin_before_park: None,
             name: String::from(DEFAULT_EXECUTOR_NAME),
             io_memory: DEFAULT_IO_MEMORY,
@@ -1114,6 +1135,14 @@ impl LocalExecutorPoolBuilder {
             handler_gen: None,
             recv_buffers: RecvBuffers::default(),
         }
+    }
+
+    /// Chooses what happens to a blocking closure's panic that no task is
+    /// waiting for. See [`LocalExecutorBuilder::unobserved_panic`].
+    #[must_use = "The builder must be built to be useful"]
+    pub fn unobserved_panic(mut self, policy: UnobservedPanic) -> Self {
+        self.on_unobserved_panic = policy;
+        self
     }
 
     /// Please see documentation under
@@ -1295,6 +1324,7 @@ impl LocalExecutorPoolBuilder {
             let blocking_thread_pool_placement = self.blocking_thread_pool_placement.clone();
             let detect_stalls = self.handler_gen.as_ref().map(|x| (*x.deref())());
             let recv_buffers = self.recv_buffers;
+            let on_unobserved_panic = self.on_unobserved_panic.clone();
             let latch = Latch::clone(latch);
 
             move || {
@@ -1311,6 +1341,7 @@ impl LocalExecutorPoolBuilder {
                             thread_pool_placement: blocking_thread_pool_placement,
                             detect_stalls,
                             recv_buffers,
+                            on_unobserved_panic,
                         },
                     )?;
                     le.init();
@@ -1397,6 +1428,8 @@ pub struct LocalExecutorConfig {
     pub thread_pool_placement: PoolPlacement,
     pub detect_stalls: Option<Box<dyn stall::StallDetectionHandler + 'static>>,
     pub(crate) recv_buffers: RecvBuffers,
+    /// What to do with a blocking panic no task is waiting for.
+    pub on_unobserved_panic: UnobservedPanic,
 }
 
 /// Single-threaded executor.
@@ -1503,7 +1536,10 @@ impl LocalExecutor {
             config.recv_buffers,
         )?);
         let tasks = Rc::new(TaskRegistry::new(WeakExecutorContext::new(
-            id, &queues, &reactor,
+            id,
+            &queues,
+            &reactor,
+            config.on_unobserved_panic.clone(),
         )));
         trace!(id = id, "Creating executor");
         Ok(LocalExecutor {
@@ -1512,6 +1548,7 @@ impl LocalExecutor {
                 tasks,
                 id,
                 reactor,
+                on_unobserved_panic: config.on_unobserved_panic,
             },
             stall_detector: RefCell::new(
                 config
@@ -2405,6 +2442,42 @@ pub unsafe fn spawn_scoped_local_into<'a, T>(
 #[derive(Debug)]
 pub struct ExecutorProxy {}
 
+/// What to do with a blocking closure's panic that no task is waiting for.
+///
+/// A closure handed to [`ExecutorProxy::spawn_blocking`] runs to completion
+/// even if the future awaiting it is dropped, which is what `select!` does
+/// every time another branch wins. A panic then has nowhere to be resumed
+/// into. The panic hook still reports it whichever of these is chosen; this
+/// decides what happens afterwards.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub enum UnobservedPanic {
+    /// Carry on. This is `tokio`'s default for a task whose handle is gone.
+    #[default]
+    Ignore,
+    /// End the process, as `rayon` does when it has nowhere to propagate to.
+    Abort,
+    /// Hand the payload over, as `rayon`'s `panic_handler` does.
+    ///
+    /// Runs on whichever thread released the last reference: the pool worker
+    /// if the future was dropped first, the executor if the closure finished
+    /// first. A panic raised here aborts the process, as `rayon` does for its
+    /// handler, since unwinding would otherwise end the pool worker or reach
+    /// whichever task dropped the future. Wrap the body in
+    /// [`std::panic::catch_unwind`] to avoid that.
+    Handler(Arc<dyn Fn(Box<dyn std::any::Any + Send>) + Send + Sync>),
+}
+
+impl fmt::Debug for UnobservedPanic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ignore => f.write_str("Ignore"),
+            Self::Abort => f.write_str("Abort"),
+            Self::Handler(_) => f.write_str("Handler(..)"),
+        }
+    }
+}
+
 /// What a blocking job left behind.
 ///
 /// One value rather than a result beside a panic flag, so "produced nothing"
@@ -2413,6 +2486,51 @@ pub struct ExecutorProxy {}
 /// shape was a `MaybeUninit` that only the closure knew it had filled: a
 /// closure that unwound left it untouched, and reading it then was undefined
 /// rather than merely wrong.
+struct BlockingSlot<R> {
+    outcome: BlockingOutcome<R>,
+    on_unobserved: UnobservedPanic,
+}
+
+impl<R> BlockingSlot<R> {
+    /// Empties the slot, which is what marks the outcome as collected.
+    ///
+    /// The outcome is taken rather than moved out, since the slot implements
+    /// `Drop` and a field cannot be moved out of such a type; `Pending` is left
+    /// behind.
+    fn take(&mut self) -> BlockingOutcome<R> {
+        mem::replace(&mut self.outcome, BlockingOutcome::Pending)
+    }
+}
+
+impl<R> Drop for BlockingSlot<R> {
+    /// A slot still holding a panic is one nobody came back for.
+    ///
+    /// The awaiting task empties the slot when it collects, so reaching here
+    /// with a payload means the future was dropped before the closure
+    /// finished and there is nowhere left to resume into.
+    fn drop(&mut self) {
+        let BlockingOutcome::Panicked(payload) = self.take() else {
+            return;
+        };
+        match &self.on_unobserved {
+            UnobservedPanic::Ignore => {}
+            UnobservedPanic::Abort => {
+                eprintln!(
+                    "glommio: a blocking closure panicked with no task awaiting it; aborting"
+                );
+                std::process::abort();
+            }
+            UnobservedPanic::Handler(handler) => {
+                let _abort = scopeguard::guard_on_unwind((), |()| {
+                    eprintln!("glommio: an unobserved panic handler panicked; aborting");
+                    std::process::abort();
+                });
+                handler(payload);
+            }
+        }
+    }
+}
+
 enum BlockingOutcome<R> {
     /// Handed to the pool, not yet run.
     Pending,
@@ -3103,6 +3221,21 @@ impl ExecutorProxy {
             .map(|x| ScopedTask::<'a, T>(x, PhantomData));
     }
 
+    /// The policy the running executor was built with.
+    fn current_unobserved_panic() -> UnobservedPanic {
+        #[cfg(any(not(nightly), not(feature = "native-tls")))]
+        return LOCAL_EX.with(|local_ex| local_ex.on_unobserved_panic.clone());
+
+        #[cfg(all(nightly, feature = "native-tls"))]
+        unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .on_unobserved_panic
+                .clone()
+        }
+    }
+
     /// Spawns a blocking task into a background thread where blocking is
     /// acceptable.
     ///
@@ -3151,13 +3284,17 @@ impl ExecutorProxy {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let outcome = Arc::new(Mutex::new(BlockingOutcome::Pending));
+        let on_unobserved = Self::current_unobserved_panic();
+        let outcome = Arc::new(Mutex::new(BlockingSlot {
+            outcome: BlockingOutcome::Pending,
+            on_unobserved,
+        }));
         let f_inner = enclose::enclose!((outcome) move || {
             let produced = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(func)) {
                 Ok(value) => BlockingOutcome::Produced(value),
                 Err(payload) => BlockingOutcome::Panicked(payload),
             };
-            *outcome.lock().unwrap() = produced;
+            outcome.lock().unwrap().outcome = produced;
         });
 
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
@@ -3185,7 +3322,7 @@ impl ExecutorProxy {
             // The lock is only ever held to store the outcome, and storing it
             // replaces a `Pending` that has nothing to drop, so nothing can
             // unwind while holding it and the mutex cannot be poisoned.
-            match cell.into_inner().unwrap() {
+            match cell.into_inner().unwrap().take() {
                 BlockingOutcome::Produced(value) => value,
                 BlockingOutcome::Panicked(payload) => std::panic::resume_unwind(payload),
                 BlockingOutcome::Pending => {

@@ -3073,6 +3073,57 @@ pub unsafe fn glommio::PoolPlacement::init(init: <T as crossbeam_epoch::atomic::
 impl<T> tracing::instrument::Instrument for glommio::PoolPlacement
 impl<T> tracing::instrument::WithSubscriber for glommio::PoolPlacement
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::PoolPlacement where T: ?core::marker::Sized
+#[non_exhaustive] pub enum glommio::prelude::executor::UnobservedPanic
+pub glommio::prelude::executor::UnobservedPanic::Abort
+pub glommio::prelude::executor::UnobservedPanic::Handler(alloc::sync::Arc<(dyn core::ops::function::Fn(alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>) + core::marker::Send + core::marker::Sync)>)
+pub glommio::prelude::executor::UnobservedPanic::Ignore
+impl core::clone::Clone for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::clone(&self) -> glommio::UnobservedPanic
+impl core::default::Default for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::default() -> glommio::UnobservedPanic
+impl core::fmt::Debug for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for glommio::UnobservedPanic
+impl core::marker::Send for glommio::UnobservedPanic
+impl core::marker::Sync for glommio::UnobservedPanic
+impl core::marker::Unpin for glommio::UnobservedPanic
+impl core::marker::UnsafeUnpin for glommio::UnobservedPanic
+impl !core::panic::unwind_safe::RefUnwindSafe for glommio::UnobservedPanic
+impl !core::panic::unwind_safe::UnwindSafe for glommio::UnobservedPanic
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::UnobservedPanic where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::UnobservedPanic where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::UnobservedPanic where U: core::convert::From<T>
+pub fn glommio::UnobservedPanic::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::UnobservedPanic where U: core::convert::Into<T>
+pub type glommio::UnobservedPanic::Error = core::convert::Infallible
+pub fn glommio::UnobservedPanic::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::UnobservedPanic where U: core::convert::TryFrom<T>
+pub type glommio::UnobservedPanic::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::UnobservedPanic::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::UnobservedPanic where T: core::clone::Clone
+pub type glommio::UnobservedPanic::Owned = T
+pub fn glommio::UnobservedPanic::clone_into(&self, target: &mut T)
+pub fn glommio::UnobservedPanic::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::UnobservedPanic where T: 'static + ?core::marker::Sized
+pub fn glommio::UnobservedPanic::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::UnobservedPanic where T: ?core::marker::Sized
+pub fn glommio::UnobservedPanic::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::UnobservedPanic where T: ?core::marker::Sized
+pub fn glommio::UnobservedPanic::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::UnobservedPanic where T: core::clone::Clone
+pub unsafe fn glommio::UnobservedPanic::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::UnobservedPanic
+pub type glommio::UnobservedPanic::Init = T
+pub const glommio::UnobservedPanic::ALIGN: usize
+pub unsafe fn glommio::UnobservedPanic::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::UnobservedPanic::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::UnobservedPanic::drop(ptr: usize)
+pub unsafe fn glommio::UnobservedPanic::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::UnobservedPanic
+impl<T> tracing::instrument::WithSubscriber for glommio::UnobservedPanic
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::UnobservedPanic where T: ?core::marker::Sized
 pub struct glommio::prelude::executor::CpuSet(_)
 impl glommio::CpuSet
 pub fn glommio::CpuSet::contains(&self, value: &glommio::CpuLocation) -> bool
@@ -3361,6 +3412,7 @@ pub fn glommio::LocalExecutorBuilder::recv_buffers(self, buffers: impl core::con
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::unobserved_panic(self, policy: glommio::UnobservedPanic) -> Self
 impl core::default::Default for glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::default() -> Self
 impl core::fmt::Debug for glommio::LocalExecutorBuilder
@@ -3413,6 +3465,7 @@ pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: boo
 pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::unobserved_panic(self, policy: glommio::UnobservedPanic) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
 pub fn glommio::LocalExecutorPoolBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::LocalExecutorPoolBuilder
@@ -4287,6 +4340,7 @@ pub fn glommio::LocalExecutorBuilder::recv_buffers(self, buffers: impl core::con
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::unobserved_panic(self, policy: glommio::UnobservedPanic) -> Self
 impl core::default::Default for glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::default() -> Self
 impl core::fmt::Debug for glommio::LocalExecutorBuilder
@@ -4339,6 +4393,7 @@ pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: boo
 pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::unobserved_panic(self, policy: glommio::UnobservedPanic) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
 pub fn glommio::LocalExecutorPoolBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::LocalExecutorPoolBuilder
@@ -5789,6 +5844,57 @@ pub unsafe fn glommio::Shares::init(init: <T as crossbeam_epoch::atomic::Pointab
 impl<T> tracing::instrument::Instrument for glommio::Shares
 impl<T> tracing::instrument::WithSubscriber for glommio::Shares
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::Shares where T: ?core::marker::Sized
+#[non_exhaustive] pub enum glommio::UnobservedPanic
+pub glommio::UnobservedPanic::Abort
+pub glommio::UnobservedPanic::Handler(alloc::sync::Arc<(dyn core::ops::function::Fn(alloc::boxed::Box<(dyn core::any::Any + core::marker::Send)>) + core::marker::Send + core::marker::Sync)>)
+pub glommio::UnobservedPanic::Ignore
+impl core::clone::Clone for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::clone(&self) -> glommio::UnobservedPanic
+impl core::default::Default for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::default() -> glommio::UnobservedPanic
+impl core::fmt::Debug for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for glommio::UnobservedPanic
+impl core::marker::Send for glommio::UnobservedPanic
+impl core::marker::Sync for glommio::UnobservedPanic
+impl core::marker::Unpin for glommio::UnobservedPanic
+impl core::marker::UnsafeUnpin for glommio::UnobservedPanic
+impl !core::panic::unwind_safe::RefUnwindSafe for glommio::UnobservedPanic
+impl !core::panic::unwind_safe::UnwindSafe for glommio::UnobservedPanic
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::UnobservedPanic where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::UnobservedPanic where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::UnobservedPanic where U: core::convert::From<T>
+pub fn glommio::UnobservedPanic::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::UnobservedPanic where U: core::convert::Into<T>
+pub type glommio::UnobservedPanic::Error = core::convert::Infallible
+pub fn glommio::UnobservedPanic::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::UnobservedPanic where U: core::convert::TryFrom<T>
+pub type glommio::UnobservedPanic::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::UnobservedPanic::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::UnobservedPanic where T: core::clone::Clone
+pub type glommio::UnobservedPanic::Owned = T
+pub fn glommio::UnobservedPanic::clone_into(&self, target: &mut T)
+pub fn glommio::UnobservedPanic::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::UnobservedPanic where T: 'static + ?core::marker::Sized
+pub fn glommio::UnobservedPanic::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::UnobservedPanic where T: ?core::marker::Sized
+pub fn glommio::UnobservedPanic::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::UnobservedPanic where T: ?core::marker::Sized
+pub fn glommio::UnobservedPanic::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::UnobservedPanic where T: core::clone::Clone
+pub unsafe fn glommio::UnobservedPanic::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::UnobservedPanic
+pub fn glommio::UnobservedPanic::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::UnobservedPanic
+pub type glommio::UnobservedPanic::Init = T
+pub const glommio::UnobservedPanic::ALIGN: usize
+pub unsafe fn glommio::UnobservedPanic::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::UnobservedPanic::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::UnobservedPanic::drop(ptr: usize)
+pub unsafe fn glommio::UnobservedPanic::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::UnobservedPanic
+impl<T> tracing::instrument::WithSubscriber for glommio::UnobservedPanic
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::UnobservedPanic where T: ?core::marker::Sized
 pub struct glommio::CpuLocation
 pub glommio::CpuLocation::cache_domain: usize
 pub glommio::CpuLocation::core: usize
@@ -6221,6 +6327,7 @@ pub fn glommio::LocalExecutorBuilder::recv_buffers(self, buffers: impl core::con
 pub fn glommio::LocalExecutorBuilder::ring_depth(self, ring_depth: usize) -> glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::spawn<G, F, T>(self, fut_gen: G) -> glommio::Result<glommio::ExecutorJoinHandle<T>> where G: core::ops::function::FnOnce() -> F + core::marker::Send + 'static, F: core::future::future::Future<Output = T> + 'static, T: core::marker::Send + 'static
 pub fn glommio::LocalExecutorBuilder::spin_before_park(self, spin: core::time::Duration) -> glommio::LocalExecutorBuilder
+pub fn glommio::LocalExecutorBuilder::unobserved_panic(self, policy: glommio::UnobservedPanic) -> Self
 impl core::default::Default for glommio::LocalExecutorBuilder
 pub fn glommio::LocalExecutorBuilder::default() -> Self
 impl core::fmt::Debug for glommio::LocalExecutorBuilder
@@ -6273,6 +6380,7 @@ pub fn glommio::LocalExecutorPoolBuilder::record_io_latencies(self, enabled: boo
 pub fn glommio::LocalExecutorPoolBuilder::recv_buffers(self, buffers: impl core::convert::Into<glommio::RecvBuffers>) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::ring_depth(self, ring_depth: usize) -> Self
 pub fn glommio::LocalExecutorPoolBuilder::spin_before_park(self, spin: core::time::Duration) -> Self
+pub fn glommio::LocalExecutorPoolBuilder::unobserved_panic(self, policy: glommio::UnobservedPanic) -> Self
 impl core::fmt::Debug for glommio::LocalExecutorPoolBuilder
 pub fn glommio::LocalExecutorPoolBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::LocalExecutorPoolBuilder

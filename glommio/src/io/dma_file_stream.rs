@@ -844,17 +844,23 @@ struct DmaStreamWriterState {
     /// A flush failed, so nothing from its position on can reach the file and
     /// every later operation must fail too, after the first has reported why.
     write_failed: bool,
+    /// Callers waiting for the flushed position to reach a target, woken
+    /// each time a buffer write finishes. A caller cannot always wait on
+    /// the writes themselves: a write's handle can be awaited only once, and
+    /// a concurrent flush or close may hold it.
+    flush_waiters: Vec<Waker>,
 }
 
 /// We do it like this so that the write and read close errors are exactly the
 /// same. The reader uses enhanced errors, so it has a message in the inner
 /// attribute of `io::Error`.
+fn closed_error() -> io::Error {
+    io::Error::other(format!("{}", io::Error::from_raw_os_error(libc::EBADF)))
+}
+
 macro_rules! already_closed {
     () => {
-        Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("{}", io::Error::from_raw_os_error(libc::EBADF)),
-        )))
+        Poll::Ready(Err(closed_error()))
     };
 }
 
@@ -872,6 +878,16 @@ macro_rules! ensure_not_closed {
 impl DmaStreamWriterState {
     fn add_waker(&mut self, waker: Waker) {
         self.waker = Some(waker);
+    }
+
+    /// Ready once everything up to `target` is written, or once the stream
+    /// has failed and nothing more will be.
+    fn poll_flushed_to(&mut self, target: u64, cx: &Context<'_>) -> Poll<()> {
+        if self.flushed_pos() >= target || self.error.is_some() || self.write_failed {
+            return Poll::Ready(());
+        }
+        self.flush_waiters.push(cx.waker().clone());
+        Poll::Pending
     }
 
     fn current_error<T, E: From<io::Error>>(&mut self) -> Option<std::result::Result<T, E>> {
@@ -915,6 +931,8 @@ impl DmaStreamWriterState {
             for flush in pending.drain(..) {
                 flush.await;
             }
+            futures_lite::future::poll_fn(|cx| state.borrow_mut().poll_flushed_to(final_pos, cx))
+                .await;
 
             let (must_truncate, must_sync) = {
                 let state = state.borrow();
@@ -1052,13 +1070,13 @@ impl DmaStreamWriterState {
             } else {
                 state.flush_state.on_complete(flush_pos);
             }
-
-            if let FileStatus::Open = state.file_status {
-                if let Some(waker) = state.waker.take() {
-                    drop(state);
-                    waker.wake();
-                }
-            }
+            let waiters = std::mem::take(&mut state.flush_waiters);
+            let waker = match state.file_status {
+                FileStatus::Open => state.waker.take(),
+                _ => None,
+            };
+            drop(state);
+            waiters.into_iter().chain(waker).for_each(Waker::wake);
         })
         .detach();
         self.flush_state.on_start(flush_pos, handle);
@@ -1127,6 +1145,7 @@ impl DmaStreamWriter {
             buffer_pos: 0,
             synced_pos: 0,
             write_failed: false,
+            flush_waiters: Vec::new(),
         };
 
         let state = Rc::new(RefCell::new(state));
@@ -1211,6 +1230,9 @@ impl DmaStreamWriter {
     async fn flush_inner(&self, partial: bool) -> Result<u64> {
         let (target_pos, pending) = {
             let mut state = self.state.borrow_mut();
+            if !matches!(state.file_status, FileStatus::Open) {
+                return Err(closed_error().into());
+            }
             let pos = if partial && state.buffer_pos > 0 {
                 state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
                 state.current_pos()
@@ -1230,6 +1252,8 @@ impl DmaStreamWriter {
             pending.pop_front();
         }
         drop(ScopeGuard::into_inner(pending));
+        futures_lite::future::poll_fn(|cx| self.state.borrow_mut().poll_flushed_to(target_pos, cx))
+            .await;
         let mut state = self.state.borrow_mut();
         if let Some(err) = state.current_error() {
             return err;
@@ -1244,8 +1268,10 @@ impl DmaStreamWriter {
             (state.flushed_pos(), state.synced_pos)
         };
         if presync_pos < flushed_pos {
-            let file = self.file.borrow().clone();
-            file.unwrap().fdatasync().await?;
+            let Some(file) = self.file.borrow().clone() else {
+                return Err(closed_error().into());
+            };
+            file.fdatasync().await?;
             self.state.borrow_mut().synced_pos = flushed_pos;
         } else {
             assert_eq!(presync_pos, flushed_pos);
@@ -2528,6 +2554,56 @@ mod test {
             .await
             .expect("closing next to a waiting flush hung");
             assert_eq!(file_size(&filename), 10);
+        }
+    );
+
+    file_stream_write_test!(
+        two_aligned_flushes_at_once_both_wait,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build();
+            let mut w = &writer;
+            w.write_all(&[7u8; 4096 + 10]).await.unwrap();
+            let (first, second) = futures::join!(writer.flush_aligned(), writer.flush_aligned());
+            assert_eq!(first.unwrap(), 4096);
+            assert_eq!(
+                second.unwrap(),
+                4096,
+                "the second flush did not wait for the first's writes"
+            );
+            w.close().await.unwrap();
+            assert_eq!(file_size(&filename), 4096 + 10);
+        }
+    );
+
+    file_stream_write_test!(
+        flushes_and_syncs_after_close_fail,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build();
+            let mut w = &writer;
+            w.write_all(&[7u8; 100]).await.unwrap();
+            w.close().await.unwrap();
+            writer.sync().await.expect_err("sync after close");
+            writer
+                .sync_aligned()
+                .await
+                .expect_err("sync_aligned after close");
+            writer
+                .flush_aligned()
+                .await
+                .expect_err("flush_aligned after close");
+            assert_eq!(file_size(&filename), 100);
         }
     );
 

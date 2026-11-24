@@ -12,8 +12,6 @@ jobs:
       contents: read
       actions: write
     runs-on: ubuntu-latest
-    outputs:
-      changelog: ${{ steps.git-cliff.outputs.content }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -43,11 +41,14 @@ jobs:
         with:
           name: release-changes
 
-      - uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          overwrite: true
-          file: CHANGES.md
-          tag: ${{ github.ref }}
-          release_name: "Release ${{ github.ref }}"
-          body: "${{ needs.generate-changelog.outputs.changelog }}"
+      # The repository publishes immutable releases, which take no assets once
+      # published, so the notes go in the body and nothing is uploaded.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --title "Release $GITHUB_REF_NAME"
+          --notes-file CHANGES.md

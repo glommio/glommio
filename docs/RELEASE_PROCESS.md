@@ -18,7 +18,7 @@ This checklist ensures all necessary steps are completed when releasing a new ve
 - [ ] Run semantic versioning checks: `cargo semver-checks --package glommio --baseline-rev origin/main`
 - [ ] Run linters: `cargo clippy --all-targets --all-features`
 - [ ] Check formatting: `cargo fmt --all -- --check`
-- [ ] Verify documentation generation: `cargo doc --package glommio`
+- [ ] Verify documentation generation the way CI does (see below): `cargo +1.93.0 doc --workspace --all-features`
 - [ ] Validate documentation links: `cargo deadlinks --dir target/doc/glommio`
 
 ### 3. Documentation
@@ -129,8 +129,10 @@ cargo test --package glommio --features version-compatibility public_api
 # Run semver checks
 cargo semver-checks --package glommio --baseline-rev origin/main
 
-# Generate documentation
-cargo doc --package glommio
+# Generate documentation as CI does; other toolchains and flags leave links
+# into zerocopy's private docs dangling (rust-lang/rust#148431)
+RUSTDOCFLAGS="--cfg zerocopy_unstable_ptr -D rustdoc::broken_intra_doc_links" \
+  cargo +1.93.0 doc --workspace --all-features
 
 # Validate documentation links
 cargo deadlinks --dir target/doc/glommio

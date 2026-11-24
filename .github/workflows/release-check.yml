@@ -52,13 +52,29 @@ jobs:
         with:
           tool: nextest@0.9.143
 
+      # On the toolchain ci.yml tests with. The macros' compile-fail tests
+      # compare compiler output, which changes wording between releases.
+      - name: Use Rust MSRV for testing
+        run: rustup override set 1.92.0
+
       - name: Run all tests
         run: .github/scripts/run-tests.sh
 
       - name: Install cargo-deadlinks
         run: which cargo-deadlinks || cargo install --locked cargo-deadlinks
 
+      # Built the way ci.yml's docs job builds them. The default toolchain and
+      # flags leave hundreds of links into zerocopy's private docs dangling,
+      # see https://github.com/rust-lang/rust/issues/148431
+      - name: Use Rust 1.93 for documentation
+        run: rustup override set 1.93.0
+
       - name: Verify documentation
+        env:
+          RUSTDOCFLAGS: >-
+            --cfg zerocopy_unstable_ptr
+            -D rustdoc::broken_intra_doc_links
         run: |
+          cargo clean --doc
           cargo doc --workspace --all-features --locked
           cargo deadlinks --dir target/doc/glommio

@@ -267,7 +267,7 @@ impl<T: Send + Sized> ConnectedSender<T> {
         {
             return Err(GlommioError::Closed(ResourceType::Channel(item)));
         }
-        match self.state.buffer.try_push(item) {
+        match self.state.buffer.buffer.try_push(item) {
             None => {
                 self.notifier.notify(false);
                 Ok(())
@@ -436,7 +436,7 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
     }
 
     fn do_recv_one(&self, cx: &mut Context<'_>, disconnected: bool) -> Poll<Option<T>> {
-        match self.state.buffer.try_pop() {
+        match self.state.buffer.buffer.try_pop() {
             None => {
                 if disconnected {
                     Poll::Ready(None)

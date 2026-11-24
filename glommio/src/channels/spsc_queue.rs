@@ -179,7 +179,10 @@ impl<T> Buffer<T> {
     /// return `None` signifying the buffer was empty. The caller may then
     /// decide what to do next (e.g. spin-wait, sleep, process something
     /// else, etc.)
-    fn try_pop(&self) -> Option<T> {
+    ///
+    /// Only for the one active consumer: two concurrent callers can pop the
+    /// same value.
+    pub(crate) fn try_pop(&self) -> Option<T> {
         let head = self.ccache.head.load(Ordering::Relaxed);
         let slot = &self.buffer_storage[head & self.mask];
         if !slot.has_value.load(Ordering::Acquire) {
@@ -199,7 +202,10 @@ impl<T> Buffer<T> {
     /// return `Some(v)`, where `v` was the value attempting to be pushed
     /// onto the buffer.  If the value was successfully pushed onto the
     /// buffer, `None` will be returned signifying success.
-    fn try_push(&self, v: T) -> Option<T> {
+    ///
+    /// Only for the one active producer: two concurrent callers can write the
+    /// same slot.
+    pub(crate) fn try_push(&self, v: T) -> Option<T> {
         if self.consumer_disconnected() {
             return Some(v);
         }
@@ -386,7 +392,10 @@ impl<T> Producer<T> {
     /// added to the queue and the method will return `None`, signifying
     /// success.  If the queue is full, this method will return `Some(v)``,
     /// where `v` is your original value.
-    pub fn try_push(&self, v: T) -> Option<T> {
+    ///
+    /// Takes `&mut self` so that the one producer cannot push from two
+    /// threads at once through a shared reference.
+    pub fn try_push(&mut self, v: T) -> Option<T> {
         (*self.buffer).try_push(v)
     }
 
@@ -459,7 +468,17 @@ impl<T> Consumer<T> {
     /// This method does not block.  If the queue is empty, the method will
     /// return `None`.  If there is a value available, the method will
     /// return `Some(v)`, where `v` is the value being popped off the queue.
-    pub fn try_pop(&self) -> Option<T> {
+    ///
+    /// Takes `&mut self` so that the one consumer cannot pop from two
+    /// threads at once through a shared reference, which could hand the same
+    /// value out twice:
+    ///
+    /// ```compile_fail,E0596
+    /// let (_producer, consumer) = glommio::channels::spsc_queue::make::<u32>(1);
+    /// let shared = &consumer;
+    /// shared.try_pop();
+    /// ```
+    pub fn try_pop(&mut self) -> Option<T> {
         (*self.buffer).try_pop()
     }
 }
@@ -471,7 +490,7 @@ mod tests {
 
     #[test]
     fn test_try_push() {
-        let (p, _) = super::make(10);
+        let (mut p, _) = super::make(10);
 
         assert_eq!(p.capacity(), 16);
 
@@ -490,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_try_poll() {
-        let (p, c) = super::make(10);
+        let (mut p, mut c) = super::make(10);
 
         if c.try_pop().is_some() {
             unreachable!("Queue was empty but a value was read!")
@@ -510,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_threaded() {
-        let (p, c) = super::make(500);
+        let (mut p, mut c) = super::make(500);
 
         thread::spawn(move || {
             for i in 0..100000 {
@@ -534,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_wrap() {
-        let (p, c) = super::inner_make(10, usize::MAX - 1);
+        let (mut p, mut c) = super::inner_make(10, usize::MAX - 1);
 
         for i in 0..10 {
             assert!(p.try_push(i).is_none());

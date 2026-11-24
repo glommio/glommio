@@ -534,6 +534,12 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// otherwise waits on the request. A peek may return fewer bytes than
     /// asked for, so stopping at the queued ones is within its contract.
     /// Only a request the kernel has dropped leaves the socket to be peeked.
+    ///
+    /// Bytes already in the receive buffer come back without looking at the
+    /// socket. Linux hands a pending socket error to a `MSG_PEEK` receive
+    /// and clears it there, so peeking past buffered bytes would take an
+    /// error that belongs to the read after them, which would then see a
+    /// clean end of file.
     pub(crate) async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         if let Some(source) = self.rx_source.as_ref() {
             let read = std::future::poll_fn(|cx| match source.result() {
@@ -574,6 +580,9 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                     return Ok(pos);
                 }
                 if !armed {
+                    if let Some(ended) = Self::final_result(multi) {
+                        return ended;
+                    }
                     break;
                 }
                 if reactor.reap_socket_completions()? > 0 {
@@ -593,24 +602,40 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 .await;
             }
         }
-        let mut pos = self.rx_buf.peek(buf);
-        if pos < buf.len() && !self.rx_done.get() {
-            if let Some(result) = self.stream.try_peek(&mut buf[pos..]) {
-                match result {
-                    Err(e) => return Err(e),
-                    Ok(len) => {
-                        pos += len;
-                        if len == 0 {
-                            self.rx_done.set(true);
-                        }
-                    }
-                }
-            }
-        }
-        if pos > 0 || self.rx_done.get() {
+        let pos = self.rx_buf.peek(buf);
+        if pos > 0 || buf.is_empty() || self.rx_done.get() {
             return Ok(pos);
         }
+        if let Some(result) = self.stream.try_peek(buf) {
+            let len = result?;
+            if len == 0 {
+                self.rx_done.set(true);
+            }
+            return Ok(len);
+        }
         self.stream.peek(buf).await
+    }
+
+    /// How an ended multishot receive left the stream, when that is final:
+    /// end of file, or an error the kernel took from the socket, which reads
+    /// as a clean end of file once taken. `None` for the endings the read
+    /// path re-arms after, running out of buffers, the reactor's throttle,
+    /// or a refused flag, where the socket still holds whatever there is.
+    /// The result stays on the request, for the read to report as well.
+    fn final_result(multi: &Source) -> Option<io::Result<usize>> {
+        let throttled = match &*multi.source_type() {
+            SourceType::RecvMulti(state) => state.throttled,
+            _ => unreachable!("rx_multi holds a multishot receive"),
+        };
+        match multi.result()? {
+            Ok(0) => Some(Ok(0)),
+            Ok(_) => None,
+            Err(err) => match err.raw_os_error() {
+                Some(libc::ENOBUFS | libc::EINVAL) => None,
+                Some(libc::ETIMEDOUT) if throttled => None,
+                _ => Some(Err(err)),
+            },
+        }
     }
 
     pub(crate) fn poll_read(

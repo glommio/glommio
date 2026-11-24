@@ -81,8 +81,7 @@ impl UdpSocket {
     /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket> {
         let addr = addr
-            .to_socket_addrs()
-            .unwrap()
+            .to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::other("empty address"))?;
 
@@ -625,8 +624,7 @@ impl UdpSocket {
     /// [`ToSocketAddrs`]: https://doc.rust-lang.org/stable/std/net/trait.ToSocketAddrs.html
     pub async fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> Result<usize> {
         let addr = addr
-            .to_socket_addrs()
-            .unwrap()
+            .to_socket_addrs()?
             .next()
             .ok_or_else(|| io::Error::other("empty address"))?;
 

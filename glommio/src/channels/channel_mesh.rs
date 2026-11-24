@@ -7,7 +7,6 @@ use std::{
     fmt::{self, Debug, Formatter},
     future::poll_fn,
     io::{Error, ErrorKind},
-    mem,
     sync::{Arc, Mutex},
     task::{Poll, Waker},
 };
@@ -162,6 +161,10 @@ impl<T: Send> Receivers<T> {
 struct Peer {
     executor_id: usize,
     role: Role,
+    /// The waker of this peer's join while it waits for the mesh to fill.
+    /// One per peer, so a withdrawn peer takes its waker with it and a join
+    /// polled by a new waker replaces the old one.
+    waker: Option<Waker>,
 }
 
 impl Peer {
@@ -169,6 +172,7 @@ impl Peer {
         Self {
             executor_id: crate::executor().id(),
             role,
+            waker: None,
         }
     }
 }
@@ -197,8 +201,6 @@ impl Role {
 struct JoinState<T: Send> {
     peers: Vec<Peer>,
     ready: bool,
-    /// Peers waiting for the last one to join, woken once the channels exist.
-    waiters: Vec<Waker>,
     senders: Vec<Vec<Option<SharedSender<T>>>>,
     receivers: Vec<Vec<Option<SharedReceiver<T>>>>,
 }
@@ -216,7 +218,6 @@ impl<T: Send> JoinState<T> {
         Self {
             peers: Vec::new(),
             ready: false,
-            waiters: Vec::new(),
             senders,
             receivers,
         }
@@ -374,7 +375,11 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 }
 
                 state.ready = true;
-                let waiters = mem::take(&mut state.waiters);
+                let waiters: Vec<Waker> = state
+                    .peers
+                    .iter_mut()
+                    .filter_map(|peer| peer.waker.take())
+                    .collect();
                 drop(state);
                 for waiter in waiters {
                     waiter.wake();
@@ -391,8 +396,21 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 if state.ready {
                     return Poll::Ready(());
                 }
-                state.waiters.retain(|w| !w.will_wake(cx.waker()));
-                state.waiters.push(cx.waker().clone());
+                let index = state
+                    .peers
+                    .binary_search_by(|p| p.executor_id.cmp(&exec_id))
+                    .expect("a waiting peer keeps its seat");
+                let peer = &mut state.peers[index];
+                if peer
+                    .waker
+                    .as_ref()
+                    .is_some_and(|waker| waker.will_wake(cx.waker()))
+                {
+                    return Poll::Pending;
+                }
+                let replaced = peer.waker.replace(cx.waker().clone());
+                drop(state);
+                drop(replaced);
                 Poll::Pending
             })
             .await;
@@ -434,7 +452,9 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
                 return;
             };
             if !state.ready {
-                state.peers.remove(index);
+                let withdrawn = state.peers.remove(index);
+                drop(state);
+                drop(withdrawn);
                 return;
             }
             (0..self.nr_peers)
@@ -599,6 +619,66 @@ mod tests {
             .unwrap();
         b.join().unwrap();
         a.join().unwrap();
+    }
+
+    /// A waker that does nothing, so a test can tell from its `Arc` whether
+    /// the mesh still holds it.
+    struct Tracked;
+
+    impl futures::task::ArcWake for Tracked {
+        fn wake_by_ref(_: &Arc<Self>) {}
+    }
+
+    /// Guards against a cancelled join leaving its waker in the mesh, where
+    /// it keeps the cancelled task alive until the mesh fills.
+    #[test]
+    fn a_cancelled_join_releases_its_waker() {
+        use std::{future::Future, pin::pin, task::Context};
+        test_executor!(async move {
+            let mesh = MeshBuilder::<u32, _>::full(2, 1);
+            let tracked = Arc::new(Tracked);
+            {
+                let waker = futures::task::waker(tracked.clone());
+                let join = pin!(mesh.clone().join());
+                assert!(join.poll(&mut Context::from_waker(&waker)).is_pending());
+            }
+            assert_eq!(
+                Arc::strong_count(&tracked),
+                1,
+                "the mesh still holds a cancelled join's waker"
+            );
+        });
+    }
+
+    /// Guards against a join polled by a new waker keeping the old one.
+    #[test]
+    fn a_join_polled_by_a_new_waker_releases_the_old_one() {
+        use std::{future::Future, pin::pin, task::Context};
+        test_executor!(async move {
+            let mesh = MeshBuilder::<u32, _>::full(2, 1);
+            let (first, second) = (Arc::new(Tracked), Arc::new(Tracked));
+            let mut join = pin!(mesh.clone().join());
+            {
+                let waker = futures::task::waker(first.clone());
+                assert!(join
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending());
+            }
+            {
+                let waker = futures::task::waker(second.clone());
+                assert!(join
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending());
+            }
+            assert_eq!(
+                Arc::strong_count(&first),
+                1,
+                "the mesh kept the waker the join was polled by before"
+            );
+            assert_eq!(Arc::strong_count(&second), 2);
+        });
     }
 
     /// A peer waiting for the others to join is not polled again until the

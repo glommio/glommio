@@ -18,7 +18,10 @@ use std::{
     future::Future,
     io,
     ops::Range,
-    os::unix::io::RawFd,
+    os::{
+        fd::{BorrowedFd, OwnedFd},
+        unix::io::RawFd,
+    },
     panic,
     pin::Pin,
     ptr,
@@ -369,6 +372,13 @@ fn probe_optional_operations() -> Vec<u8> {
 /// Whether an optional opcode can be submitted on this kernel.
 pub(crate) fn supports_optional_op(opcode: u8) -> bool {
     OPTIONAL_OPS.contains(&opcode)
+}
+
+/// A duplicate of `fd` for an operation queued on the blocking pool, which
+/// may run after the caller has closed the original. Taken while the caller
+/// still holds the file, so it names the same one.
+fn pool_descriptor(fd: RawFd) -> io::Result<OwnedFd> {
+    unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
 }
 
 /// Checks the kernel implements every opcode glommio submits.
@@ -2593,10 +2603,16 @@ impl Reactor {
             );
             None
         } else {
-            Some(self.enqueue_blocking_request(
-                source.inner.clone(),
-                BlockingThreadOp::Truncate(source.raw(), size as _),
-            ))
+            match pool_descriptor(source.raw()) {
+                Ok(fd) => Some(self.enqueue_blocking_request(
+                    source.inner.clone(),
+                    BlockingThreadOp::Truncate(fd, size as _),
+                )),
+                Err(err) => {
+                    source.inner.borrow_mut().wakers.result = Some(Err(err));
+                    None
+                }
+            }
         };
 
         async move {
@@ -2649,14 +2665,28 @@ impl Reactor {
             _ => panic!("Unexpected source for copy_file_range operation"),
         };
 
-        let op = BlockingThreadOp::CopyFileRange(
-            fd_in,
-            (off_in).try_into().unwrap(),
-            source.raw(),
-            pos.try_into().unwrap(),
-            len,
-        );
-        self.enqueue_blocking_request(source.inner.clone(), op)
+        let op = pool_descriptor(fd_in).and_then(|fd_in| {
+            Ok(BlockingThreadOp::CopyFileRange(
+                fd_in,
+                (off_in).try_into().unwrap(),
+                pool_descriptor(source.raw())?,
+                pos.try_into().unwrap(),
+                len,
+            ))
+        });
+        let blocking = match op {
+            Ok(op) => Some(self.enqueue_blocking_request(source.inner.clone(), op)),
+            Err(err) => {
+                source.inner.borrow_mut().wakers.result = Some(Err(err));
+                None
+            }
+        };
+
+        async move {
+            if let Some(waiter) = blocking {
+                waiter.await;
+            }
+        }
     }
 
     /// Creates a directory on the ring where the kernel has `MKDIRAT`.

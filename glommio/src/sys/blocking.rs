@@ -43,12 +43,19 @@ fn to_result(res: i64) -> io::Result<usize> {
     }
 }
 
+/// An operation for a pool thread.
+///
+/// The descriptor-taking operations own a duplicate of each descriptor, made
+/// when they are queued. A queued operation outlives a cancelled future, and
+/// the file can be closed meanwhile; by the time the pool runs it, the bare
+/// number may name another file, which the operation would then truncate or
+/// write into.
 pub(super) enum BlockingThreadOp {
     Rename(NativePath, NativePath),
     Remove(NativePath),
     CreateDir(NativePath, libc::c_int),
-    Truncate(RawFd, i64),
-    CopyFileRange(RawFd, i64, RawFd, i64, usize),
+    Truncate(OwnedFd, i64),
+    CopyFileRange(OwnedFd, i64, OwnedFd, i64, usize),
     Fn(Box<dyn FnOnce() + Send + 'static>),
 }
 
@@ -60,10 +67,14 @@ impl Debug for BlockingThreadOp {
             BlockingThreadOp::CreateDir(path, flags) => {
                 write!(f, "create dir `{path:?}` (`{flags:b}`)")
             }
-            BlockingThreadOp::Truncate(fd, to) => write!(f, "truncate `{fd}` -> `{to}`"),
+            BlockingThreadOp::Truncate(fd, to) => {
+                write!(f, "truncate `{}` -> `{to}`", fd.as_raw_fd())
+            }
             BlockingThreadOp::CopyFileRange(fd_in, off_in, fd_out, off_out, len) => write!(
                 f,
-                "copy_file_range `{fd_in}` @ `{off_in}` -> {fd_out} @ `{off_out}` for {len} bytes"
+                "copy_file_range `{}` @ `{off_in}` -> {} @ `{off_out}` for {len} bytes",
+                fd_in.as_raw_fd(),
+                fd_out.as_raw_fd()
             ),
             BlockingThreadOp::Fn(_) => write!(f, "user function"),
         }
@@ -83,13 +94,13 @@ impl BlockingThreadOp {
                 raw_syscall!(unlink(path.as_ptr()))
             }
             BlockingThreadOp::Truncate(fd, sz) => {
-                raw_syscall!(ftruncate(fd, sz))
+                raw_syscall!(ftruncate(fd.as_raw_fd(), sz))
             }
             BlockingThreadOp::CopyFileRange(fd_in, mut off_in, fd_out, mut off_out, len) => {
                 raw_syscall!(copy_file_range(
-                    fd_in,
+                    fd_in.as_raw_fd(),
                     &mut off_in,
-                    fd_out,
+                    fd_out.as_raw_fd(),
                     &mut off_out,
                     len,
                     0

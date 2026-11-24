@@ -208,33 +208,50 @@ impl DmaStreamReaderState {
 
     fn fill_buffer(&mut self, read_state: Rc<RefCell<Self>>, file: Rc<DmaFile>) {
         let pos = self.buffer_read_ahead_current_pos;
+        if self.fetch_buffer_at(pos, read_state, file) {
+            self.buffer_read_ahead_current_pos += self.buffer_size;
+        }
+    }
+
+    /// Starts reading the buffer at `pos` unless it is past the end, cached
+    /// or being read already, and returns whether it did. A read skipped
+    /// because another failed still releases and wakes its waiter, which
+    /// then asks for the buffer again.
+    fn fetch_buffer_at(
+        &mut self,
+        pos: u64,
+        read_state: Rc<RefCell<Self>>,
+        file: Rc<DmaFile>,
+    ) -> bool {
         let buffer_id = self.buffer_id(pos);
 
         if pos > self.max_pos {
-            return;
+            return false;
         }
         let len = self.buffer_size;
 
         if self.pending.get(&buffer_id).is_some() || self.buffermap.get(&buffer_id).is_some() {
-            return;
+            return false;
         }
 
         let pending = crate::spawn_local(async move {
             futures_lite::future::yield_now().await;
 
-            if read_state.borrow().error.is_some() {
-                return;
-            }
-            let buffer = file.read_at_aligned(pos, len as _).await;
+            let buffer = if read_state.borrow().error.is_some() {
+                None
+            } else {
+                Some(file.read_at_aligned(pos, len as _).await)
+            };
 
             let mut state = read_state.borrow_mut();
             match buffer {
-                Ok(buf) => {
+                Some(Ok(buf)) => {
                     state.buffermap.insert(buffer_id, buf);
                 }
-                Err(x) => {
+                Some(Err(x)) => {
                     state.error = Some(x.into());
                 }
+                None => {}
             }
             state.pending.remove(&buffer_id);
             let mut wakers = state.wakermap.remove(&buffer_id);
@@ -246,7 +263,7 @@ impl DmaStreamReaderState {
         .detach();
 
         self.pending.insert(buffer_id, pending);
-        self.buffer_read_ahead_current_pos += len;
+        true
     }
 
     fn offset_of(&self, pos: u64) -> usize {
@@ -578,6 +595,8 @@ impl DmaStreamReader {
         match state.get_cached_buffer(&buffer_id).cloned() {
             None => {
                 if state.add_waker(buffer_id, cx.waker().clone()) {
+                    let pos = buffer_id * state.buffer_size;
+                    state.fetch_buffer_at(pos, self.state.clone(), self.file.clone());
                     state.fill_buffer(self.state.clone(), self.file.clone());
                 }
                 Poll::Pending
@@ -1633,6 +1652,70 @@ mod test {
         writer.close().await.unwrap();
         assert_eq!(std::fs::read(&filename).unwrap(), vec![0xAB; 4096]);
     });
+
+    /// Guards against a read after a failed one waiting forever on a buffer
+    /// whose read-ahead gave up when it saw the failure.
+    #[test]
+    fn a_read_after_a_failed_read_returns() {
+        for dir in make_test_directories("read-after-failed-read") {
+            test_executor!(async move {
+                let path = dir.path.join("testfile");
+                std::fs::write(&path, vec![7u8; 64 << 10]).unwrap();
+                let file = crate::io::OpenOptions::new()
+                    .write(true)
+                    .dma_open(&path)
+                    .await
+                    .unwrap();
+                let mut reader = DmaStreamReaderBuilder::new(file)
+                    .with_buffer_size(4096)
+                    .with_read_ahead(4)
+                    .build();
+                let mut buf = [0u8; 16];
+                for attempt in 0..8 {
+                    let read = crate::timer::timeout(Duration::from_secs(1), async {
+                        Ok(reader.read(&mut buf).await)
+                    })
+                    .await;
+                    assert!(
+                        read.expect("a read never returned").is_err(),
+                        "read {attempt}"
+                    );
+                }
+                let _ = reader.close().await;
+            });
+        }
+    }
+
+    /// Guards against a read-ahead that skipped its read because another had
+    /// failed leaving its buffer marked as being read, so that asking for it
+    /// waited forever.
+    #[test]
+    fn a_read_ahead_skipped_after_a_failure_is_read_again() {
+        for dir in make_test_directories("read-ahead-skipped") {
+            test_executor!(async move {
+                let path = dir.path.join("testfile");
+                std::fs::write(&path, vec![7u8; 64 << 10]).unwrap();
+                let file = DmaFile::open(&path).await.unwrap();
+                let mut reader = DmaStreamReaderBuilder::new(file)
+                    .with_buffer_size(4096)
+                    .with_read_ahead(4)
+                    .build();
+                reader.state.borrow_mut().error =
+                    Some(io::Error::other("a read that failed elsewhere"));
+                crate::timer::sleep(Duration::from_millis(10)).await;
+                let mut buf = [0u8; 16];
+                assert!(reader.read(&mut buf).await.is_err());
+                let read = crate::timer::timeout(Duration::from_secs(1), async {
+                    Ok(reader.read(&mut buf).await)
+                })
+                .await
+                .expect("the read never returned");
+                assert_eq!(read.unwrap(), 16);
+                assert_eq!(buf, [7u8; 16]);
+                reader.close().await.unwrap();
+            });
+        }
+    }
 
     file_stream_write_test!(write_more_than_write_behind, path, _k, filename, file, {
         let mut writer = DmaStreamWriterBuilder::new(file)

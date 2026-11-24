@@ -285,7 +285,16 @@ impl SleepNotifier {
         self.id
     }
 
+    /// Wakes the owner if it is about to sleep, or always when `force`.
+    ///
+    /// Callers publish their work first, with a store the owner drains after
+    /// its heavy barrier. The light barrier pairs with that: it keeps the
+    /// publish ahead of the look at `should_notify`, so either the owner sees
+    /// the work or this sees the owner going to sleep. It is a compiler fence
+    /// where the heavy barrier reaches every thread, and a full fence on the
+    /// fallback strategy, where it does not.
     pub(crate) fn notify(&self, force: bool) {
+        membarrier::light();
         if self
             .should_notify
             .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)

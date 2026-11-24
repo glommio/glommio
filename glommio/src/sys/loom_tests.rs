@@ -132,3 +132,43 @@ fn closing_leaves_nothing_behind() {
         assert!(counts.woken.load(Ordering::SeqCst) <= 1);
     });
 }
+
+/// P4: a producer that publishes outside the waker queue and then notifies,
+/// as a shared channel does, cannot be missed by an owner going to sleep.
+///
+/// The channel's push is a store-release with nothing after it but the
+/// notify. Unlike `queue_waker`, nothing in between orders that store
+/// before the notify's look at `should_notify`.
+#[test]
+fn a_notify_after_a_plain_publish_is_not_lost() {
+    loom::model(|| {
+        let notifier = new_sleep_notifier().unwrap();
+        let published = Arc::new(super::sync::AtomicBool::new(false));
+
+        let mut producer = Some({
+            let notifier = notifier.clone();
+            let published = published.clone();
+            thread::spawn(move || {
+                published.store(true, Ordering::Release);
+                notifier.notify(false);
+            })
+        });
+
+        notifier
+            .sleep_unless_woken(
+                || published.load(Ordering::Acquire) as usize,
+                || {
+                    producer.take().unwrap().join().unwrap();
+                    assert!(
+                        notifier.signals() > 0,
+                        "the owner slept over a published value with nothing to wake it"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        if let Some(producer) = producer {
+            producer.join().unwrap();
+        }
+    });
+}

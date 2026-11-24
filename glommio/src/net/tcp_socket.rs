@@ -1034,6 +1034,19 @@ impl<B: RxBuf + Unpin> AsyncWrite for TcpStream<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{channels::shared_channel, enclose, timer::Timer, LocalExecutorBuilder};
+    use futures_lite::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
+        StreamExt,
+    };
+    use std::{
+        cell::Cell,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn a_read_timeout_of_duration_max_waits() {
@@ -1052,19 +1065,6 @@ mod tests {
             assert!(matches!(raced, futures::future::Either::Right(_)));
         });
     }
-    use crate::{channels::shared_channel, enclose, timer::Timer, LocalExecutorBuilder};
-    use futures_lite::{
-        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
-        StreamExt,
-    };
-    use std::{
-        cell::Cell,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
-        time::{Duration, Instant},
-    };
 
     /// Guards against a failed `peer_addr` closing the descriptor the
     /// accepted stream still holds.

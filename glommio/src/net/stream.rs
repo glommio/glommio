@@ -622,6 +622,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             if buf.len() >= self.rx_buf.buffer_size()
                 && self.rx_source.is_none()
                 && self.rx_multi.is_none()
+                && !self.rx_multi_parked
             {
                 return self.stream.poll_read(cx, buf);
             }
@@ -807,11 +808,12 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
 
     /// Fills by plain reads while the multishot receive is parked for want of
     /// buffers, and re-arms it as soon as one returns data, by which time the
-    /// buffers other streams held may be back.
+    /// buffers other streams held may be back. Any result ends the parking:
+    /// data re-arms, and end of file leaves nothing to re-arm.
     fn poll_fill_parked(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
         let result = poll_err!(ready!(self.poll_fill(cx)));
+        self.rx_multi_parked = false;
         if result > 0 {
-            self.rx_multi_parked = false;
             let reactor = self.stream.reactor.upgrade().unwrap();
             self.rx_multi =
                 reactor.recv_multi(self.stream.stream.as_raw_fd(), self.rx_buf.buffer_size());
@@ -839,6 +841,20 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     #[cfg(test)]
     pub(crate) fn multishot_armed(&self) -> bool {
         self.rx_multi.is_some()
+    }
+
+    /// Whether the multishot receive is parked for want of buffers.
+    #[cfg(test)]
+    pub(crate) fn multishot_parked(&self) -> bool {
+        self.rx_multi_parked
+    }
+
+    /// Parks the multishot receive as running out of buffers would, with no
+    /// plain read in flight yet.
+    #[cfg(test)]
+    pub(crate) fn park_multishot(&mut self) {
+        self.rx_multi = None;
+        self.rx_multi_parked = true;
     }
 
     /// Moves queued arrivals into the receive buffer until it is full or the

@@ -571,6 +571,18 @@ impl<B: RxBuf> TcpStream<B> {
         self.stream.multishot_armed()
     }
 
+    /// See [`GlommioStream::multishot_parked`].
+    #[cfg(test)]
+    pub(crate) fn multishot_parked(&self) -> bool {
+        self.stream.multishot_parked()
+    }
+
+    /// See [`GlommioStream::park_multishot`].
+    #[cfg(test)]
+    pub(crate) fn park_multishot(&mut self) {
+        self.stream.park_multishot()
+    }
+
     /// Sets the read timeout to the timeout specified.
     ///
     /// If the value specified is [`None`], then read calls will block

@@ -181,6 +181,11 @@ name    = "filesystem_ops"
 harness = false
 name    = "timer_burst"
 
+[[bench]]
+harness           = false
+name              = "shared_channel_registry"
+required-features = ["bench"]
+
 [[example]]
 name = "pingpong_ladder"
 path = "examples/pingpong_ladder.rs"

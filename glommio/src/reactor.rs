@@ -37,13 +37,14 @@ use crate::{
 };
 use nix::poll::PollFlags;
 
-type SharedChannelWakerChecker = (SmallVec<[Waker; 1]>, Option<Box<dyn Fn() -> usize>>);
-
 use crate::timer::TimerId;
 
 struct SharedChannels {
     id: u64,
-    wakers_map: BTreeMap<u64, SharedChannelWakerChecker>,
+    /// How much room each connected channel has, for as long as it is connected.
+    checkers: BTreeMap<u64, Box<dyn Fn() -> usize>>,
+    /// Wakers waiting on a channel. A channel has an entry only while some do.
+    pending: BTreeMap<u64, SmallVec<[Waker; 1]>>,
     connection_wakers: Vec<Waker>,
 }
 
@@ -52,7 +53,8 @@ impl SharedChannels {
         SharedChannels {
             id: 0,
             connection_wakers: Vec::new(),
-            wakers_map: BTreeMap::new(),
+            checkers: BTreeMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -61,13 +63,14 @@ impl SharedChannels {
         let mut ready = SmallVec::new();
         ready.extend(self.connection_wakers.drain(..));
 
-        for (pending, check) in self.wakers_map.values_mut() {
-            if pending.is_empty() {
-                continue;
-            }
-            let room = std::cmp::min(check.as_ref().unwrap()(), pending.len());
-            ready.extend(pending.drain(0..room).rev());
-        }
+        let Self {
+            checkers, pending, ..
+        } = self;
+        pending.retain(|id, wakers| {
+            let room = std::cmp::min(checkers[id](), wakers.len());
+            ready.extend(wakers.drain(0..room).rev());
+            !wakers.is_empty()
+        });
         ready
     }
 }
@@ -222,21 +225,31 @@ impl Reactor {
         let mut channels = self.shared_channels.borrow_mut();
         let id = channels.id;
         channels.id += 1;
-        let ret = channels
-            .wakers_map
-            .insert(id, (Default::default(), Some(test_function)));
+        let ret = channels.checkers.insert(id, test_function);
         assert!(ret.is_none());
         id
     }
 
-    /// How many shared channel halves are registered with this reactor.
+    /// How many shared channel halves the reactor still holds anything for,
+    /// a room check or a waiting waker.
     #[cfg(test)]
     pub(crate) fn registered_shared_channels(&self) -> usize {
-        self.shared_channels.borrow().wakers_map.len()
+        let channels = self.shared_channels.borrow();
+        let mut ids: Vec<u64> = channels
+            .checkers
+            .keys()
+            .chain(channels.pending.keys())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
     }
 
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
-        let removed = self.shared_channels.borrow_mut().wakers_map.remove(&id);
+        let mut channels = self.shared_channels.borrow_mut();
+        let removed = (channels.checkers.remove(&id), channels.pending.remove(&id));
+        drop(channels);
         drop(removed);
     }
 
@@ -247,12 +260,7 @@ impl Reactor {
 
     pub(crate) fn add_shared_channel_waker(&self, id: u64, waker: Waker) {
         let mut channels = self.shared_channels.borrow_mut();
-        let map = channels
-            .wakers_map
-            .entry(id)
-            .or_insert_with(|| (SmallVec::new(), None));
-
-        map.0.push(waker);
+        channels.pending.entry(id).or_default().push(waker);
     }
 
     pub(crate) fn alloc_dma_buffer(&self, size: usize) -> DmaBuffer {
@@ -847,9 +855,8 @@ impl Reactor {
         let ready = self
             .shared_channels
             .borrow_mut()
-            .wakers_map
-            .get_mut(&id)
-            .map(|(pending, _)| mem::take(pending))
+            .pending
+            .remove(&id)
             .unwrap_or_default();
         let processed = ready.len();
         for waker in ready {

@@ -33,6 +33,15 @@ sudo -E \
         nextest_status=0
         cargo "${args[@]}" || nextest_status=$?
 
+        # The filesystem operations go to io_uring wherever the kernel has
+        # them, which is every runner, so their blocking-pool fallback runs
+        # only when forced. The same tests, forced.
+        fallback_ops=RENAMEAT,UNLINKAT,MKDIRAT,FTRUNCATE
+        echo GLOMMIO_DISABLE_URING_OPS="${fallback_ops}" cargo "${args[@]}" -p glommio --test filesystem_ops
+        fallback_status=0
+        GLOMMIO_DISABLE_URING_OPS="${fallback_ops}" \
+            cargo "${args[@]}" -p glommio --test filesystem_ops || fallback_status=$?
+
         # nextest cannot run doc tests, so they need a separate cargo test
         # invocation or they do not run at all. Only on the host target: a
         # doc test is documentation, which does not vary by target, and
@@ -47,8 +56,8 @@ sudo -E \
 
         # Report both verdicts rather than stopping at the first failure, so
         # one flaky unit test cannot hide a doc test regression.
-        echo "nextest exited ${nextest_status}, doc tests exited ${doc_status}"
-        if [[ "${nextest_status}" -ne 0 || "${doc_status}" -ne 0 ]]; then
+        echo "nextest exited ${nextest_status}, the forced fallback ${fallback_status}, doc tests exited ${doc_status}"
+        if [[ "${nextest_status}" -ne 0 || "${fallback_status}" -ne 0 || "${doc_status}" -ne 0 ]]; then
             exit 1
         fi
     '

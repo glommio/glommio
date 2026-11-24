@@ -134,6 +134,7 @@ mod read_result;
 mod sched;
 mod stat;
 
+use crate::sys::source::NativePath;
 use std::path::Path;
 
 pub(super) use crate::Result;
@@ -141,7 +142,12 @@ pub(super) use crate::Result;
 /// rename an existing file.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) -> Result<()> {
     let reactor = crate::executor().reactor();
-    let source = reactor.rename(old_path.as_ref(), new_path.as_ref()).await;
+    let source = reactor
+        .rename(
+            NativePath::try_from(old_path.as_ref())?,
+            NativePath::try_from(new_path.as_ref())?,
+        )
+        .await;
     source.collect_rw().await?;
     Ok(())
 }
@@ -149,7 +155,9 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(old_path: P, new_path: Q) ->
 /// remove an existing file given its name
 pub async fn remove<P: AsRef<Path>>(path: P) -> Result<()> {
     let reactor = crate::executor().reactor();
-    let source = reactor.remove_file(path.as_ref()).await;
+    let source = reactor
+        .remove_file(NativePath::try_from(path.as_ref())?)
+        .await;
     source.collect_rw().await?;
     Ok(())
 }

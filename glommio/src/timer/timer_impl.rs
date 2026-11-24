@@ -9,7 +9,7 @@ use std::{
     future::Future,
     pin::Pin,
     rc::{Rc, Weak},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -21,8 +21,13 @@ struct Inner {
 
     is_charged: bool,
 
-    /// When this timer fires.
-    when: Instant,
+    /// When this timer fires, or `None` for a duration past what an
+    /// `Instant` can hold, which never fires and is never registered.
+    when: Option<Instant>,
+
+    /// The waiting task's waker while `when` is `None`, so a reset to a real
+    /// deadline can register it.
+    parked: Option<Waker>,
 
     reactor: Weak<Reactor>,
 }
@@ -31,18 +36,30 @@ impl Inner {
     /// Deregisters the timer from the reactor, updates the timeout, and
     /// re-registers the timer with the new timeout.
     fn reset(&mut self, dur: Duration) {
-        let mut waker = None;
+        let mut waker = self.parked.take();
         if self.is_charged {
-            waker = self.reactor.upgrade().unwrap().remove_timer(self.id);
-        }
-
-        self.when = Instant::now() + dur;
-
-        if let Some(waker) = waker {
-            self.reactor
+            waker = self
+                .reactor
                 .upgrade()
                 .unwrap()
-                .insert_timer(self.id, self.when, waker);
+                .remove_timer(self.id)
+                .or(waker);
+        }
+
+        self.when = Instant::now().checked_add(dur);
+        self.is_charged = false;
+
+        if let Some(waker) = waker {
+            match self.when {
+                Some(when) => {
+                    self.reactor
+                        .upgrade()
+                        .unwrap()
+                        .insert_timer(self.id, when, waker);
+                    self.is_charged = true;
+                }
+                None => self.parked = Some(waker),
+            }
         }
     }
 }
@@ -105,7 +122,8 @@ impl Timer {
             inner: Rc::new(RefCell::new(Inner {
                 id: reactor.register_timer(),
                 is_charged: false,
-                when: Instant::now() + dur,
+                when: Instant::now().checked_add(dur),
+                parked: None,
                 reactor: Rc::downgrade(&reactor),
             })),
         }
@@ -118,7 +136,8 @@ impl Timer {
             inner: Rc::new(RefCell::new(Inner {
                 id,
                 is_charged: false,
-                when: Instant::now() + dur,
+                when: Instant::now().checked_add(dur),
+                parked: None,
                 reactor: Rc::downgrade(&crate::executor().reactor()),
             })),
         }
@@ -151,12 +170,16 @@ impl Timer {
 
 impl Drop for Timer {
     fn drop(&mut self) {
-        let inner = self.inner.borrow_mut();
-        if inner.is_charged {
-            if let Some(reactor) = inner.reactor.upgrade() {
-                reactor.remove_timer(inner.id);
-            }
-        }
+        let mut inner = self.inner.borrow_mut();
+        let parked = inner.parked.take();
+        let registered = inner
+            .is_charged
+            .then(|| inner.reactor.upgrade())
+            .flatten()
+            .and_then(|reactor| reactor.remove_timer(inner.id));
+        inner.is_charged = false;
+        drop(inner);
+        drop((parked, registered));
     }
 }
 
@@ -166,15 +189,21 @@ impl Future for Timer {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut inner = self.inner.borrow_mut();
 
-        if Instant::now() >= inner.when {
+        let Some(when) = inner.when else {
+            let replaced = inner.parked.replace(cx.waker().clone());
+            drop(inner);
+            drop(replaced);
+            return Poll::Pending;
+        };
+        if Instant::now() >= when {
             inner.reactor.upgrade().unwrap().remove_timer(inner.id);
-            Poll::Ready(inner.when)
+            Poll::Ready(when)
         } else {
             inner
                 .reactor
                 .upgrade()
                 .unwrap()
-                .insert_timer(inner.id, inner.when, cx.waker().clone());
+                .insert_timer(inner.id, when, cx.waker().clone());
             inner.is_charged = true;
             Poll::Pending
         }
@@ -468,10 +497,12 @@ impl<T: 'static> TimerActionOnce<T> {
     /// [`cancel`]: struct.TimerActionOnce.html#method.cancel
     /// [`join`]: struct.TimerActionOnce.html#method.join
     pub fn destroy(&self) {
-        self.reactor
-            .upgrade()
-            .unwrap()
-            .remove_timer(self.inner.borrow().id);
+        let mut inner = self.inner.borrow_mut();
+        let parked = inner.parked.take();
+        let registered = self.reactor.upgrade().unwrap().remove_timer(inner.id);
+        inner.is_charged = false;
+        drop(inner);
+        drop((parked, registered));
         self.handle.cancel();
     }
 
@@ -757,6 +788,159 @@ mod test {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+
+    #[test]
+    fn duration_max_waits_forever() {
+        test_executor!(async move {
+            let cpu = || -> Duration {
+                nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+                    .unwrap()
+                    .into()
+            };
+            let before = cpu();
+            let raced = futures::future::select(
+                Box::pin(crate::timer::sleep(Duration::MAX)),
+                Box::pin(crate::timer::sleep(Duration::from_millis(100))),
+            )
+            .await;
+            assert!(matches!(raced, futures::future::Either::Right(_)));
+            let pending = crate::timer::timeout(Duration::MAX, async {
+                crate::timer::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            });
+            pending.await.unwrap();
+            let mut timer = Timer::new(Duration::MAX);
+            timer.reset(Duration::MAX);
+            assert!(futures::poll!(&mut timer).is_pending());
+            assert!(cpu() - before < Duration::from_millis(50));
+        });
+    }
+
+    #[test]
+    fn rearming_a_forever_action_fires() {
+        test_executor!(async move {
+            let action = TimerActionOnce::do_in(Duration::MAX, async {});
+            crate::timer::sleep(Duration::from_millis(10)).await;
+            action.rearm_in(Duration::from_millis(10));
+            crate::timer::timeout(Duration::from_secs(1), async { Ok(action.join().await) })
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn rearming_a_rearmed_forever_action_takes_the_latest_deadline() {
+        test_executor!(async move {
+            let action = TimerActionOnce::do_in(Duration::MAX, async {});
+            crate::timer::sleep(Duration::from_millis(10)).await;
+            action.rearm_in(Duration::from_secs(60));
+            action.rearm_in(Duration::from_millis(10));
+            crate::timer::timeout(Duration::from_secs(1), async { Ok(action.join().await) })
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn rearming_back_to_forever_deregisters_the_timer() {
+        test_executor!(async move {
+            let action = TimerActionOnce::do_in(Duration::MAX, async {});
+            crate::timer::sleep(Duration::from_millis(10)).await;
+            action.rearm_in(Duration::from_secs(60));
+            let registered = {
+                let inner = action.inner.borrow();
+                (inner.when.unwrap(), inner.id)
+            };
+            action.rearm_in(Duration::MAX);
+            assert!(!crate::executor().reactor().timer_exists(&registered));
+            action.destroy();
+        });
+    }
+
+    #[test]
+    fn dropping_a_reset_forever_timer_deregisters_it() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::MAX);
+            assert!(futures::poll!(&mut timer).is_pending());
+            timer.reset(Duration::from_secs(60));
+            let registered = {
+                let inner = timer.inner.borrow();
+                (inner.when.unwrap(), inner.id)
+            };
+            assert!(crate::executor().reactor().timer_exists(&registered));
+            drop(timer);
+            assert!(!crate::executor().reactor().timer_exists(&registered));
+        });
+    }
+
+    #[test]
+    fn destroying_a_forever_action_releases_its_waker() {
+        test_executor!(async move {
+            let action = TimerActionOnce::do_in(Duration::MAX, async {});
+            crate::timer::sleep(Duration::from_millis(10)).await;
+            assert!(action.inner.borrow().parked.is_some());
+            action.destroy();
+            assert!(action.inner.borrow().parked.is_none());
+            action.rearm_in(Duration::from_secs(60));
+            let registered = {
+                let inner = action.inner.borrow();
+                (inner.when.unwrap(), inner.id)
+            };
+            assert!(!crate::executor().reactor().timer_exists(&registered));
+        });
+    }
+
+    #[test]
+    fn dropping_a_forever_timer_releases_its_waker() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::MAX);
+            let inner = timer.inner.clone();
+            assert!(futures::poll!(&mut timer).is_pending());
+            assert!(inner.borrow().parked.is_some());
+            drop(timer);
+            assert!(inner.borrow().parked.is_none());
+        });
+    }
+
+    thread_local! {
+        static HOOKED: RefCell<Option<Rc<RefCell<Inner>>>> = const { RefCell::new(None) };
+        static HOOK_BORROWED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    struct BorrowOnDrop;
+
+    impl futures::task::ArcWake for BorrowOnDrop {
+        fn wake_by_ref(_: &std::sync::Arc<Self>) {}
+    }
+
+    impl Drop for BorrowOnDrop {
+        fn drop(&mut self) {
+            let borrowed = HOOKED.with(|hooked| {
+                hooked
+                    .borrow()
+                    .as_ref()
+                    .map(|inner| inner.try_borrow_mut().is_ok())
+            });
+            HOOK_BORROWED.with(|cell| cell.set(borrowed));
+        }
+    }
+
+    #[test]
+    fn a_replaced_parked_waker_drops_outside_the_borrow() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::MAX);
+            HOOKED.with(|hooked| *hooked.borrow_mut() = Some(timer.inner.clone()));
+            let hook = futures::task::waker(std::sync::Arc::new(BorrowOnDrop));
+            let mut cx = Context::from_waker(&hook);
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            drop(hook);
+            assert!(futures::poll!(&mut timer).is_pending());
+            HOOKED.with(|hooked| hooked.borrow_mut().take());
+            assert_eq!(HOOK_BORROWED.with(Cell::get), Some(true));
+        });
+    }
 
     #[test]
     fn timeout_does_not_expire() {

@@ -565,6 +565,12 @@ impl TcpStream {
 }
 
 impl<B: RxBuf> TcpStream<B> {
+    /// Whether a multishot receive is armed, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn multishot_armed(&self) -> bool {
+        self.stream.multishot_armed()
+    }
+
     /// Sets the read timeout to the timeout specified.
     ///
     /// If the value specified is [`None`], then read calls will block

@@ -453,6 +453,11 @@ pub(crate) struct GlommioStream<S, B> {
     /// produces lands in one of those buffers, so nothing here reads the
     /// socket directly.
     rx_multi: Option<Source>,
+    /// The multishot receive ran out of buffers with nothing on the socket.
+    /// Re-arming it then would only run into the empty pool again, at once
+    /// and on every pass, so the stream fills with plain reads until one
+    /// returns data, and re-arms then.
+    rx_multi_parked: bool,
 }
 
 impl<S> From<socket2::Socket> for GlommioStream<S, NonBuffered>
@@ -476,6 +481,7 @@ where
             rx_done: Cell::new(false),
             rx_source: None,
             rx_multi: None,
+            rx_multi_parked: false,
         }
     }
 }
@@ -507,6 +513,7 @@ impl<S: AsRawFd> GlommioStream<S, NonBuffered> {
             rx_done: self.rx_done,
             rx_source: self.rx_source,
             rx_multi,
+            rx_multi_parked: false,
         }
     }
 }
@@ -628,6 +635,8 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     fn poll_replenish_buffer(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
         let result = if self.rx_multi.is_some() {
             poll_err!(ready!(self.poll_fill_multishot(cx)))
+        } else if self.rx_multi_parked {
+            poll_err!(ready!(self.poll_fill_parked(cx)))
         } else {
             let result = poll_err!(ready!(self.poll_fill(cx)));
             self.rx_buf.handle_result(result);
@@ -695,9 +704,12 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// error, on the arrival that took the last buffer, which is the only
     /// way a bundled request ends with data and no error. A plain one that
     /// ends that way was cut off by a full completion queue instead, which
-    /// more buffers would not help, so it is not counted. A request the
-    /// reactor cancelled for queueing more than this stream can take is
-    /// re-armed here, which happens only once the queue is drained: that is
+    /// more buffers would not help, so it is not counted. If the socket has
+    /// nothing either after running out, the request is not re-armed into
+    /// the empty pool but parked, and plain reads fill until data comes. A
+    /// request the reactor cancelled for queueing more than this stream can
+    /// take is re-armed here, which happens only once the queue is drained:
+    /// that is
     /// the backpressure a connection nobody reads is given. The reactor
     /// reports a cancelled request as timed out, since before this the only
     /// thing that cancelled a request was a timeout, and this stream has no
@@ -745,14 +757,12 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 _ => unreachable!("rx_multi holds a multishot receive"),
             };
             self.rx_multi = None;
-            match result {
+            let exhausted = match result {
                 Ok(0) => return Poll::Ready(Ok(0)),
-                Ok(_) if was_bundled => reactor.note_recv_buffers_exhausted(),
-                Ok(_) => {}
-                Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => {
-                    reactor.note_recv_buffers_exhausted()
-                }
-                Err(err) if was_throttled && err.raw_os_error() == Some(libc::ETIMEDOUT) => {}
+                Ok(_) if was_bundled => true,
+                Ok(_) => false,
+                Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => true,
+                Err(err) if was_throttled && err.raw_os_error() == Some(libc::ETIMEDOUT) => false,
                 Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
                     reactor.refuse_recv_multi(was_bundled);
                     if was_bundled {
@@ -767,6 +777,9 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                     return Poll::Ready(Ok(result));
                 }
                 Err(err) => return Poll::Ready(Err(err)),
+            };
+            if exhausted {
+                reactor.note_recv_buffers_exhausted();
             }
             let fd = self.stream.stream.as_raw_fd();
             if let Some(result) = self.stream.poll_read_speculative(self.rx_buf.unfilled()) {
@@ -777,6 +790,10 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 self.rx_buf.handle_result(result);
                 return Poll::Ready(Ok(result));
             }
+            if exhausted {
+                self.rx_multi_parked = true;
+                return self.poll_fill_parked(cx);
+            }
             match reactor.recv_multi(fd, self.rx_buf.buffer_size()) {
                 Some(source) => self.rx_multi = Some(source),
                 None => {
@@ -786,6 +803,21 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 }
             }
         }
+    }
+
+    /// Fills by plain reads while the multishot receive is parked for want of
+    /// buffers, and re-arms it as soon as one returns data, by which time the
+    /// buffers other streams held may be back.
+    fn poll_fill_parked(&mut self, cx: &Context<'_>) -> Poll<io::Result<usize>> {
+        let result = poll_err!(ready!(self.poll_fill(cx)));
+        if result > 0 {
+            self.rx_multi_parked = false;
+            let reactor = self.stream.reactor.upgrade().unwrap();
+            self.rx_multi =
+                reactor.recv_multi(self.stream.stream.as_raw_fd(), self.rx_buf.buffer_size());
+        }
+        self.rx_buf.handle_result(result);
+        Poll::Ready(Ok(result))
     }
 
     /// Makes the armed multishot receive look as if the kernel had ended it
@@ -983,6 +1015,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 rx_done: self.rx_done,
                 rx_source: self.rx_source,
                 rx_multi: self.rx_multi,
+                rx_multi_parked: self.rx_multi_parked,
             },
             GlommioStream {
                 stream: tx,
@@ -990,6 +1023,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 rx_done: Cell::new(false),
                 rx_source: None,
                 rx_multi: None,
+                rx_multi_parked: false,
             },
         )
     }
@@ -1015,6 +1049,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<Rc<S>, B> {
             rx_done: rx.rx_done,
             rx_source: rx.rx_source,
             rx_multi: rx.rx_multi,
+            rx_multi_parked: rx.rx_multi_parked,
         })
     }
 }

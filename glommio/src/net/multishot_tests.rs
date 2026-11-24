@@ -59,6 +59,88 @@ fn reads_arrive_in_order_and_give_their_buffers_back() {
     });
 }
 
+/// A reader waiting while another connection holds every buffer waits on a
+/// plain read instead of re-arming into the empty pool on every pass, and
+/// goes back to multishot once data comes and the buffers are back.
+#[test]
+fn a_reader_waits_quietly_while_the_buffers_are_all_held() {
+    executor(2, 32).run(async {
+        let (mut hog_writer, mut hog) = pair(Preallocated::new(256)).await;
+        let (mut writer, mut reader) = pair(Preallocated::new(256)).await;
+        hog_writer.write_all(&[1; 64]).await.unwrap();
+        Timer::new(Duration::from_millis(20)).await;
+        assert_eq!(buffers_held(), 2, "the hog should hold the whole pool");
+
+        let exhausted = || {
+            crate::executor()
+                .io_stats()
+                .all_rings()
+                .recv_buffers_exhausted()
+        };
+        let before = exhausted();
+        let late = crate::spawn_local(async move {
+            Timer::new(Duration::from_millis(100)).await;
+            writer.write_all(b"late").await.unwrap();
+            writer
+        });
+        let mut got = [0u8; 4];
+        reader.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"late");
+        let spins = exhausted() - before;
+        assert!(
+            spins <= 4,
+            "the waiting reader ran into the empty pool {spins} times in 100ms"
+        );
+
+        let mut drained = [0u8; 64];
+        hog.read_exact(&mut drained).await.unwrap();
+        let mut writer = late.await;
+        writer.write_all(b"again").await.unwrap();
+        let mut got = [0u8; 5];
+        reader.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"again");
+        assert!(
+            reader.multishot_armed(),
+            "the reader went back to multishot"
+        );
+    });
+}
+
+/// A read at least as large as the stream's buffer normally goes straight
+/// to the socket, but not while multishot is parked: it has to go through
+/// the parked fill, which re-arms multishot once data comes.
+#[test]
+fn a_large_read_while_parked_re_arms_multishot() {
+    executor(4, 64).run(async {
+        let (mut writer, mut reader) = pair(Preallocated::new(256)).await;
+        reader.park_multishot();
+        writer.write_all(&[3; 64]).await.unwrap();
+        let mut got = [0u8; 512];
+        let n = reader.read(&mut got).await.unwrap();
+        assert!(n > 0 && got[..n].iter().all(|b| *b == 3));
+        assert!(
+            reader.multishot_armed() && !reader.multishot_parked(),
+            "a large read bypassed the parked fill and left multishot parked"
+        );
+    });
+}
+
+/// End of file while parked leaves the stream unparked as well as done.
+#[test]
+fn end_of_file_while_parked_unparks() {
+    executor(4, 64).run(async {
+        let (writer, mut reader) = pair(Preallocated::new(256)).await;
+        reader.park_multishot();
+        drop(writer);
+        let mut got = [0u8; 16];
+        assert_eq!(reader.read(&mut got).await.unwrap(), 0);
+        assert!(
+            !reader.multishot_parked(),
+            "end of file left multishot parked"
+        );
+    });
+}
+
 /// A stream buffer smaller than a kernel buffer drains one arrival in
 /// several steps without losing or reordering anything.
 #[test]

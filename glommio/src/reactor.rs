@@ -660,6 +660,8 @@ impl Reactor {
     }
 
     pub(crate) fn fdatasync(&self, raw: RawFd) -> Source {
+        #[cfg(test)]
+        crate::sys::test_support::note_file_op("fdatasync");
         let source = self.new_source(raw, SourceType::FdataSync, None);
         self.sys.fdatasync(&source);
         source
@@ -678,6 +680,8 @@ impl Reactor {
     }
 
     pub(crate) fn truncate(&self, raw: RawFd, size: u64) -> impl Future<Output = Source> {
+        #[cfg(test)]
+        crate::sys::test_support::note_file_op("truncate");
         let source = self.new_source(raw, SourceType::Truncate, None);
         let waiter = self.sys.truncate(&source, size);
 

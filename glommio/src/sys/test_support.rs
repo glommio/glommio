@@ -1,5 +1,5 @@
-//! Test-only hooks: synchronization for foreign wake submission, and
-//! injected ring submission failures.
+//! Test-only hooks: synchronization for foreign wake submission, injected
+//! ring submission failures, and a record of file syncs and truncates.
 
 use std::{
     cell::{Cell, RefCell},
@@ -16,6 +16,43 @@ struct ForeignWakePause {
 thread_local! {
     static FOREIGN_WAKE_PAUSE: RefCell<Option<ForeignWakePause>> = const { RefCell::new(None) };
     static SUBMIT_FAILURE: Cell<Option<(&'static str, i32)>> = const { Cell::new(None) };
+    static FILE_OPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+}
+
+/// Records, in order, the syncs and truncates this thread issues, until
+/// taken or dropped. Dropping it stops the recording, so a test that panics
+/// leaves nothing armed for the next test on the thread.
+#[must_use = "recording stops when this is dropped"]
+pub(crate) struct FileOpsRecording(());
+
+impl FileOpsRecording {
+    /// Stops recording and returns what was recorded.
+    pub(crate) fn take(self) -> Vec<&'static str> {
+        FILE_OPS
+            .with(|ops| ops.take())
+            .expect("file ops were not being recorded")
+    }
+}
+
+impl Drop for FileOpsRecording {
+    fn drop(&mut self) {
+        FILE_OPS.with(|ops| ops.take());
+    }
+}
+
+/// Starts recording the syncs and truncates this thread issues.
+pub(crate) fn record_file_ops() -> FileOpsRecording {
+    FILE_OPS.with(|ops| assert!(ops.replace(Some(Vec::new())).is_none()));
+    FileOpsRecording(())
+}
+
+/// Notes a sync or truncate, if this thread is recording them.
+pub(crate) fn note_file_op(op: &'static str) {
+    FILE_OPS.with(|ops| {
+        if let Some(ops) = ops.borrow_mut().as_mut() {
+            ops.push(op);
+        }
+    });
 }
 
 /// Pauses this thread's next submission after enqueueing and releasing the queue lock.
@@ -59,4 +96,22 @@ pub(crate) fn take_submit_failure(ring: &str) -> Option<io::Error> {
         }
         _ => None,
     })
+}
+
+mod tests {
+    use super::*;
+
+    /// A test that panics while recording leaves the next one free to record.
+    #[test]
+    fn a_panic_while_recording_stops_the_recording() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _recording = record_file_ops();
+            note_file_op("truncate");
+            panic!("the test failed while recording");
+        });
+        assert!(panicked.is_err());
+        let recording = record_file_ops();
+        note_file_op("fdatasync");
+        assert_eq!(recording.take(), ["fdatasync"]);
+    }
 }

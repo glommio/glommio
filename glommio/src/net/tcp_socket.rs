@@ -1126,6 +1126,78 @@ mod tests {
             });
     }
 
+    /// A multishot receive the kernel ended with an error has already taken
+    /// the socket's error, so the socket itself reads as a clean end of file
+    /// afterwards. A peek has to report the receive's error, and leave it for
+    /// the read, rather than look at the socket.
+    #[test]
+    fn a_peek_reports_the_error_that_ended_the_receive() {
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let writer = TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                drop(writer);
+                Timer::new(Duration::from_millis(20)).await;
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::ECONNRESET), false);
+
+                let mut got = [0u8; 4];
+                let peeked = reader.peek(&mut got).await;
+                let err = std::io::Error::from(peeked.expect_err("the reset read as end of file"));
+                assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+                let err = reader
+                    .read(&mut got)
+                    .await
+                    .expect_err("the peek took the reset away from the read");
+                assert_eq!(err.raw_os_error(), Some(libc::ECONNRESET));
+            });
+    }
+
+    /// Bytes already buffered come back from a peek even when the socket
+    /// behind them has failed; the error waits for a later call.
+    #[test]
+    fn a_peek_returns_buffered_bytes_ahead_of_a_socket_error() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut writer = TcpStream::connect(addr).await.unwrap();
+            let mut reader = listener.accept().await.unwrap().buffered();
+            writer.write_all(b"abc").await.unwrap();
+            let mut first = [0u8; 1];
+            reader.read_exact(&mut first).await.unwrap();
+
+            let linger = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            let set = unsafe {
+                libc::setsockopt(
+                    writer.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    &linger as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(set, 0);
+            drop(writer);
+            Timer::new(Duration::from_millis(20)).await;
+
+            let mut got = [0u8; 8];
+            let peeked = reader
+                .peek(&mut got)
+                .await
+                .expect("the reset hid the buffered bytes");
+            assert_eq!(&got[..peeked], b"bc");
+        });
+    }
+
     /// A stream that ran out of kernel buffers reads on through the socket;
     /// when that read is the end of the stream, nothing is re-armed on it.
     #[test]

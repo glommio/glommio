@@ -198,7 +198,6 @@ mod mprotect {
 /// Under loom both barriers are a sequentially consistent fence, the closest
 /// thing loom models to a barrier that orders every thread at once.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn light() {
     if cfg!(loom) {
         return super::sync::fence(atomic::Ordering::SeqCst);
@@ -216,7 +215,6 @@ pub(crate) fn light() {
 /// call, if supported; otherwise, it falls back to `mprotect()`-based
 /// process-wide memory barrier.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn heavy() {
     if cfg!(loom) {
         return super::sync::fence(atomic::Ordering::SeqCst);

@@ -1189,6 +1189,7 @@ pub(crate) mod test {
     use futures::join;
     use futures_lite::{stream, StreamExt};
     use rand::{rng, seq::SliceRandom};
+    use rusty_fork::rusty_fork_test;
     use std::{cell::RefCell, convert::TryInto, ops::Deref, path::PathBuf, time::Duration};
 
     macro_rules! dma_file_test {
@@ -2155,6 +2156,120 @@ pub(crate) mod test {
         assert_eq!(read.len(), alignment);
         assert!(read.iter().all(|&b| b == 1));
     });
+
+    /// Occupies the executor's one blocking thread until the returned sender
+    /// fires, so whatever is queued next waits behind it.
+    async fn hold_the_blocking_pool() -> (std::sync::mpsc::Sender<()>, crate::task::JoinHandle<()>)
+    {
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started) = std::sync::mpsc::channel::<()>();
+        let held = crate::spawn_local(crate::executor().spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = gate.recv();
+        }))
+        .detach();
+        while started.try_recv().is_err() {
+            futures_lite::future::yield_now().await;
+        }
+        (release, held)
+    }
+
+    /// Opens `path` for writing at exactly descriptor `number`, which the
+    /// caller has just closed, and returns what keeps it open.
+    fn reopen_at(number: RawFd, path: &Path) -> (std::fs::File, Option<std::os::fd::OwnedFd>) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let moved = (file.as_raw_fd() != number).then(|| {
+            assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), number) }, number);
+            unsafe { OwnedFd::from_raw_fd(number) }
+        });
+        (file, moved)
+    }
+
+    /// Lets the held pool go and waits until everything queued behind it ran.
+    async fn release_the_blocking_pool(
+        release: std::sync::mpsc::Sender<()>,
+        held: crate::task::JoinHandle<()>,
+    ) {
+        release.send(()).unwrap();
+        held.await;
+        crate::executor().spawn_blocking(|| ()).await;
+    }
+
+    rusty_fork_test! {
+        /// A cancelled copy on the blocking pool must not write through its
+        /// descriptor number once another file holds it. Forked, as the test
+        /// reuses a number by hand, which would race the other tests' files.
+        #[test]
+        fn a_cancelled_copy_cannot_write_to_a_reused_fd() {
+            for dir in make_test_directories("dma-cancelled-copy") {
+                let path = dir.path.clone();
+                test_executor!(async move {
+                    let src = OpenOptions::new()
+                        .create_new(true)
+                        .read(true)
+                        .write(true)
+                        .dma_open(path.join("src"))
+                        .await
+                        .unwrap();
+                    let len = src.alignment().max(4096) as usize;
+                    let mut buf = src.alloc_dma_buffer(len);
+                    buf.as_bytes_mut().fill(b's');
+                    src.write_at(buf, 0).await.unwrap();
+                    let dst = DmaFile::create(path.join("dst")).await.unwrap();
+
+                    let (release, held) = hold_the_blocking_pool().await;
+                    let mut copy = Box::pin(dst.copy_file_range_aligned(&src, 0, len, 0));
+                    assert!(futures_lite::future::poll_once(&mut copy).await.is_none());
+                    drop(copy);
+                    let number = dst.as_raw_fd();
+                    dst.close().await.unwrap();
+
+                    let victim = path.join("victim");
+                    std::fs::write(&victim, vec![b'v'; len]).unwrap();
+                    let _open = reopen_at(number, &victim);
+                    release_the_blocking_pool(release, held).await;
+
+                    assert_eq!(
+                        std::fs::read(&victim).unwrap(),
+                        vec![b'v'; len],
+                        "the cancelled copy wrote into whatever reused its descriptor"
+                    );
+                });
+            }
+        }
+
+        /// The same for a truncate on the blocking pool, which kernels before
+        /// 6.9 always take. Forked as well, since that choice is made once per
+        /// process.
+        #[test]
+        fn a_cancelled_blocking_truncate_cannot_shrink_a_reused_fd() {
+            std::env::set_var("GLOMMIO_DISABLE_URING_OPS", "FTRUNCATE");
+            for dir in make_test_directories("dma-cancelled-blocking-truncate") {
+                let path = dir.path.clone();
+                test_executor!(async move {
+                    let dst = DmaFile::create(path.join("dst")).await.unwrap();
+                    let (release, held) = hold_the_blocking_pool().await;
+                    let mut truncate = Box::pin(dst.truncate(0));
+                    assert!(futures_lite::future::poll_once(&mut truncate).await.is_none());
+                    drop(truncate);
+                    let number = dst.as_raw_fd();
+                    dst.close().await.unwrap();
+
+                    let victim = path.join("victim");
+                    std::fs::write(&victim, [b'v'; 4096]).unwrap();
+                    let _open = reopen_at(number, &victim);
+                    release_the_blocking_pool(release, held).await;
+
+                    assert_eq!(
+                        std::fs::metadata(&victim).unwrap().len(),
+                        4096,
+                        "the cancelled truncate shrank whatever reused its descriptor"
+                    );
+                });
+            }
+        }
+    }
 
     dma_file_test!(copy_file_range, path, _k, {
         let file1 = OpenOptions::new()

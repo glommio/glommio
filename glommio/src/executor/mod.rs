@@ -2459,10 +2459,12 @@ pub enum UnobservedPanic {
     Abort,
     /// Hand the payload over, as `rayon`'s `panic_handler` does.
     ///
-    /// Runs on whichever thread released the last reference, usually a pool
-    /// worker, and inside a `Drop`, so a panic raised here aborts the process.
-    /// Wrap the body in [`std::panic::catch_unwind`] to avoid that, which is
-    /// what `rayon` advises for the same reason.
+    /// Runs on whichever thread released the last reference: the pool worker
+    /// if the future was dropped first, the executor if the closure finished
+    /// first. A panic raised here aborts the process, as `rayon` does for its
+    /// handler, since unwinding would otherwise end the pool worker or reach
+    /// whichever task dropped the future. Wrap the body in
+    /// [`std::panic::catch_unwind`] to avoid that.
     Handler(Arc<dyn Fn(Box<dyn std::any::Any + Send>) + Send + Sync>),
 }
 
@@ -2518,7 +2520,13 @@ impl<R> Drop for BlockingSlot<R> {
                 );
                 std::process::abort();
             }
-            UnobservedPanic::Handler(handler) => handler(payload),
+            UnobservedPanic::Handler(handler) => {
+                let _abort = scopeguard::guard_on_unwind((), |()| {
+                    eprintln!("glommio: an unobserved panic handler panicked; aborting");
+                    std::process::abort();
+                });
+                handler(payload);
+            }
         }
     }
 }

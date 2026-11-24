@@ -756,8 +756,10 @@ impl<T, P: Policy> TimingWheel<T, P> {
         held.truncate(kept);
         if held.is_empty() {
             self.levels[level].mask.clear(slot);
+            self.return_buffer(level, slot, &mut held);
+        } else {
+            self.levels[level].slots[slot] = held;
         }
-        self.levels[level].slots[slot] = held;
         if let Some(cell) = self.earliest_cell(level, slot) {
             cell.set(survivor_min);
         }
@@ -947,6 +949,27 @@ mod tests {
         assert!(wheel.levels[cascading_level].slots[cascading_slot].capacity() > 0);
         wheel.advance_to(start + ms(1_000));
         assert_eq!(wheel.drain_expired().count(), RETAINED_SLOT_CAPACITY + 3);
+    }
+
+    /// A slot emptied by expiring its entries before its tick, rather than
+    /// at it, gives up a buffer that grew large like any other emptied slot.
+    #[test]
+    fn a_slot_expired_before_its_tick_gives_up_a_large_buffer() {
+        let start = Instant::now();
+        let mut wheel: TimingWheel<(), Millis> = TimingWheel::starting_at(start);
+        let first = wheel.insert(start + Duration::from_micros(1_500), ());
+        for i in 1..=RETAINED_SLOT_CAPACITY as u64 {
+            wheel.insert(
+                start + Duration::from_micros(1_500) + Duration::from_nanos(i),
+                (),
+            );
+        }
+        let (level, slot) = slot_of(&wheel, first);
+
+        wheel.advance_to(start + Duration::from_micros(1_900));
+
+        assert_eq!(wheel.drain_expired().count(), RETAINED_SLOT_CAPACITY + 1);
+        assert_eq!(wheel.levels[level].slots[slot].capacity(), 0);
     }
 
     #[test]

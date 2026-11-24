@@ -173,9 +173,12 @@ impl Future for Timer {
             return Poll::Pending;
         };
         if Instant::now() >= when {
-            if let Some(id) = inner.id.take() {
-                inner.reactor.upgrade().unwrap().remove_timer(id);
-            }
+            let removed = inner
+                .id
+                .take()
+                .and_then(|id| inner.reactor.upgrade().unwrap().remove_timer(id));
+            drop(inner);
+            drop(removed);
             Poll::Ready(when)
         } else {
             let reactor = inner.reactor.upgrade().unwrap();
@@ -707,8 +710,9 @@ impl TimerActionRepeat {
     ///
     /// A repeat action arms a fresh timer for each iteration, so there is no
     /// one registration for this to withdraw. Any timer currently armed is
-    /// dropped along with the cancelled task, which happens on a later turn of
-    /// the executor rather than here. [`TimerActionOnce::destroy`] does
+    /// dropped along with the cancelled task, and its drop withdraws its
+    /// registration, which happens on a later turn of the executor rather than
+    /// here. [`TimerActionOnce::destroy`] does
     /// withdraw immediately, because a single action has a single timer.
     ///
     /// # Examples
@@ -731,12 +735,7 @@ impl TimerActionRepeat {
     /// [`TimerActionRepeat`]: struct.TimerActionRepeat.html
     /// [`cancel`]: struct.TimerActionRepeat.html#method.cancel
     /// [`join`]: struct.TimerActionRepeat.html#method.join
-    #[allow(no_comments_allowed)]
     pub fn destroy(&self) {
-        // Cancelling the task drops whichever `Timer` the loop is currently
-        // waiting on, and that timer's `Drop` withdraws its registration.
-        // There is no stable handle to withdraw here: each iteration mints a
-        // new one.
         self.handle.cancel();
     }
 
@@ -971,6 +970,23 @@ mod test {
             });
             HOOK_BORROWED.with(|cell| cell.set(borrowed));
         }
+    }
+
+    #[test]
+    fn a_ready_timer_drops_its_registered_waker_outside_the_borrow() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_millis(5));
+            HOOKED.with(|hooked| *hooked.borrow_mut() = Some(timer.inner.clone()));
+            let hook = futures::task::waker(std::sync::Arc::new(BorrowOnDrop));
+            assert!(Pin::new(&mut timer)
+                .poll(&mut Context::from_waker(&hook))
+                .is_pending());
+            drop(hook);
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(futures::poll!(&mut timer).is_ready());
+            HOOKED.with(|hooked| hooked.borrow_mut().take());
+            assert_eq!(HOOK_BORROWED.with(Cell::get), Some(true));
+        });
     }
 
     #[test]

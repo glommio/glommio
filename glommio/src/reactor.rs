@@ -594,6 +594,42 @@ impl Reactor {
         size: usize,
         scheduler: Option<&FileScheduler>,
     ) -> ScheduledSource {
+        let source = self.new_source(
+            raw,
+            SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
+            Some(self.buffered_read_stats()),
+        );
+
+        if let Some(scheduler) = scheduler {
+            if let Some(source) =
+                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
+            {
+                source
+            } else {
+                self.sys.read_buffered(&source, pos, size);
+                scheduler.schedule(source, pos..pos + size as u64)
+            }
+        } else {
+            self.sys.read_buffered(&source, pos, size);
+            ScheduledSource::new_raw(source, pos..pos + size as u64)
+        }
+    }
+
+    /// Reads from wherever the descriptor's own offset is, and advances it, as
+    /// `read(2)` does. For descriptors such as standard input that are read in
+    /// sequence rather than by position: the ring takes an offset of -1 to mean
+    /// the current one.
+    pub(crate) fn read_buffered_at_cursor(&self, raw: RawFd, size: usize) -> ScheduledSource {
+        let source = self.new_source(
+            raw,
+            SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
+            Some(self.buffered_read_stats()),
+        );
+        self.sys.read_buffered(&source, u64::MAX, size);
+        ScheduledSource::new_raw(source, 0..size as u64)
+    }
+
+    fn buffered_read_stats(&self) -> &'static StatsCollection {
         const STATS: StatsCollection = StatsCollection {
             fulfilled: Some(|result, stats, op_count| {
                 if let Ok(result) = result {
@@ -616,30 +652,10 @@ impl Reactor {
             latency: None,
             ..STATS
         };
-        let stats = if self.record_io_latencies {
+        if self.record_io_latencies {
             &STATS
         } else {
             &STATS_WITHOUT_LATENCY
-        };
-
-        let source = self.new_source(
-            raw,
-            SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
-            Some(stats),
-        );
-
-        if let Some(scheduler) = scheduler {
-            if let Some(source) =
-                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
-            {
-                source
-            } else {
-                self.sys.read_buffered(&source, pos, size);
-                scheduler.schedule(source, pos..pos + size as u64)
-            }
-        } else {
-            self.sys.read_buffered(&source, pos, size);
-            ScheduledSource::new_raw(source, pos..pos + size as u64)
         }
     }
 

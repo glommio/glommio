@@ -703,12 +703,11 @@ impl AsyncBufRead for Stdin {
                     let this = self.project();
                     Poll::Ready(Ok(this.buffer.unconsumed_bytes()))
                 } else {
-                    let source = self.reactor.upgrade().unwrap().read_buffered(
-                        libc::STDIN_FILENO,
-                        0,
-                        self.buffer.max_buffer_size,
-                        None,
-                    );
+                    let source = self
+                        .reactor
+                        .upgrade()
+                        .unwrap()
+                        .read_buffered_at_cursor(libc::STDIN_FILENO, self.buffer.max_buffer_size);
                     source.add_waiter_single(cx.waker());
                     self.source = Some(source);
                     Poll::Pending
@@ -725,6 +724,36 @@ impl AsyncBufRead for Stdin {
 #[cfg(test)]
 mod test {
     use super::*;
+    use rusty_fork::rusty_fork_test;
+
+    rusty_fork_test! {
+        /// Stdin redirected from a regular file reads it through to the end,
+        /// starting where the descriptor's offset already is. Forked, since it
+        /// replaces the process's standard input.
+        #[test]
+        fn stdin_from_a_file_reads_on_from_the_current_offset() {
+            use futures_lite::AsyncReadExt;
+            use std::{io::Seek, os::fd::AsRawFd};
+
+            let dir = make_test_directories("stdin-from-a-file").remove(0);
+            let path = dir.path.join("input");
+            let contents: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &contents).unwrap();
+            let mut file = std::fs::File::open(&path).unwrap();
+            file.seek(std::io::SeekFrom::Start(10)).unwrap();
+            assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), libc::STDIN_FILENO) }, 0);
+
+            test_executor!(async move {
+                let mut read = Vec::new();
+                crate::timer::timeout(Duration::from_secs(5), async {
+                    stdin().read_to_end(&mut read).await.map_err(Into::into)
+                })
+                .await
+                .expect("stdin never reached the end of the file");
+                assert_eq!(read, contents[10..]);
+            });
+        }
+    }
 
     /// Guards against a cancelled `close()` leaving the writer to close its
     /// descriptor a second time, after another file has reused the number.

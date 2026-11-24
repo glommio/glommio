@@ -3763,7 +3763,7 @@ mod tests {
     /// Optional opcodes are probed too, and are not quietly required.
     ///
     /// An opcode in the required list refuses to start on a kernel without it.
-    /// These three have a blocking fallback precisely so they do not, and the
+    /// These four have a blocking fallback precisely so they do not, and the
     /// documented floor stays where it is. Moving one across would raise the
     /// floor to that opcode's kernel without anybody noticing.
     #[test]

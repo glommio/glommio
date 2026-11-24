@@ -1,6 +1,7 @@
-//! What `rename`, `remove` and `Directory::create` cost on each path.
+//! What `rename`, `remove`, `Directory::create` and `truncate` cost on each
+//! path.
 //!
-//! These three go to io_uring where the kernel has the opcode and to the
+//! These four go to io_uring where the kernel has the opcode and to the
 //! blocking pool where it does not. Which path a process takes is decided once
 //! at startup, so comparing them means running this twice:
 //!
@@ -25,10 +26,30 @@ use common::Glommio;
 use criterion::{criterion_group, criterion_main, Criterion};
 use futures::future::join_all;
 use glommio::io::{Directory, DmaFile};
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
-/// A directory of its own per benchmark, cleaned up as it goes.
+/// The most files the truncate bench holds open at once. Criterion sizes
+/// `iters` to fill its measurement time, which for a truncate on tmpfs runs to
+/// tens of thousands, past the usual descriptor limit; a batch this size is
+/// still far more than either path needs to show how it handles one.
+const TRUNCATE_BATCH: u64 = 256;
+
+/// The scratch directories the benchmarks use, removed when they finish.
+const SCRATCH: [&str; 4] = ["remove", "rename", "mkdir", "truncate"];
+
+/// A directory of its own per benchmark, emptied as it goes and removed at
+/// the end.
 fn scratch(name: &str) -> PathBuf {
+    let dir = scratch_path(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch directory");
+    dir
+}
+
+fn scratch_path(name: &str) -> PathBuf {
     // `temp_dir` is usually tmpfs, where nothing blocks and an unlink costs
     // about 1.5us. The point of moving these to the ring is what happens when
     // they do block, so point this at a real filesystem to measure that.
@@ -36,10 +57,7 @@ fn scratch(name: &str) -> PathBuf {
         Ok(path) => PathBuf::from(path),
         Err(_) => std::env::temp_dir(),
     };
-    let dir = root.join(format!("glommio-fsbench-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch directory");
-    dir
+    root.join(format!("glommio-fsbench-{}-{name}", std::process::id()))
 }
 
 /// Says which path this process took.
@@ -154,23 +172,32 @@ fn filesystem_ops(c: &mut Criterion) {
                 // repeatedly holds a single inode and cannot be issued as a
                 // batch, which makes it a measurement of the sequential case
                 // rather than of truncate.
-                let mut files = Vec::with_capacity(iters as usize);
-                for i in 0..iters {
-                    let file = DmaFile::create(dir.join(format!("f{i}"))).await.unwrap();
-                    let buf = file.alloc_dma_buffer(4096);
-                    file.write_at(buf, 0).await.unwrap();
-                    files.push(file);
-                }
+                let mut elapsed = Duration::ZERO;
+                let mut done = 0;
+                while done < iters {
+                    let batch = done..iters.min(done + TRUNCATE_BATCH);
+                    let mut files = Vec::with_capacity(batch.end as usize - done as usize);
+                    for i in batch.clone() {
+                        let file = DmaFile::create(dir.join(format!("f{i}"))).await.unwrap();
+                        let buf = file.alloc_dma_buffer(4096);
+                        file.write_at(buf, 0).await.unwrap();
+                        files.push(file);
+                    }
 
-                let start = Instant::now();
-                join_all(files.iter().map(|f| f.truncate(2048)))
-                    .await
-                    .into_iter()
-                    .for_each(|r| r.unwrap());
-                let elapsed = start.elapsed();
+                    let start = Instant::now();
+                    join_all(files.iter().map(|f| f.truncate(2048)))
+                        .await
+                        .into_iter()
+                        .for_each(|r| r.unwrap());
+                    elapsed += start.elapsed();
 
-                for file in files {
-                    file.close().await.unwrap();
+                    for file in files {
+                        file.close().await.unwrap();
+                    }
+                    for i in batch.clone() {
+                        let _ = std::fs::remove_file(dir.join(format!("f{i}")));
+                    }
+                    done = batch.end;
                 }
                 elapsed
             }
@@ -178,6 +205,9 @@ fn filesystem_ops(c: &mut Criterion) {
     });
 
     group.finish();
+    for name in SCRATCH {
+        let _ = std::fs::remove_dir_all(scratch_path(name));
+    }
 }
 
 criterion_group!(benches, filesystem_ops);

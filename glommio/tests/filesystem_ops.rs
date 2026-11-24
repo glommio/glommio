@@ -1,13 +1,14 @@
 // Unless explicitly stated otherwise all files in this repository are licensed
 // under the MIT/Apache-2.0 License, at your convenience
 //
-//! `rename`, `remove` and `Directory::create` behave the same whichever way
-//! they are submitted.
+//! `rename`, `remove`, `Directory::create` and `truncate` behave the same
+//! whichever way they are submitted.
 //!
 //! Each runs on the ring where the kernel has the opcode and on the blocking
 //! pool where it does not, so the two have to agree on results and on errno.
 //! `GLOMMIO_DISABLE_URING_OPS` forces the second path on a kernel that has
-//! everything, which is the only way to reach it on a modern machine.
+//! everything, which is the only way to reach it on a modern machine; CI runs
+//! this file both ways.
 
 use glommio::{
     io::{Directory, DmaFile},

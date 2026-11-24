@@ -52,6 +52,11 @@ jobs:
         with:
           tool: nextest@0.9.143
 
+      # On the toolchain ci.yml tests with. The macros' compile-fail tests
+      # compare compiler output, which changes wording between releases.
+      - name: Use Rust MSRV for testing
+        run: rustup override set 1.92.0
+
       - name: Run all tests
         run: .github/scripts/run-tests.sh
 

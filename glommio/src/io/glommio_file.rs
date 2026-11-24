@@ -204,6 +204,10 @@ impl AsFd for GlommioFile {
 }
 
 impl GlommioFile {
+    /// Opens `path` relative to `dir`.
+    ///
+    /// An `O_TMPFILE` file is left without a path: the one given names its
+    /// parent directory, not the file, which has no name to rename or remove.
     pub(crate) async fn open_at(
         dir: RawFd,
         path: &Path,
@@ -221,11 +225,12 @@ impl GlommioFile {
 
         let source = reactor.open_at(dir, &path, flags, mode);
         let fd = source.collect_fd().await?;
+        let unnamed = flags & libc::O_TMPFILE == libc::O_TMPFILE;
 
         let mut file = GlommioFile {
             file: Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as _) })),
             lock_state: Some(Arc::new(Default::default())),
-            path: RefCell::new(Some(path)),
+            path: RefCell::new((!unnamed).then_some(path)),
             inode: 0,
             dev_major: 0,
             dev_minor: 0,
@@ -368,11 +373,9 @@ impl GlommioFile {
             Ok(())
         } else {
             Err(GlommioError::CanNotBeClosed(
-                ResourceType::File(
-                    path.map_or("path has already been taken!".to_string(), |p| {
-                        p.to_string_lossy().to_string()
-                    }),
-                ),
+                ResourceType::File(path.map_or("the file has no path".to_string(), |p| {
+                    p.to_string_lossy().to_string()
+                })),
                 "Another clone of this file exists somewhere - cannot close fd",
             ))
         }

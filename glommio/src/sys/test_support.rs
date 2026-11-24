@@ -1,5 +1,5 @@
-//! Test-only hooks: synchronization for foreign wake submission, and
-//! injected ring submission failures.
+//! Test-only hooks: synchronization for foreign wake submission, injected
+//! ring submission failures, and a record of file syncs and truncates.
 
 use std::{
     cell::{Cell, RefCell},
@@ -16,6 +16,28 @@ struct ForeignWakePause {
 thread_local! {
     static FOREIGN_WAKE_PAUSE: RefCell<Option<ForeignWakePause>> = const { RefCell::new(None) };
     static SUBMIT_FAILURE: Cell<Option<(&'static str, i32)>> = const { Cell::new(None) };
+    static FILE_OPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+}
+
+/// Starts recording, in order, the syncs and truncates this thread issues.
+pub(crate) fn record_file_ops() {
+    FILE_OPS.with(|ops| assert!(ops.replace(Some(Vec::new())).is_none()));
+}
+
+/// Notes a sync or truncate, if this thread is recording them.
+pub(crate) fn note_file_op(op: &'static str) {
+    FILE_OPS.with(|ops| {
+        if let Some(ops) = ops.borrow_mut().as_mut() {
+            ops.push(op);
+        }
+    });
+}
+
+/// Stops recording and returns what was recorded.
+pub(crate) fn recorded_file_ops() -> Vec<&'static str> {
+    FILE_OPS
+        .with(|ops| ops.take())
+        .expect("file ops were not being recorded")
 }
 
 /// Pauses this thread's next submission after enqueueing and releasing the queue lock.

@@ -889,6 +889,10 @@ impl DmaStreamWriterState {
         self.flushed_pos() > self.aligned_pos
     }
 
+    /// Flushes what is left, padded to the alignment, then truncates the
+    /// padding away before syncing. The sync that close promises then covers
+    /// the final size too; syncing first left the shrink to whenever the
+    /// filesystem next committed, so a crash could bring the padding back.
     fn initiate_close(&mut self, state: Rc<RefCell<Self>>, file: Rc<DmaFile>, do_close: bool) {
         self.file_status = FileStatus::Closing;
         let final_pos = self.current_pos();
@@ -920,17 +924,6 @@ impl DmaStreamWriterState {
                 state.sync_on_close && state.synced_pos < final_pos
             };
 
-            if must_adjust {
-                let res = file.fdatasync().await;
-                {
-                    let mut state = state.borrow_mut();
-                    if collect_error!(state, res) {
-                        return;
-                    }
-                    state.synced_pos = final_pos;
-                }
-            }
-
             let must_truncate = {
                 let state = state.borrow();
                 state.must_truncate()
@@ -943,6 +936,17 @@ impl DmaStreamWriterState {
                     if collect_error!(state, res) {
                         return;
                     }
+                }
+            }
+
+            if must_adjust {
+                let res = file.fdatasync().await;
+                {
+                    let mut state = state.borrow_mut();
+                    if collect_error!(state, res) {
+                        return;
+                    }
+                    state.synced_pos = final_pos;
                 }
             }
 
@@ -1655,6 +1659,19 @@ mod test {
         writer.write_all(b"after").await.unwrap();
         writer.close().await.unwrap();
         assert_eq!(std::fs::read(&filename).unwrap(), b"after");
+    });
+
+    file_stream_write_test!(close_truncates_before_it_syncs, path, _k, filename, file, {
+        let mut writer = DmaStreamWriterBuilder::new(file).build();
+        writer.write_all(&[7; 100]).await.unwrap();
+        crate::sys::test_support::record_file_ops();
+        writer.close().await.unwrap();
+        assert_eq!(
+            crate::sys::test_support::recorded_file_ops(),
+            ["truncate", "fdatasync"],
+            "the sync that close promises has to cover the final size"
+        );
+        assert_eq!(std::fs::read(&filename).unwrap(), [7; 100]);
     });
 
     file_stream_write_test!(close_after_a_cancelled_flush, path, _k, filename, file, {

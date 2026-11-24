@@ -1857,6 +1857,10 @@ impl UringCommon for SleepableRing {
     /// The raw entry submits exactly the entries pushed, which `submit`
     /// would have done the same way.
     fn submit_sqes(&mut self) -> io::Result<usize> {
+        #[cfg(test)]
+        if let Some(err) = sys::test_support::take_submit_failure(self.name) {
+            return Err(err);
+        }
         let x = if self.cooperative {
             let to_submit = self.ring.submission().len() as u32;
             unsafe {
@@ -2762,7 +2766,9 @@ impl Reactor {
     /// When sleeping:
     ///
     /// * It's ok to sleep, but if there is a timer set, we need to make sure
-    ///   we wake up to handle it.
+    ///   we wake up to handle it. If the kernel does not take that timer
+    ///   (`flush_rings!` lets `EBUSY`, `EAGAIN` and `EINTR` through as no
+    ///   submissions), we don't sleep this time.
     /// * From this moment on the remote executors are aware that we are
     ///   sleeping. We have to sweep the remote channels function once more
     ///   because since last time until now it could be that something
@@ -2887,39 +2893,41 @@ impl Reactor {
             if let Some(dur) = user_timer {
                 self.latency_preemption_timeout_src
                     .set(Some(lat_ring.prepare_latency_preemption_timer(dur)));
-                assert!(flush_rings!(lat_ring)? > 0);
+                should_sleep = flush_rings!(lat_ring)? > 0;
             }
-            drop((poll_ring, main_ring, lat_ring, sock_ring));
-            self.notifier.sleep_unless_woken(
-                || process_remote_channels() + self.flush_syscall_thread(),
-                || {
-                    let mut poll_ring = self.poll_ring.borrow_mut();
-                    let mut main_ring = self.main_ring.borrow_mut();
-                    let mut lat_ring = self.latency_ring.borrow_mut();
-                    let mut sock_ring = self.socket_ring.as_ref().map(|ring| ring.borrow_mut());
-                    if self.eventfd_src.is_installed().unwrap() {
-                        match sock_ring.as_deref_mut() {
-                            Some(sock_ring) => self
-                                .link_rings_and_sleep(sock_ring, &self.link_fds)
-                                .expect("some error"),
-                            None => self
-                                .link_rings_and_sleep(&mut main_ring, &self.link_fds[1..])
-                                .expect("some error"),
+            if should_sleep {
+                drop((poll_ring, main_ring, lat_ring, sock_ring));
+                self.notifier.sleep_unless_woken(
+                    || process_remote_channels() + self.flush_syscall_thread(),
+                    || {
+                        let mut poll_ring = self.poll_ring.borrow_mut();
+                        let mut main_ring = self.main_ring.borrow_mut();
+                        let mut lat_ring = self.latency_ring.borrow_mut();
+                        let mut sock_ring = self.socket_ring.as_ref().map(|ring| ring.borrow_mut());
+                        if self.eventfd_src.is_installed().unwrap() {
+                            match sock_ring.as_deref_mut() {
+                                Some(sock_ring) => self
+                                    .link_rings_and_sleep(sock_ring, &self.link_fds)
+                                    .expect("some error"),
+                                None => self
+                                    .link_rings_and_sleep(&mut main_ring, &self.link_fds[1..])
+                                    .expect("some error"),
+                            }
+                            flush_cancellations!(into &mut 0; lat_ring, poll_ring, main_ring);
+                            flush_rings!(lat_ring, poll_ring, main_ring)?;
+                            consume_rings!(into &mut 0; lat_ring, poll_ring, main_ring);
+                            if let Some(sock_ring) = sock_ring.as_deref_mut() {
+                                flush_cancellations!(into &mut 0; sock_ring);
+                                flush_rings!(sock_ring)?;
+                                consume_rings!(into &mut 0; sock_ring);
+                            }
                         }
-                        flush_cancellations!(into &mut 0; lat_ring, poll_ring, main_ring);
-                        flush_rings!(lat_ring, poll_ring, main_ring)?;
-                        consume_rings!(into &mut 0; lat_ring, poll_ring, main_ring);
-                        if let Some(sock_ring) = sock_ring.as_deref_mut() {
-                            flush_cancellations!(into &mut 0; sock_ring);
-                            flush_rings!(sock_ring)?;
-                            consume_rings!(into &mut 0; sock_ring);
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            main_ring = self.main_ring.borrow_mut();
-            lat_ring = self.latency_ring.borrow_mut();
+                        Ok(())
+                    },
+                )?;
+                main_ring = self.main_ring.borrow_mut();
+                lat_ring = self.latency_ring.borrow_mut();
+            }
             Settled(())
         } else {
             settled
@@ -3928,6 +3936,26 @@ mod tests {
             parked >= Duration::from_millis(250),
             "woke after {parked:?}"
         );
+    }
+
+    /// A timer the kernel did not take cannot end the sleep, so the reactor
+    /// must not sleep on it. A transient `EBUSY` used to panic here.
+    #[test]
+    fn unsubmitted_sleep_timer_skips_the_sleep() {
+        let (done, slept) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let notifier = sys::new_sleep_notifier().unwrap();
+            let pool =
+                BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+            let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
+            reactor.install_eventfd();
+            sys::test_support::fail_next_submit("latency", libc::EBUSY);
+            let _ = done.send(reactor.wait(|| None, Some(Duration::from_secs(60)), true, 0, || 0));
+        });
+        let slept = slept
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the reactor panicked, or slept without its timer");
+        assert!(!slept.unwrap());
     }
 
     /// Every input the decision can be given, and the property that has to

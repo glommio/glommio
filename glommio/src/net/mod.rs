@@ -5,7 +5,7 @@
 //!
 //! This module provides glommio's networking support.
 use crate::sys;
-use nix::sys::socket::{self, MsgFlags, SockaddrLike};
+use nix::sys::socket::{self, MsgFlags, SockFlag, SockaddrLike};
 use std::{
     io::{self, IoSlice},
     os::{
@@ -22,6 +22,8 @@ fn unless_would_block<T>(res: nix::Result<T>) -> Option<io::Result<T>> {
     }
 }
 
+/// Accepts a connection that is already waiting, without the ring. Closed on
+/// exec, as the ring's accept asks for too.
 fn yolo_accept(fd: BorrowedFd<'_>) -> Option<io::Result<RawFd>> {
     debug_assert!(
         {
@@ -30,7 +32,7 @@ fn yolo_accept(fd: BorrowedFd<'_>) -> Option<io::Result<RawFd>> {
         },
         "listener is blocking; accept would park the executor"
     );
-    unless_would_block(socket::accept(fd.as_raw_fd()))
+    unless_would_block(socket::accept4(fd.as_raw_fd(), SockFlag::SOCK_CLOEXEC))
 }
 
 fn yolo_send(fd: RawFd, buf: &[u8]) -> Option<io::Result<usize>> {

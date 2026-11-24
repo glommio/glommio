@@ -168,6 +168,17 @@ mod test {
         relative
     }
 
+    /// A cloned directory is closed on exec, like the one it came from.
+    #[test]
+    fn a_cloned_directory_is_closed_on_exec() {
+        test_executor!(async move {
+            let dir = Directory::open(std::env::temp_dir()).await.unwrap();
+            let clone = dir.try_clone().unwrap();
+            let flags = unsafe { libc::fcntl(clone.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0, "the clone leaks across exec");
+        });
+    }
+
     #[test]
     fn open_and_create_take_relative_paths() {
         test_executor!(async move {

@@ -19,9 +19,31 @@ thread_local! {
     static FILE_OPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
 }
 
-/// Starts recording, in order, the syncs and truncates this thread issues.
-pub(crate) fn record_file_ops() {
+/// Records, in order, the syncs and truncates this thread issues, until
+/// taken or dropped. Dropping it stops the recording, so a test that panics
+/// leaves nothing armed for the next test on the thread.
+#[must_use = "recording stops when this is dropped"]
+pub(crate) struct FileOpsRecording(());
+
+impl FileOpsRecording {
+    /// Stops recording and returns what was recorded.
+    pub(crate) fn take(self) -> Vec<&'static str> {
+        FILE_OPS
+            .with(|ops| ops.take())
+            .expect("file ops were not being recorded")
+    }
+}
+
+impl Drop for FileOpsRecording {
+    fn drop(&mut self) {
+        FILE_OPS.with(|ops| ops.take());
+    }
+}
+
+/// Starts recording the syncs and truncates this thread issues.
+pub(crate) fn record_file_ops() -> FileOpsRecording {
     FILE_OPS.with(|ops| assert!(ops.replace(Some(Vec::new())).is_none()));
+    FileOpsRecording(())
 }
 
 /// Notes a sync or truncate, if this thread is recording them.
@@ -31,13 +53,6 @@ pub(crate) fn note_file_op(op: &'static str) {
             ops.push(op);
         }
     });
-}
-
-/// Stops recording and returns what was recorded.
-pub(crate) fn recorded_file_ops() -> Vec<&'static str> {
-    FILE_OPS
-        .with(|ops| ops.take())
-        .expect("file ops were not being recorded")
 }
 
 /// Pauses this thread's next submission after enqueueing and releasing the queue lock.
@@ -81,4 +96,22 @@ pub(crate) fn take_submit_failure(ring: &str) -> Option<io::Error> {
         }
         _ => None,
     })
+}
+
+mod tests {
+    use super::*;
+
+    /// A test that panics while recording leaves the next one free to record.
+    #[test]
+    fn a_panic_while_recording_stops_the_recording() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _recording = record_file_ops();
+            note_file_op("truncate");
+            panic!("the test failed while recording");
+        });
+        assert!(panicked.is_err());
+        let recording = record_file_ops();
+        note_file_op("fdatasync");
+        assert_eq!(recording.take(), ["fdatasync"]);
+    }
 }

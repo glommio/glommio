@@ -287,6 +287,10 @@ impl<T: Send + Sized> ConnectedSender<T> {
 
     /// Sends data into this channel when it is ready to receive it
     ///
+    /// Room is judged from the queue's size, which the receiver's thread
+    /// updates; should a push still find the slot taken, this waits again
+    /// rather than failing.
+    ///
     /// # Examples
     /// ```
     /// use glommio::{channels::shared_channel, prelude::*};
@@ -309,14 +313,14 @@ impl<T: Send + Sized> ConnectedSender<T> {
     /// producer.join().unwrap();
     /// receiver.join().unwrap();
     /// ```
-    pub async fn send(&self, item: T) -> Result<(), T> {
-        let waiter = future::poll_fn(|cx| self.wait_for_room(cx));
-        waiter.await;
-        let res = self.try_send(item);
-        if let Err(GlommioError::WouldBlock(_)) = &res {
-            panic!("operation would block")
+    pub async fn send(&self, mut item: T) -> Result<(), T> {
+        loop {
+            future::poll_fn(|cx| self.wait_for_room(cx)).await;
+            match self.try_send(item) {
+                Err(GlommioError::WouldBlock(ResourceType::Channel(back))) => item = back,
+                res => return res,
+            }
         }
-        res
     }
 
     fn wait_for_room(&self, cx: &Context<'_>) -> Poll<()> {

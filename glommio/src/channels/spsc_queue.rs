@@ -80,7 +80,11 @@ impl<T> fmt::Debug for Buffer<T> {
             .finish()
     }
 }
-unsafe impl<T: Sync> Sync for Buffer<T> {}
+/// The buffer is shared between the producer and consumer threads, but a
+/// value only ever moves through it, in on one side and out on the other, and
+/// no reference to one is handed out. So it needs `T: Send`, as `std::sync::mpsc`
+/// does, and not `T: Sync`.
+unsafe impl<T: Send> Sync for Buffer<T> {}
 
 /// A handle to the queue which allows consuming values from the buffer.
 ///
@@ -192,7 +196,7 @@ impl<T> Buffer<T> {
         slot.has_value.store(false, Ordering::Release);
         self.ccache
             .head
-            .store(head.wrapping_add(1), Ordering::Relaxed);
+            .store(head.wrapping_add(1), Ordering::Release);
         v
     }
 
@@ -236,7 +240,7 @@ impl<T> Buffer<T> {
         slot.has_value.store(true, Ordering::Release);
         self.pcache
             .tail
-            .store(tail.wrapping_add(1), Ordering::Relaxed);
+            .store(tail.wrapping_add(1), Ordering::Release);
         None
     }
 
@@ -266,13 +270,19 @@ impl<T> Buffer<T> {
     ///
     /// This value represents the current size of the queue.  This value can be
     /// from 0-`capacity` inclusive.
+    ///
+    /// `head` and `tail` run free and wrap, so the distance is taken modulo
+    /// the word. Both are stored with `Release` after the slot they cover, so
+    /// a side that reads a moved index here also sees that slot's flag, and a
+    /// size that promises room or a value is one `try_push` or `try_pop` will
+    /// find.
     pub(crate) fn size(&self) -> usize {
         std::cmp::min(
             self.capacity,
             self.pcache
                 .tail
                 .load(Ordering::Acquire)
-                .saturating_sub(self.ccache.head.load(Ordering::Acquire)),
+                .wrapping_sub(self.ccache.head.load(Ordering::Acquire)),
         )
     }
 }
@@ -558,6 +568,8 @@ mod tests {
         for i in 0..10 {
             assert!(p.try_push(i).is_none());
         }
+        assert_eq!(p.size(), 10, "the indices wrapped, the size did not");
+        assert_eq!(p.free_space(), p.capacity() - 10);
 
         for i in 0..10 {
             assert_eq!(c.try_pop(), Some(i));
@@ -569,5 +581,13 @@ mod tests {
     fn producer_consumer_are_send() {
         assert_send_sync::<Producer<u32>>();
         assert_send_sync::<Consumer<u32>>();
+    }
+
+    /// Values only move through the queue, never shared, so a value that is
+    /// `Send` but not `Sync` can cross it.
+    #[test]
+    fn values_need_only_be_send() {
+        assert_send_sync::<Producer<std::cell::Cell<u32>>>();
+        assert_send_sync::<Consumer<std::cell::Cell<u32>>>();
     }
 }

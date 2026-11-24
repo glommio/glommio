@@ -1514,18 +1514,15 @@ fn align_up(v: usize, align: usize) -> usize {
 ///
 /// Not `Copy` or `Clone` on purpose. Anything that invalidates it takes it by
 /// value, so the reading that depends on it cannot be moved above them without
-/// failing to compile. That is the whole point: every bug this decision has
-/// had was a read placed one step too early, and a comment saying "read this
-/// after the drain" is the kind of instruction that quietly stops being true.
+/// failing to compile. Parking invalidates it, as do the remote channels
+/// drained on the way into a park.
 #[must_use]
 struct Settled(());
 
 /// What the keep-or-rearm decision reads about the latency preemption timer.
 ///
-/// Gathered at one point on purpose. The two fields can each be invalidated by
-/// a ring drain, by work arriving from another executor, or by a park, and
-/// every bug this decision has had was one of them being read a step earlier
-/// than the other.
+/// Gathered at one point because a ring drain, work arriving from another
+/// executor, or a park can each invalidate either field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PreemptObservation {
     /// What the held timer is armed for.
@@ -1548,13 +1545,12 @@ enum PreemptAction {
 }
 
 impl PreemptObservation {
+    /// Leaves a timer still armed for exactly what is wanted, and rearms
+    /// otherwise. With nothing wanted, a timer still held fires once and is
+    /// given up on the next pass, one wasted wakeup.
     fn decide(self) -> PreemptAction {
         match self.wanted {
-            // Nothing asks to be preempted. Anything still held fires once and
-            // is given up on the next pass, which costs one wasted wakeup and
-            // no correctness.
             None => PreemptAction::Leave,
-            // Held for exactly what is wanted, and it has not fired.
             Some(wanted) if self.armed_for == Some(wanted) => PreemptAction::Leave,
             Some(wanted) => PreemptAction::Rearm(wanted),
         }
@@ -2175,6 +2171,11 @@ impl Reactor {
         )
     }
 
+    /// [`Self::wait`], with `after_drain` run once the rings are drained.
+    ///
+    /// A rearm at the end can replace a timer that has not fired, so its
+    /// cancellation is flushed with the new timer rather than left for the
+    /// next pass.
     fn wait_with_after_drain<Preempt, F, AfterDrain>(
         &self,
         preempt_timer: Preempt,
@@ -2197,10 +2198,6 @@ impl Reactor {
 
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        // Give up a timer that has fired, or one armed for a duration nobody
-        // wants any more, while its cancellation can still leave with the
-        // flush below. This is not the keep decision, which is taken once at
-        // the end from a single reading.
         self.discard_unusable_preempt_timer(preempt_timer());
 
         self.throughput_preemption_timeout_src.replace(Some(
@@ -2223,9 +2220,6 @@ impl Reactor {
             && lat_ring.can_sleep();
 
         let settled = if should_sleep {
-            // Parking, and the remote channels drained on the way into it, can
-            // both change what the timer should be, so evidence gathered before
-            // them does not carry across.
             drop(settled);
             drop(self.latency_preemption_timeout_src.take());
             self.latency_preemption_armed_for.set(None);
@@ -2265,9 +2259,6 @@ impl Reactor {
             self.latency_preemption_armed_for.set(Some(preempt));
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
-            // The line above can drop a timer that had not fired, which happens
-            // when what is wanted changed. Its cancellation is submitted here
-            // rather than left for the next pass to flush.
             flush_cancellations!(into &mut 0; lat_ring);
             flush_rings!(lat_ring, main_ring)?;
         }

@@ -1254,8 +1254,6 @@ mod tests {
         });
     }
 
-    /// Guards against a failed `peer_addr` closing the descriptor the
-    /// accepted stream still holds.
     /// A connection already queued is accepted without the ring, and is
     /// closed on exec like one accepted through it.
     #[test]
@@ -1265,14 +1263,17 @@ mod tests {
             let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let stream = listener.accept().await.unwrap();
             let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
-            assert_ne!(
+            assert!(flags >= 0, "F_GETFD failed on the accepted socket");
+            assert_eq!(
                 flags & libc::FD_CLOEXEC,
-                0,
+                libc::FD_CLOEXEC,
                 "the accepted socket leaks across exec"
             );
         });
     }
 
+    /// Guards against a failed `peer_addr` closing the descriptor the
+    /// accepted stream still holds.
     #[test]
     fn a_failed_peer_addr_keeps_the_descriptor() {
         test_executor!(async move {

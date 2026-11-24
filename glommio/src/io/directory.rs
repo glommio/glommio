@@ -175,7 +175,12 @@ mod test {
             let dir = Directory::open(std::env::temp_dir()).await.unwrap();
             let clone = dir.try_clone().unwrap();
             let flags = unsafe { libc::fcntl(clone.as_raw_fd(), libc::F_GETFD) };
-            assert_ne!(flags & libc::FD_CLOEXEC, 0, "the clone leaks across exec");
+            assert!(flags >= 0, "F_GETFD failed on the clone");
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "the clone leaks across exec"
+            );
         });
     }
 

@@ -122,8 +122,8 @@ pub fn glommio::channels::channel_mesh::MeshBuilder<T, A>::clone(&self) -> Self
 impl<T: core::marker::Send, A: glommio::channels::channel_mesh::MeshAdapter> core::fmt::Debug for glommio::channels::channel_mesh::MeshBuilder<T, A>
 pub fn glommio::channels::channel_mesh::MeshBuilder<T, A>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T, A> core::marker::Freeze for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::Freeze
-impl<T, A> core::marker::Send for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::Send, T: core::marker::Sync
-impl<T, A> core::marker::Sync for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::Sync, T: core::marker::Sync
+impl<T, A> core::marker::Send for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::Send
+impl<T, A> core::marker::Sync for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::Sync
 impl<T, A> core::marker::Unpin for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::Unpin
 impl<T, A> core::marker::UnsafeUnpin for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::marker::UnsafeUnpin
 impl<T, A> core::panic::unwind_safe::RefUnwindSafe for glommio::channels::channel_mesh::MeshBuilder<T, A> where A: core::panic::unwind_safe::RefUnwindSafe
@@ -556,8 +556,8 @@ pub fn glommio::channels::shared_channel::SharedReceiver<T>::fmt(&self, f: &mut 
 impl<T: core::marker::Send + core::marker::Sized> core::ops::drop::Drop for glommio::channels::shared_channel::SharedReceiver<T>
 pub fn glommio::channels::shared_channel::SharedReceiver<T>::drop(&mut self)
 impl<T> core::marker::Freeze for glommio::channels::shared_channel::SharedReceiver<T>
-impl<T> core::marker::Send for glommio::channels::shared_channel::SharedReceiver<T> where T: core::marker::Sync
-impl<T> core::marker::Sync for glommio::channels::shared_channel::SharedReceiver<T> where T: core::marker::Sync
+impl<T> core::marker::Send for glommio::channels::shared_channel::SharedReceiver<T>
+impl<T> core::marker::Sync for glommio::channels::shared_channel::SharedReceiver<T>
 impl<T> core::marker::Unpin for glommio::channels::shared_channel::SharedReceiver<T>
 impl<T> core::marker::UnsafeUnpin for glommio::channels::shared_channel::SharedReceiver<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for glommio::channels::shared_channel::SharedReceiver<T>
@@ -598,8 +598,8 @@ pub fn glommio::channels::shared_channel::SharedSender<T>::fmt(&self, f: &mut co
 impl<T: core::marker::Send + core::marker::Sized> core::ops::drop::Drop for glommio::channels::shared_channel::SharedSender<T>
 pub fn glommio::channels::shared_channel::SharedSender<T>::drop(&mut self)
 impl<T> core::marker::Freeze for glommio::channels::shared_channel::SharedSender<T>
-impl<T> core::marker::Send for glommio::channels::shared_channel::SharedSender<T> where T: core::marker::Sync
-impl<T> core::marker::Sync for glommio::channels::shared_channel::SharedSender<T> where T: core::marker::Sync
+impl<T> core::marker::Send for glommio::channels::shared_channel::SharedSender<T>
+impl<T> core::marker::Sync for glommio::channels::shared_channel::SharedSender<T>
 impl<T> core::marker::Unpin for glommio::channels::shared_channel::SharedSender<T>
 impl<T> core::marker::UnsafeUnpin for glommio::channels::shared_channel::SharedSender<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for glommio::channels::shared_channel::SharedSender<T>
@@ -642,8 +642,8 @@ pub fn glommio::channels::spsc_queue::Consumer<T>::try_pop(&mut self) -> core::o
 impl<T> core::fmt::Debug for glommio::channels::spsc_queue::Consumer<T>
 pub fn glommio::channels::spsc_queue::Consumer<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::channels::spsc_queue::Consumer<T>
-impl<T> core::marker::Send for glommio::channels::spsc_queue::Consumer<T> where T: core::marker::Sync + core::marker::Send
-impl<T> core::marker::Sync for glommio::channels::spsc_queue::Consumer<T> where T: core::marker::Sync + core::marker::Send
+impl<T> core::marker::Send for glommio::channels::spsc_queue::Consumer<T> where T: core::marker::Send
+impl<T> core::marker::Sync for glommio::channels::spsc_queue::Consumer<T> where T: core::marker::Send
 impl<T> core::marker::Unpin for glommio::channels::spsc_queue::Consumer<T>
 impl<T> core::marker::UnsafeUnpin for glommio::channels::spsc_queue::Consumer<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for glommio::channels::spsc_queue::Consumer<T>
@@ -685,8 +685,8 @@ pub fn glommio::channels::spsc_queue::Producer<T>::try_push(&mut self, v: T) -> 
 impl<T> core::fmt::Debug for glommio::channels::spsc_queue::Producer<T>
 pub fn glommio::channels::spsc_queue::Producer<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::channels::spsc_queue::Producer<T>
-impl<T> core::marker::Send for glommio::channels::spsc_queue::Producer<T> where T: core::marker::Sync + core::marker::Send
-impl<T> core::marker::Sync for glommio::channels::spsc_queue::Producer<T> where T: core::marker::Sync + core::marker::Send
+impl<T> core::marker::Send for glommio::channels::spsc_queue::Producer<T> where T: core::marker::Send
+impl<T> core::marker::Sync for glommio::channels::spsc_queue::Producer<T> where T: core::marker::Send
 impl<T> core::marker::Unpin for glommio::channels::spsc_queue::Producer<T>
 impl<T> core::marker::UnsafeUnpin for glommio::channels::spsc_queue::Producer<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for glommio::channels::spsc_queue::Producer<T>

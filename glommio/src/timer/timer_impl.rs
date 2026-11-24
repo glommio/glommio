@@ -17,9 +17,13 @@ use crate::Result;
 
 #[derive(Debug)]
 struct Inner {
-    id: u64,
-
-    is_charged: bool,
+    /// Handle to the registered timer. `None` until the first poll registers
+    /// it, since the reactor mints the handle rather than the caller.
+    ///
+    /// Holding a handle is what it means to be registered. Every insert mints
+    /// a new one, so a handle still held when re-registering has to be removed
+    /// first, or the timer it names can no longer be reached.
+    id: Option<crate::timer::TimerId>,
 
     /// When this timer fires, or `None` for a duration past what an
     /// `Instant` can hold, which never fires and is never registered.
@@ -37,26 +41,16 @@ impl Inner {
     /// re-registers the timer with the new timeout.
     fn reset(&mut self, dur: Duration) {
         let mut waker = self.parked.take();
-        if self.is_charged {
-            waker = self
-                .reactor
-                .upgrade()
-                .unwrap()
-                .remove_timer(self.id)
-                .or(waker);
+        if let Some(id) = self.id.take() {
+            waker = self.reactor.upgrade().unwrap().remove_timer(id).or(waker);
         }
 
         self.when = Instant::now().checked_add(dur);
-        self.is_charged = false;
 
         if let Some(waker) = waker {
             match self.when {
                 Some(when) => {
-                    self.reactor
-                        .upgrade()
-                        .unwrap()
-                        .insert_timer(self.id, when, waker);
-                    self.is_charged = true;
+                    self.id = Some(self.reactor.upgrade().unwrap().insert_timer(when, waker));
                 }
                 None => self.parked = Some(waker),
             }
@@ -120,25 +114,10 @@ impl Timer {
         let reactor = crate::executor().reactor();
         Timer {
             inner: Rc::new(RefCell::new(Inner {
-                id: reactor.register_timer(),
-                is_charged: false,
+                id: None,
                 when: Instant::now().checked_add(dur),
                 parked: None,
                 reactor: Rc::downgrade(&reactor),
-            })),
-        }
-    }
-
-    /// Useful in generating repeat timers that have a constant id. Not for
-    /// external usage.
-    fn from_id(id: u64, dur: Duration) -> Timer {
-        Timer {
-            inner: Rc::new(RefCell::new(Inner {
-                id,
-                is_charged: false,
-                when: Instant::now().checked_add(dur),
-                parked: None,
-                reactor: Rc::downgrade(&crate::executor().reactor()),
             })),
         }
     }
@@ -173,11 +152,9 @@ impl Drop for Timer {
         let mut inner = self.inner.borrow_mut();
         let parked = inner.parked.take();
         let registered = inner
-            .is_charged
-            .then(|| inner.reactor.upgrade())
-            .flatten()
-            .and_then(|reactor| reactor.remove_timer(inner.id));
-        inner.is_charged = false;
+            .id
+            .take()
+            .and_then(|id| inner.reactor.upgrade()?.remove_timer(id));
         drop(inner);
         drop((parked, registered));
     }
@@ -196,15 +173,24 @@ impl Future for Timer {
             return Poll::Pending;
         };
         if Instant::now() >= when {
-            inner.reactor.upgrade().unwrap().remove_timer(inner.id);
+            let removed = inner
+                .id
+                .take()
+                .and_then(|id| inner.reactor.upgrade().unwrap().remove_timer(id));
+            drop(inner);
+            drop(removed);
             Poll::Ready(when)
         } else {
-            inner
-                .reactor
-                .upgrade()
-                .unwrap()
-                .insert_timer(inner.id, when, cx.waker().clone());
-            inner.is_charged = true;
+            let reactor = inner.reactor.upgrade().unwrap();
+            if let Some(id) = inner.id.take() {
+                if let Some(displaced) = reactor.update_timer_waker(id, cx.waker()) {
+                    inner.id = Some(id);
+                    drop(inner);
+                    drop(displaced);
+                    return Poll::Pending;
+                }
+            }
+            inner.id = Some(reactor.insert_timer(when, cx.waker().clone()));
             Poll::Pending
         }
     }
@@ -253,8 +239,6 @@ pub struct TimerActionOnce<T> {
 #[derive(Debug)]
 pub struct TimerActionRepeat {
     handle: JoinHandle<()>,
-    timer_id: u64,
-    reactor: Weak<Reactor>,
 }
 
 impl<T: 'static> TimerActionOnce<T> {
@@ -332,8 +316,7 @@ impl<T: 'static> TimerActionOnce<T> {
         tq: TaskQueueHandle,
     ) -> Result<TimerActionOnce<T>> {
         let reactor = crate::executor().reactor();
-        let timer_id = reactor.register_timer();
-        let timer = Timer::from_id(timer_id, when);
+        let timer = Timer::new(when);
         let inner = timer.inner.clone();
 
         let task = crate::spawn_local_into(
@@ -499,8 +482,10 @@ impl<T: 'static> TimerActionOnce<T> {
     pub fn destroy(&self) {
         let mut inner = self.inner.borrow_mut();
         let parked = inner.parked.take();
-        let registered = self.reactor.upgrade().unwrap().remove_timer(inner.id);
-        inner.is_charged = false;
+        let registered = inner
+            .id
+            .take()
+            .and_then(|id| self.reactor.upgrade()?.remove_timer(id));
         drop(inner);
         drop((parked, registered));
         self.handle.cancel();
@@ -638,13 +623,10 @@ impl TimerActionRepeat {
         G: Fn() -> F + 'static,
         F: Future<Output = Option<Duration>> + 'static,
     {
-        let reactor = crate::executor().reactor();
-        let timer_id = reactor.register_timer();
-
         let task = crate::spawn_local_into(
             async move {
                 while let Some(period) = action_gen().await {
-                    Timer::from_id(timer_id, period).await;
+                    Timer::new(period).await;
                 }
             },
             tq,
@@ -652,8 +634,6 @@ impl TimerActionRepeat {
 
         Ok(TimerActionRepeat {
             handle: task.detach(),
-            timer_id,
-            reactor: Rc::downgrade(&reactor),
         })
     }
 
@@ -723,10 +703,17 @@ impl TimerActionRepeat {
     /// Cancel an existing [`TimerActionRepeat`], without waiting for it to
     /// return
     ///
-    /// This is a non-async version of [`cancel`]. It will remove the timer if
-    /// it hasn't fired already and destroy the [`TimerActionRepeat`] releasing
-    /// the resources associated with it, but without blocking the current
-    /// task. It is still possible to [`join`] the task if needed.
+    /// This is a non-async version of [`cancel`]. It destroys the
+    /// [`TimerActionRepeat`] and releases the resources associated with it
+    /// without blocking the current task. It is still possible to [`join`] the
+    /// task if needed.
+    ///
+    /// A repeat action arms a fresh timer for each iteration, so there is no
+    /// one registration for this to withdraw. Any timer currently armed is
+    /// dropped along with the cancelled task, and its drop withdraws its
+    /// registration, which happens on a later turn of the executor rather than
+    /// here. [`TimerActionOnce::destroy`] does
+    /// withdraw immediately, because a single action has a single timer.
     ///
     /// # Examples
     ///
@@ -749,7 +736,6 @@ impl TimerActionRepeat {
     /// [`cancel`]: struct.TimerActionRepeat.html#method.cancel
     /// [`join`]: struct.TimerActionRepeat.html#method.join
     pub fn destroy(&self) {
-        self.reactor.upgrade().unwrap().remove_timer(self.timer_id);
         self.handle.cancel();
     }
 
@@ -788,6 +774,63 @@ mod test {
         cell::{Cell, RefCell},
         rc::Rc,
     };
+
+    struct CountWakes(std::sync::atomic::AtomicUsize);
+
+    impl futures::task::ArcWake for CountWakes {
+        fn wake_by_ref(arc_self: &std::sync::Arc<Self>) {
+            arc_self
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn counting_waker() -> (std::sync::Arc<CountWakes>, std::task::Waker) {
+        let count = std::sync::Arc::new(CountWakes(Default::default()));
+        let waker = futures::task::waker(count.clone());
+        (count, waker)
+    }
+
+    #[test]
+    fn repolling_an_armed_timer_keeps_its_registration() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_secs(10));
+            let (_, waker) = counting_waker();
+            let mut cx = Context::from_waker(&waker);
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            let armed = timer.inner.borrow().id;
+            assert!(armed.is_some());
+
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            assert_eq!(timer.inner.borrow().id, armed);
+
+            let (_, other) = counting_waker();
+            let mut cx = Context::from_waker(&other);
+            assert!(Pin::new(&mut timer).poll(&mut cx).is_pending());
+            assert_eq!(timer.inner.borrow().id, armed);
+        });
+    }
+
+    #[test]
+    fn a_repolled_timer_wakes_the_task_that_polled_it_last() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_millis(5));
+            let (first_count, first) = counting_waker();
+            let (second_count, second) = counting_waker();
+            assert!(Pin::new(&mut timer)
+                .poll(&mut Context::from_waker(&first))
+                .is_pending());
+            assert!(Pin::new(&mut timer)
+                .poll(&mut Context::from_waker(&second))
+                .is_pending());
+
+            crate::timer::sleep(Duration::from_millis(20)).await;
+
+            use std::sync::atomic::Ordering::Relaxed;
+            assert_eq!(first_count.0.load(Relaxed), 0);
+            assert_eq!(second_count.0.load(Relaxed), 1);
+        });
+    }
 
     #[test]
     fn duration_max_waits_forever() {
@@ -849,12 +892,14 @@ mod test {
             let action = TimerActionOnce::do_in(Duration::MAX, async {});
             crate::timer::sleep(Duration::from_millis(10)).await;
             action.rearm_in(Duration::from_secs(60));
-            let registered = {
-                let inner = action.inner.borrow();
-                (inner.when.unwrap(), inner.id)
-            };
+            let registered = action
+                .inner
+                .borrow()
+                .id
+                .expect("the rearm registered nothing");
             action.rearm_in(Duration::MAX);
-            assert!(!crate::executor().reactor().timer_exists(&registered));
+            assert!(!crate::executor().reactor().timer_exists(registered));
+            assert!(action.inner.borrow().id.is_none());
             action.destroy();
         });
     }
@@ -865,13 +910,14 @@ mod test {
             let mut timer = Timer::new(Duration::MAX);
             assert!(futures::poll!(&mut timer).is_pending());
             timer.reset(Duration::from_secs(60));
-            let registered = {
-                let inner = timer.inner.borrow();
-                (inner.when.unwrap(), inner.id)
-            };
-            assert!(crate::executor().reactor().timer_exists(&registered));
+            let registered = timer
+                .inner
+                .borrow()
+                .id
+                .expect("the reset registered nothing");
+            assert!(crate::executor().reactor().timer_exists(registered));
             drop(timer);
-            assert!(!crate::executor().reactor().timer_exists(&registered));
+            assert!(!crate::executor().reactor().timer_exists(registered));
         });
     }
 
@@ -884,11 +930,10 @@ mod test {
             action.destroy();
             assert!(action.inner.borrow().parked.is_none());
             action.rearm_in(Duration::from_secs(60));
-            let registered = {
-                let inner = action.inner.borrow();
-                (inner.when.unwrap(), inner.id)
-            };
-            assert!(!crate::executor().reactor().timer_exists(&registered));
+            assert!(
+                action.inner.borrow().id.is_none(),
+                "a rearm after destroy registered the cancelled task's waker"
+            );
         });
     }
 
@@ -925,6 +970,23 @@ mod test {
             });
             HOOK_BORROWED.with(|cell| cell.set(borrowed));
         }
+    }
+
+    #[test]
+    fn a_ready_timer_drops_its_registered_waker_outside_the_borrow() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_millis(5));
+            HOOKED.with(|hooked| *hooked.borrow_mut() = Some(timer.inner.clone()));
+            let hook = futures::task::waker(std::sync::Arc::new(BorrowOnDrop));
+            assert!(Pin::new(&mut timer)
+                .poll(&mut Context::from_waker(&hook))
+                .is_pending());
+            drop(hook);
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(futures::poll!(&mut timer).is_ready());
+            HOOKED.with(|hooked| hooked.borrow_mut().take());
+            assert_eq!(HOOK_BORROWED.with(Cell::get), Some(true));
+        });
     }
 
     #[test]

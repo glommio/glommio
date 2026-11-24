@@ -398,18 +398,28 @@ impl StreamWriter {
         }
     }
 
+    /// Takes back the buffer a finished write used, without the bytes the
+    /// write took. A write the kernel cut short leaves its tail at the front
+    /// of the buffer, to go out with the next write as `write(2)` callers
+    /// retry, which also brings out the error that cut it short. A write
+    /// that took nothing of a non-empty buffer is an error of its own, or
+    /// retrying would never end.
     fn consume_flush_result(&mut self, source: Source) -> io::Result<()> {
-        let res = source.result().unwrap();
-        if res.is_ok() {
-            if let IoBuffer::Buffered(mut buffer) = source.extract_buffer() {
-                self.file_pos += buffer.len() as u64;
-                buffer.clear();
-                self.buffer.replace_buffer(buffer);
-            } else {
-                unreachable!("expected vec buffer");
-            }
+        let written = source.result().unwrap()?;
+        let IoBuffer::Buffered(mut buffer) = source.extract_buffer() else {
+            unreachable!("expected vec buffer");
+        };
+        if written == 0 && !buffer.is_empty() {
+            self.buffer.replace_buffer(buffer);
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "the file took none of a buffered write",
+            ));
         }
-        res.map(|_x| ())
+        self.file_pos += written as u64;
+        buffer.drain(..written);
+        self.buffer.replace_buffer(buffer);
+        Ok(())
     }
 
     fn flush_write_buffer(&mut self, waker: &Waker) -> bool {
@@ -473,7 +483,15 @@ impl StreamWriter {
                 true => Poll::Pending,
                 false => Poll::Ready(Ok(())),
             },
-            Some(source) => Poll::Ready(self.consume_flush_result(source)),
+            Some(source) => {
+                if let Err(err) = self.consume_flush_result(source) {
+                    return Poll::Ready(Err(err));
+                }
+                match self.flush_write_buffer(cx.waker()) {
+                    true => Poll::Pending,
+                    false => Poll::Ready(Ok(())),
+                }
+            }
         }
     }
 
@@ -727,6 +745,28 @@ mod test {
     use rusty_fork::rusty_fork_test;
 
     rusty_fork_test! {
+        /// A write the kernel cuts short, here at the process's file size
+        /// limit, either gets its tail written or fails; it is not taken as
+        /// complete. Forked, since the limit is per process.
+        #[test]
+        fn a_short_write_is_not_taken_as_complete() {
+            use futures_lite::AsyncWriteExt;
+
+            let dir = make_test_directories("short-buffered-write").remove(0);
+            crate::test_utils::limit_file_size(64 << 10);
+            test_executor!(async move {
+                let path = dir.path.join("out");
+                let mut writer =
+                    StreamWriterBuilder::new(BufferedFile::create(&path).await.unwrap()).build();
+                writer.write_all(&[1; 100 << 10]).await.unwrap();
+                let err = writer
+                    .flush()
+                    .await
+                    .expect_err("the bytes past the limit were reported as written");
+                assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
+            });
+        }
+
         /// Stdin redirected from a regular file reads it through to the end,
         /// starting where the descriptor's offset already is. Forked, since it
         /// replaces the process's standard input.

@@ -849,6 +849,21 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Caps the size of any file this process writes at `bytes`, with the
+    /// signal that would otherwise kill it ignored, so a write past the cap
+    /// is cut short and the next one fails with `EFBIG`. Per process and
+    /// irreversible, so only for forked tests.
+    pub(crate) fn limit_file_size(bytes: u64) {
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: bytes,
+                rlim_max: bytes,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+        }
+    }
+
     /// Glommio currently only supports NVMe-backed volumes formatted with
     /// XFS or EXT4. We therefore let the user decide what directory glommio
     /// should use to host the unit tests in. For more information regarding

@@ -81,7 +81,10 @@ impl AdvisoryLockStateHolder {
         Self::map_state(self.state.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    fn mark_locking<'a>(&'a self, file: &Path) -> Result<AdvisoryLockStateGuard<'a>> {
+    /// Marks the lock as being taken. `file` only names the file in the
+    /// error, and an unnamed file has no path to give.
+    fn mark_locking<'a>(&'a self, file: Option<&Path>) -> Result<AdvisoryLockStateGuard<'a>> {
+        let file = file.map_or_else(|| "an unnamed file".to_string(), |p| format!("{p:?}"));
         self.state
             .compare_exchange(
                 AdvisoryLockState::Unlocked as u8,
@@ -92,13 +95,13 @@ impl AdvisoryLockStateHolder {
             .map(|_| AdvisoryLockStateGuard(self, true))
             .map_err(|state| match Self::map_state(state) {
                 AdvisoryLockState::Unlocked => crate::GlommioError::WouldBlock(ResourceType::File(
-                    format!("Failed to acquire lock but current state is unlocked on {file:?}?"),
+                    format!("Failed to acquire lock but current state is unlocked on {file}?"),
                 )),
                 AdvisoryLockState::Locking => crate::GlommioError::WouldBlock(ResourceType::File(
-                    format!("The lock is already trying to be acquired on {file:?}"),
+                    format!("The lock is already trying to be acquired on {file}"),
                 )),
                 AdvisoryLockState::Locked => crate::GlommioError::WouldBlock(ResourceType::File(
-                    format!("The lock is already acquired on {file:?}"),
+                    format!("The lock is already acquired on {file}"),
                 )),
             })
     }
@@ -386,7 +389,7 @@ impl GlommioFile {
             .lock_state
             .as_ref()
             .unwrap()
-            .mark_locking(self.path.borrow().as_ref().unwrap())?;
+            .mark_locking(self.path.borrow().as_deref())?;
 
         let res = unsafe { libc::flock(self.as_raw_fd(), flags) };
         if res == -1 {
@@ -897,9 +900,9 @@ pub(crate) mod test {
         let holder = AdvisoryLockStateHolder::default();
         let path = Path::new("file");
         for _ in 0..64 {
-            holder.mark_locking(path).unwrap().commit();
+            holder.mark_locking(Some(path)).unwrap().commit();
             holder.unlock();
-            drop(holder.mark_locking(path).unwrap());
+            drop(holder.mark_locking(Some(path)).unwrap());
         }
         assert_eq!(holder.state(), AdvisoryLockState::Unlocked);
     }

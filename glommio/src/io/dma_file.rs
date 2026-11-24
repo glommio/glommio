@@ -2150,6 +2150,29 @@ pub(crate) mod test {
         assert!(!path.join("moved").exists());
     });
 
+    dma_file_test!(a_tmpfile_can_be_locked, path, _k, {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .tmpfile(true)
+            .dma_open(&path)
+            .await
+            .unwrap();
+
+        file.try_lock_exclusive()
+            .await
+            .unwrap()
+            .unlock()
+            .await
+            .unwrap();
+        file.try_lock_shared()
+            .await
+            .unwrap()
+            .unlock()
+            .await
+            .unwrap();
+    });
+
     dma_file_test!(resize_dma_buf, path, _k, {
         let file = OpenOptions::new()
             .create_new(true)

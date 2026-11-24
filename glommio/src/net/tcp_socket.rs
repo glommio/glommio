@@ -1048,6 +1048,90 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    /// A kernel with buffer rings but no bundles answers the first bundled
+    /// receive with EINVAL. The stream must re-arm the plain form, not
+    /// unwrap the source it just gave up.
+    #[test]
+    fn a_bundled_einval_re_arms_plain() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = super::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut writer = super::TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::EINVAL), true);
+                writer.write_all(b"hello").await.unwrap();
+                let mut got = [0u8; 5];
+                reader.read_exact(&mut got).await.unwrap();
+                assert_eq!(&got, b"hello");
+                assert!(
+                    reader.stream.multishot_armed(),
+                    "the plain form was not re-armed after the bundle was refused"
+                );
+            });
+    }
+
+    /// The kernel ends a receive with a real `ETIMEDOUT` too, from a TCP
+    /// user or keepalive timeout. Only the reactor's own throttle reads as
+    /// one and is re-armed; a real one is the reader's.
+    #[test]
+    fn a_real_timeout_ending_the_receive_reaches_the_reader() {
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let _writer = TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::ETIMEDOUT), false);
+                let mut got = [0u8; 1];
+                let read = futures_lite::future::poll_once(reader.read(&mut got)).await;
+                let err = read
+                    .expect("the timeout was swallowed and the read re-armed")
+                    .unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+            });
+    }
+
+    /// A stream that ran out of kernel buffers reads on through the socket;
+    /// when that read is the end of the stream, nothing is re-armed on it.
+    #[test]
+    fn end_of_file_after_running_dry_arms_nothing() {
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(1, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut hog_writer = TcpStream::connect(addr).await.unwrap();
+                let _hog = listener.accept().await.unwrap().buffered();
+                hog_writer.write_all(b"x").await.unwrap();
+                Timer::new(Duration::from_millis(20)).await;
+
+                let writer = TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                drop(writer);
+                Timer::new(Duration::from_millis(20)).await;
+                let mut got = [0u8; 1];
+                assert_eq!(reader.read(&mut got).await.unwrap(), 0);
+                assert!(
+                    !reader.stream.multishot_armed(),
+                    "a receive was armed on a stream at its end"
+                );
+            });
+    }
+
     #[test]
     fn a_read_timeout_of_duration_max_waits() {
         test_executor!(async move {

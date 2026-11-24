@@ -370,15 +370,15 @@ fn probe_optional_operations() -> Vec<u8> {
 }
 
 /// Whether an optional opcode can be submitted on this kernel.
+pub(crate) fn supports_optional_op(opcode: u8) -> bool {
+    OPTIONAL_OPS.contains(&opcode)
+}
+
 /// A duplicate of `fd` for an operation queued on the blocking pool, which
 /// may run after the caller has closed the original. Taken while the caller
 /// still holds the file, so it names the same one.
 fn pool_descriptor(fd: RawFd) -> io::Result<OwnedFd> {
     unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()
-}
-
-pub(crate) fn supports_optional_op(opcode: u8) -> bool {
-    OPTIONAL_OPS.contains(&opcode)
 }
 
 /// Checks the kernel implements every opcode glommio submits.

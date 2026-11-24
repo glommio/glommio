@@ -2198,7 +2198,7 @@ impl Reactor {
 
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        self.discard_unusable_preempt_timer(preempt_timer());
+        self.discard_unusable_preempt_timer(preempt_timer(), may_sleep);
 
         self.throughput_preemption_timeout_src.replace(Some(
             main_ring.prepare_throughput_preemption_timer(
@@ -2266,14 +2266,20 @@ impl Reactor {
         Ok(should_sleep)
     }
 
-    /// Gives up the held timer unless it is exactly the one still wanted.
+    /// Gives up the held timer unless it is exactly the preempt timer still
+    /// wanted, and this `wait` cannot park. A user timer left by a park is
+    /// never kept, and a park would give the timer up anyway, too late for its
+    /// cancellation to be flushed before the sleep it would then cut short.
     ///
     /// Called before the flush so a discarded timer's cancellation leaves with
     /// it. Deliberately not a decision: it only ever gives up, never installs.
-    fn discard_unusable_preempt_timer(&self, wanted: Option<Duration>) {
+    fn discard_unusable_preempt_timer(&self, wanted: Option<Duration>, may_sleep: bool) {
         match self.latency_preemption_timeout_src.take() {
             Some(src)
-                if src.result().is_none() && self.latency_preemption_armed_for.get() == wanted =>
+                if !may_sleep
+                    && src.result().is_none()
+                    && wanted.is_some()
+                    && self.latency_preemption_armed_for.get() == wanted =>
             {
                 self.latency_preemption_timeout_src.set(Some(src));
             }
@@ -2782,6 +2788,92 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));
+    }
+
+    /// The fast path this whole decision exists for.
+    #[test]
+    fn an_unchanged_preempt_timer_stays_armed_across_waits() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        let wanted = Duration::from_millis(100);
+        reactor.wait(|| Some(wanted), None, false, 0, || 0).unwrap();
+        let first = reactor.latency_preemption_timeout_src.take().unwrap();
+        let armed = first.inner.clone();
+        reactor.latency_preemption_timeout_src.set(Some(first));
+        for _ in 0..3 {
+            reactor.wait(|| Some(wanted), None, false, 0, || 0).unwrap();
+            let held = reactor.latency_preemption_timeout_src.take().unwrap();
+            assert!(std::ptr::eq(&*armed, &*held.inner));
+            reactor.latency_preemption_timeout_src.set(Some(held));
+        }
+    }
+
+    /// A user timer left from a park that bailed out is not a preempt timer,
+    /// whatever `wanted` is.
+    #[test]
+    fn a_user_timer_from_an_abandoned_park_is_given_up() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        reactor
+            .wait(|| None, Some(Duration::from_millis(20)), true, 0, || 1)
+            .unwrap();
+        let held = reactor.latency_preemption_timeout_src.take();
+        assert!(held.is_some());
+        reactor.latency_preemption_timeout_src.set(held);
+        reactor.wait(|| None, None, false, 0, || 0).unwrap();
+        assert!(reactor.latency_preemption_timeout_src.take().is_none());
+    }
+
+    /// Parks for `user` after `prepare`, returning how long the park lasted.
+    fn park_after(
+        prepare: impl FnOnce(&Reactor),
+        wanted: Option<Duration>,
+        user: Duration,
+    ) -> Duration {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        let reactor = Reactor::new(notifier, 0, 128, pool).unwrap();
+        prepare(&reactor);
+        let start = Instant::now();
+        reactor.wait(|| wanted, Some(user), true, 0, || 0).unwrap();
+        start.elapsed()
+    }
+
+    #[test]
+    fn a_park_is_not_cut_short_by_an_abandoned_user_timer() {
+        let parked = park_after(
+            |reactor| {
+                reactor
+                    .wait(|| None, Some(Duration::from_millis(20)), true, 0, || 1)
+                    .unwrap();
+            },
+            None,
+            Duration::from_millis(300),
+        );
+        assert!(
+            parked >= Duration::from_millis(250),
+            "woke after {parked:?}"
+        );
+    }
+
+    #[test]
+    fn a_park_is_not_cut_short_by_a_kept_preempt_timer() {
+        let preempt = Duration::from_millis(20);
+        let parked = park_after(
+            |reactor| {
+                reactor
+                    .wait(|| Some(preempt), None, false, 0, || 0)
+                    .unwrap();
+            },
+            Some(preempt),
+            Duration::from_millis(300),
+        );
+        assert!(
+            parked >= Duration::from_millis(250),
+            "woke after {parked:?}"
+        );
     }
 
     /// Every input the decision can be given, and the property that has to

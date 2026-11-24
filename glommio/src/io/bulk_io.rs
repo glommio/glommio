@@ -220,7 +220,9 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
     /// `Poll::Pending`.
     ///
     /// When the underlying stream is closed, pull out of the merger whatever
-    /// is there, if anything.
+    /// is there, if anything. The merger is gone from then on, which is how
+    /// a later call knows not to poll the underlying stream again: it need
+    /// not be fused, and some streams panic when polled after their end.
     ///
     /// Two subsequent merged IO requests may ask for the exact same data
     /// (because we align then up and down after merging) so there is one more
@@ -236,15 +238,18 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
         };
 
         let next_inner = |this: &mut Self, cx: &mut Context<'_>| {
+            let Some(merger) = this.merger.as_mut() else {
+                return Poll::Ready(None);
+            };
             loop {
                 match this.iter.poll_next(cx) {
                     Poll::Ready(Some(io)) => {
-                        if let Some(merged) = this.merger.as_mut().unwrap().merge(io) {
+                        if let Some(merged) = merger.merge(io) {
                             return Poll::Ready(Some(merged));
                         }
                     }
                     Poll::Pending => {
-                        return if let Some(merged) = this.merger.as_mut().unwrap().flush() {
+                        return if let Some(merged) = merger.flush() {
                             Poll::Ready(Some(merged))
                         } else {
                             Poll::Pending
@@ -541,6 +546,20 @@ mod tests {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    /// A stream polled again after it ended may panic, as `unfold` does, so
+    /// coalescing stops polling it at its first `None`.
+    #[test]
+    fn an_ended_stream_is_not_polled_again() {
+        test_executor!(async move {
+            let reads = futures::stream::unfold(0u64, |i| async move {
+                (i < 3).then(|| ((i * 8192, 64usize), i + 1))
+            });
+            let merged =
+                collect_iovecs(CoalescedReads::new(4096, None, None, Box::pin(reads))).await;
+            assert_eq!(merged.len(), 3);
+        });
     }
 
     #[test]

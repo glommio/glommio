@@ -57,7 +57,9 @@ use crate::Result;
 ///
 /// * By default, the ReusePort flag is set in the socket automatically. The OS
 ///   already provides some load balancing capabilities with that so you can
-///   simply [`bind`] to the same address from many executors.
+///   simply [`bind`] to the same address from many executors. Any other socket
+///   of the same user can join the port the same way; a listener built by
+///   [`TcpListenerBuilder`] with [`reuse_port(false)`] keeps it to itself.
 ///
 /// * If that is insufficient or otherwise not desirable, it is possible to use
 ///   [`shared_accept`] instead of [`accept`]: that returns an object that
@@ -76,12 +78,134 @@ use crate::Result;
 /// [`bind`]: TcpListener::bind
 /// [`incoming`]: TcpListener::incoming
 /// [`bind_to_executor`]: AcceptedTcpStream::bind_to_executor
+/// [`reuse_port(false)`]: TcpListenerBuilder::reuse_port
 /// [`Send`]: https://doc.rust-lang.org/std/marker/trait.Send.html
 /// [`shared_channel`]: ../channels/shared_channel/index.html
 pub struct TcpListener {
     reactor: Weak<Reactor>,
     listener: net::TcpListener,
     current_source: RefCell<Option<Source>>,
+}
+
+/// Options for binding a [`TcpListener`], for when the defaults of
+/// [`TcpListener::bind`] do not fit.
+///
+/// The defaults are those of [`TcpListener::bind`]: `SO_REUSEPORT` and
+/// `SO_REUSEADDR` set, and a backlog of 1024. The builder holds no address,
+/// so one value can be copied into every executor and bound there.
+///
+/// # Examples
+///
+/// ```
+/// use glommio::{net::TcpListenerBuilder, LocalExecutor};
+///
+/// let ex = LocalExecutor::default();
+/// ex.run(async move {
+///     let listener = TcpListenerBuilder::new()
+///         .reuse_port(false)
+///         .backlog(4096)
+///         .bind("127.0.0.1:0")
+///         .unwrap();
+///     println!("Listening on {}", listener.local_addr().unwrap());
+/// });
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct TcpListenerBuilder {
+    reuse_port: bool,
+    reuse_address: bool,
+    backlog: u32,
+}
+
+impl Default for TcpListenerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TcpListenerBuilder {
+    /// Creates a builder with the defaults of [`TcpListener::bind`].
+    #[must_use = "the builder does nothing until it is bound"]
+    pub fn new() -> Self {
+        Self {
+            reuse_port: true,
+            reuse_address: true,
+            backlog: 1024,
+        }
+    }
+
+    /// Whether to set `SO_REUSEPORT`, on by default.
+    ///
+    /// With it set, every executor can bind the same address and the kernel
+    /// spreads connections across them. So can any other socket of the same
+    /// user that sets it, in this process or another, and it then takes a
+    /// share of the connections. Turn it off for a listener that must own its
+    /// port: a later bind to the port then fails with `EADDRINUSE`, and
+    /// connections can be spread with [`TcpListener::shared_accept`] instead.
+    #[must_use = "the builder does nothing until it is bound"]
+    pub fn reuse_port(mut self, reuse_port: bool) -> Self {
+        self.reuse_port = reuse_port;
+        self
+    }
+
+    /// Whether to set `SO_REUSEADDR`, on by default as in
+    /// [`std::net::TcpListener::bind`].
+    ///
+    /// It lets the listener bind a port that connections of an earlier
+    /// listener still hold in `TIME_WAIT`, so a restarted server does not
+    /// have to wait them out. `SO_REUSEPORT` allows that on its own, so this
+    /// matters for a listener built with [`reuse_port(false)`]. It does not
+    /// let two listeners share a port.
+    ///
+    /// [`reuse_port(false)`]: TcpListenerBuilder::reuse_port
+    #[must_use = "the builder does nothing until it is bound"]
+    pub fn reuse_address(mut self, reuse_address: bool) -> Self {
+        self.reuse_address = reuse_address;
+        self
+    }
+
+    /// The length of the queue of connections waiting to be accepted, 1024 by
+    /// default.
+    ///
+    /// The kernel caps it at `net.core.somaxconn`.
+    #[must_use = "the builder does nothing until it is bound"]
+    pub fn backlog(mut self, backlog: u32) -> Self {
+        self.backlog = backlog;
+        self
+    }
+
+    /// Creates a TCP listener bound to `addr` with these options.
+    ///
+    /// Binding with port number 0 will request an available port from the OS.
+    /// Of the addresses `addr` resolves to, only the first is tried.
+    ///
+    /// The socket is non-blocking whatever the options, since an accept is
+    /// first tried directly and a blocking one would park the executor.
+    pub fn bind<A: ToSocketAddrs>(&self, addr: A) -> Result<TcpListener> {
+        let addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::other("empty address"))?;
+
+        let domain = if addr.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
+        let sk = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+        let addr = socket2::SockAddr::from(addr);
+        sk.set_reuse_port(self.reuse_port)?;
+        sk.set_reuse_address(self.reuse_address)?;
+        sk.set_nonblocking(true)?;
+        sk.bind(&addr)?;
+        sk.listen(i32::try_from(self.backlog).unwrap_or(i32::MAX))?;
+        let listener = sk.into();
+
+        Ok(TcpListener {
+            reactor: Rc::downgrade(&crate::executor().reactor()),
+            listener,
+            current_source: Default::default(),
+        })
+    }
 }
 
 impl FromRawFd for TcpListener {
@@ -120,7 +244,8 @@ impl TcpListener {
     ///
     /// This method sets the ReusePort option in the bound socket, so it is
     /// designed to be called from multiple executors to achieve
-    /// parallelism.
+    /// parallelism. It also sets ReuseAddr and a backlog of 1024. To change
+    /// any of these, use [`TcpListenerBuilder`].
     ///
     /// # Examples
     ///
@@ -134,30 +259,7 @@ impl TcpListener {
     /// });
     /// ```
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<TcpListener> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::other("empty address"))?;
-
-        let domain = if addr.is_ipv6() {
-            Domain::IPV6
-        } else {
-            Domain::IPV4
-        };
-        let sk = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-        let addr = socket2::SockAddr::from(addr);
-        sk.set_reuse_port(true)?;
-        // yolo_accept needs this: a blocking listener parks the executor.
-        sk.set_nonblocking(true)?;
-        sk.bind(&addr)?;
-        sk.listen(1024)?;
-        let listener = sk.into();
-
-        Ok(TcpListener {
-            reactor: Rc::downgrade(&crate::executor().reactor()),
-            listener,
-            current_source: Default::default(),
-        })
+        TcpListenerBuilder::new().bind(addr)
     }
 
     /// Accepts a new incoming TCP connection and allows the result to be sent

@@ -52,7 +52,8 @@ impl Directory {
         let path = path.as_ref().to_owned();
         let flags = libc::O_DIRECTORY | libc::O_CLOEXEC;
         let reactor = crate::executor().reactor();
-        let source = reactor.open_at(libc::AT_FDCWD, &path, flags, 0o755);
+        let native = sys::source::NativePath::try_from(&*path)?;
+        let source = reactor.open_at(libc::AT_FDCWD, native, flags, 0o755);
         let fd = source.collect_fd().await.map_err(|source| {
             GlommioError::create_enhanced(source, "Opening directory", Some(&path), None)
         })?;
@@ -272,6 +273,23 @@ mod test {
             let recorded = recorded.expect("the file recorded no path");
             assert!(recorded.is_absolute(), "recorded {recorded:?}");
             assert!(names_the_file, "recorded {recorded:?}");
+        });
+    }
+
+    /// A path holding an interior NUL cannot name a directory or a file in
+    /// one. Opening either answers `EFAULT` instead of panicking.
+    #[test]
+    fn opening_a_path_with_a_nul_fails_instead_of_panicking() {
+        use crate::io::glommio_file::test::os_error_of;
+        test_executor!(async move {
+            let efault = Some(libc::EFAULT);
+            let opened = Directory::open("/tmp/glommio\0nul").await;
+            assert_eq!(opened.err().and_then(os_error_of), efault);
+            let dir = Directory::open(std::env::temp_dir()).await.unwrap();
+            let file = dir.open_file("glommio\0nul").await;
+            assert_eq!(file.err().and_then(os_error_of), efault);
+            let created = dir.create_file("glommio\0nul").await;
+            assert_eq!(created.err().and_then(os_error_of), efault);
         });
     }
 }

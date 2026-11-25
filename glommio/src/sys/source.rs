@@ -90,7 +90,7 @@ pub(crate) enum SourceType {
         libc::msghdr,
         nix::sys::socket::SockaddrStorage,
     ),
-    Open(CString),
+    Open(NativePath),
     FdataSync,
     Fallocate,
     Truncate,

@@ -238,6 +238,10 @@ impl BufferedFile {
     /// the name from the filesystem but the file will still be accessible for
     /// as long as it is open.
     ///
+    /// A removed file has no path: [`path`](Self::path) returns `None`, and
+    /// [`rename`](Self::rename) and `remove` fail, rather than act on another
+    /// file created under the old name.
+    ///
     /// Note: this syscall might be issued in a background thread depending on
     /// the system's capabilities.
     pub async fn remove(&self) -> Result<()> {
@@ -523,6 +527,21 @@ mod test {
         file.read_at(u64::MAX - 4095, 8192)
             .await
             .expect_err("a read past the largest offset succeeded");
+        file.close().await.unwrap();
+    });
+
+    buffered_file_test!(a_removed_buffered_file_has_no_path_to_rename, path, _k, {
+        let name = path.join("removed");
+        let file = BufferedFile::create(&name).await.unwrap();
+        file.remove().await.unwrap();
+        std::fs::write(&name, b"unrelated").unwrap();
+
+        file.rename(path.join("moved"))
+            .await
+            .expect_err("a removed file cannot be renamed");
+        assert_eq!(std::fs::read(&name).unwrap(), b"unrelated");
+        assert!(!path.join("moved").exists());
+        assert!(file.path().is_none(), "a removed file has no path");
         file.close().await.unwrap();
     });
 

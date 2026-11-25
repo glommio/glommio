@@ -554,23 +554,29 @@ impl GlommioFile {
         Ok(())
     }
 
+    /// Removes the file's name and forgets it, so a later `rename`, `remove`
+    /// or `path` cannot reach a different file created under that name.
+    ///
+    /// The path is forgotten before the unlink is issued and given back only
+    /// if the unlink fails. A remove dropped after it was issued may or may
+    /// not have taken the name, and a handle that kept it could act on a
+    /// stranger's file.
     pub(crate) async fn remove(&self) -> Result<()> {
         let path = self.path_required("remove")?.to_owned();
-        let source = self
-            .reactor
-            .upgrade()
-            .unwrap()
-            .remove_file(crate::sys::source::NativePath::try_from(&*path)?)
-            .await;
+        let native = crate::sys::source::NativePath::try_from(&*path)?;
+        self.path.replace(None);
+        let source = self.reactor.upgrade().unwrap().remove_file(native).await;
 
-        source.collect_rw().await.map_err(|source| {
-            GlommioError::create_enhanced(
+        if let Err(source) = source.collect_rw().await {
+            let err = GlommioError::create_enhanced(
                 source,
                 "Removing",
-                self.path.borrow().as_ref(),
+                Some(&path),
                 Some(self.as_raw_fd()),
-            )
-        })?;
+            );
+            self.path.replace(Some(path));
+            return Err(err);
+        }
         Ok(())
     }
 

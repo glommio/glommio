@@ -422,6 +422,10 @@ impl ImmutableFile {
     /// the name from the filesystem but the file will still be accessible for
     /// as long as it is open.
     ///
+    /// A removed file has no path: [`path`](Self::path) returns `None`, and
+    /// [`rename`](Self::rename) and `remove` fail, rather than act on another
+    /// file created under the old name.
+    ///
     /// Note: this syscall might be issued in a background thread depending on
     /// the system's capabilities.
     pub async fn remove(&self) -> Result<()> {

@@ -1031,7 +1031,21 @@ impl DmaStreamWriterState {
         let aligned_pos = self.aligned_pos;
         let flush_pos = self.current_pos();
         let handle = crate::spawn_local(async move {
-            let res = file.write_at(buffer, aligned_pos).await;
+            let len = buffer.len();
+            let res =
+                file.write_at(buffer, aligned_pos)
+                    .await
+                    .and_then(|written| {
+                        if written < len {
+                            Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        format!("the file took {written} of the {len} bytes of an aligned write"),
+                    )
+                    .into())
+                        } else {
+                            Ok(written)
+                        }
+                    });
             let mut state = state.borrow_mut();
             if collect_error!(state, res) {
                 state.write_failed = true;
@@ -1541,7 +1555,33 @@ mod test {
     use super::*;
     use crate::{enclose, io::dma_file::align_up, test_utils::make_test_directories, timer::Timer};
     use futures::{task::noop_waker_ref, AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use rusty_fork::rusty_fork_test;
     use std::{io::ErrorKind, path::Path, time::Duration};
+
+    rusty_fork_test! {
+        /// A buffer the kernel writes only part of, here at the process's
+        /// file size limit, fails the stream instead of counting as written.
+        /// Forked, since the limit is per process.
+        #[test]
+        fn a_short_dma_write_fails_the_stream() {
+            let dir = make_test_directories("short-dma-write").remove(0);
+            crate::test_utils::limit_file_size(4096);
+            test_executor!(async move {
+                let path = dir.path.join("out");
+                let file = DmaFile::create(&path).await.unwrap();
+                let mut writer = DmaStreamWriterBuilder::new(file)
+                    .with_buffer_size(8192)
+                    .build();
+                let wrote = async {
+                    writer.write_all(&[1; 8192]).await?;
+                    writer.close().await
+                };
+                wrote
+                    .await
+                    .expect_err("a buffer cut short at the limit was reported as written");
+            });
+        }
+    }
 
     const NUM_CONCURRENT_WRITERS: usize = 10;
 

@@ -878,37 +878,46 @@ pub(crate) mod test {
         });
     }
 
-    /// The OS error a failed operation answered, whether or not it was
-    /// enhanced with the path and operation.
-    pub(crate) fn os_error_of<T>(err: crate::GlommioError<T>) -> Option<i32> {
-        match err {
-            crate::GlommioError::IoError(source)
-            | crate::GlommioError::EnhancedIoError { source, .. } => source.raw_os_error(),
-            _ => None,
-        }
+    /// The `io::ErrorKind` a caller sees after `?` turns a failed operation's
+    /// error into an `io::Error`, or `None` if it succeeded.
+    pub(crate) fn kind_seen_through_question_mark<R, T>(
+        result: std::result::Result<R, crate::GlommioError<T>>,
+    ) -> Option<std::io::ErrorKind> {
+        result.err().map(|err| std::io::Error::from(err).kind())
     }
 
-    /// A path holding an interior NUL cannot name a file. Opening one answers
-    /// `EFAULT`, as renaming or removing one does, instead of panicking.
+    /// A path holding an interior NUL cannot name a file. Opening, renaming
+    /// or removing one fails with `InvalidInput`, as std does, instead of
+    /// panicking, and the kind survives `?` into an `io::Error`.
     #[test]
     fn opening_a_path_with_a_nul_fails_instead_of_panicking() {
+        use std::io::ErrorKind::InvalidInput;
         test_executor!(async move {
             let path = Path::new("/tmp/glommio\0nul");
-            let efault = Some(libc::EFAULT);
             let raw = GlommioFile::open_at(None, path, libc::O_RDONLY, 0).await;
-            assert_eq!(raw.err().and_then(|e| e.raw_os_error()), efault);
+            assert_eq!(raw.err().map(|e| e.kind()), Some(InvalidInput));
             let dma = crate::io::DmaFile::open(path).await;
-            assert_eq!(dma.err().and_then(os_error_of), efault);
+            assert_eq!(kind_seen_through_question_mark(dma), Some(InvalidInput));
             let created = crate::io::DmaFile::create(path).await;
-            assert_eq!(created.err().and_then(os_error_of), efault);
+            assert_eq!(kind_seen_through_question_mark(created), Some(InvalidInput));
             let buffered = crate::io::BufferedFile::open(path).await;
-            assert_eq!(buffered.err().and_then(os_error_of), efault);
+            assert_eq!(
+                kind_seen_through_question_mark(buffered),
+                Some(InvalidInput)
+            );
             let with_options = crate::io::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .buffered_open(path)
                 .await;
-            assert_eq!(with_options.err().and_then(os_error_of), efault);
+            assert_eq!(
+                kind_seen_through_question_mark(with_options),
+                Some(InvalidInput)
+            );
+            let renamed = crate::io::rename(path, "/tmp/glommio-nul-target").await;
+            assert_eq!(kind_seen_through_question_mark(renamed), Some(InvalidInput));
+            let removed = crate::io::remove(path).await;
+            assert_eq!(kind_seen_through_question_mark(removed), Some(InvalidInput));
         });
     }
 

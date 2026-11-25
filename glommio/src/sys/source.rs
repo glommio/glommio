@@ -52,15 +52,19 @@ impl NativePath {
 impl TryFrom<&Path> for NativePath {
     type Error = io::Error;
 
-    /// Fails for a path holding an interior NUL, which cannot name a file.
-    ///
-    /// `EFAULT` is what the blocking pool answered for this before there was
-    /// a conversion here at all, so the answer does not change with the path
-    /// an operation takes.
+    /// Fails with `InvalidInput` for a path holding an interior NUL, which
+    /// cannot name a file, as std does. Every path operation converts here,
+    /// so they all answer alike, and the kind survives conversion into an
+    /// `io::Error`, which an OS code without a kind of its own would not.
     fn try_from(path: &Path) -> io::Result<Self> {
         CString::new(path.as_os_str().as_bytes())
             .map(NativePath)
-            .map_err(|_| io::Error::from_raw_os_error(libc::EFAULT))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path contains an interior NUL byte",
+                )
+            })
     }
 }
 

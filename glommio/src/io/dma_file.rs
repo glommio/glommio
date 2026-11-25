@@ -96,13 +96,22 @@ impl AdvisoryLockGuard {
     }
 
     /// Downgrade the lock guard to a weak reference that won't keep the file open. The lock will be released when the
-    /// the last strong reference is dropped.
+    /// last strong reference is dropped.
+    ///
+    /// The weak handle also stops upgrading, with the lock still held, once
+    /// [try_take_last_clone](Self::try_take_last_clone) returns `Ok`. Downgrade the guard it returns if you need a
+    /// weak handle after that.
     pub fn downgrade(&self) -> WeakAdvisoryLockGuard {
         WeakAdvisoryLockGuard(Arc::downgrade(self.0.as_ref().unwrap()))
     }
 
     /// Like [DmaFile::try_take_last_clone], this returns `Ok(self)` if and only if it's the last clone of the lock
     /// guard in the program (not including weak references). `Err(self)` is returned if other instances exist.
+    ///
+    /// On `Ok`, every [WeakAdvisoryLockGuard] downgraded before the call stops upgrading, although the lock is still
+    /// held. This is deliberate: no other thread can then upgrade one into a clone the caller does not know about, so
+    /// [unlock](Self::unlock) on the returned guard cannot fail because another clone exists. On `Err`, weak handles
+    /// are untouched.
     pub fn try_take_last_clone(mut self) -> std::result::Result<Self, Self> {
         match Arc::try_unwrap(self.0.take().unwrap()) {
             Ok(unique) => Ok(Self(Some(Arc::new(unique)))),
@@ -113,6 +122,9 @@ impl AdvisoryLockGuard {
 
 /// This holds a weak reference to an advisory lock. The advisory lock may be dropped while this reference is held
 /// in which case this instance will fail to [upgrade](Self::upgrade).
+///
+/// It also fails to upgrade, with the lock still held, once [AdvisoryLockGuard::try_take_last_clone] returns `Ok` or
+/// [DmaFile::try_take_last_clone_unlocking_guard] takes the guard as its last clone. See those methods for why.
 #[derive(Default, Debug, Clone)]
 pub struct WeakAdvisoryLockGuard(AWeak<OwnedGlommioFile>);
 
@@ -123,7 +135,8 @@ impl WeakAdvisoryLockGuard {
     }
 
     /// Upgrades a weak handle to a held advisory lock back to a strong handle. Returns None if the advisory lock was
-    /// dropped.
+    /// dropped, or if the guard was taken as its last clone (see [AdvisoryLockGuard::try_take_last_clone]), in which
+    /// case the lock may still be held.
     pub fn upgrade(&self) -> Option<AdvisoryLockGuard> {
         self.0.upgrade().map(|guard| AdvisoryLockGuard(Some(guard)))
     }
@@ -791,6 +804,37 @@ impl DmaFile {
     /// NOTE: Clones are allowed to exist on any thread and all share the same underlying
     /// fd safely. try_take_last_clone is also safe to invoke from any thread and will
     /// behave correctly with respect to clones on other threads.
+    ///
+    /// # Weak handles
+    ///
+    /// On `Ok`, every [WeakDmaFile] downgraded before the call stops upgrading for good, and reports a
+    /// [strong count](WeakDmaFile::strong_count) of 0, although the returned file is still open. This is deliberate:
+    /// it is what makes the answer race-free. A weak handle on another thread cannot upgrade after the check and make
+    /// a following [close](Self::close) fail with [CanNotBeClosed](crate::GlommioError::CanNotBeClosed). Call
+    /// [downgrade](Self::downgrade) on the returned file for a weak handle that works. On `Err`, weak handles are
+    /// untouched.
+    ///
+    /// ```
+    /// use glommio::{io::OpenOptions, LocalExecutor};
+    ///
+    /// LocalExecutor::default().run(async {
+    ///     let file = OpenOptions::new()
+    ///         .create_new(true)
+    ///         .read(true)
+    ///         .write(true)
+    ///         .tmpfile(true)
+    ///         .dma_open(std::env::temp_dir())
+    ///         .await
+    ///         .unwrap();
+    ///     let weak = file.downgrade();
+    ///
+    ///     let file = file.try_take_last_clone().unwrap();
+    ///     assert!(weak.upgrade().is_none());
+    ///     assert!(file.downgrade().upgrade().is_some());
+    ///
+    ///     file.close().await.unwrap();
+    /// });
+    /// ```
     #[expect(clippy::result_large_err)]
     pub fn try_take_last_clone(mut self) -> std::result::Result<Self, Self> {
         match self.file.try_take_last_clone() {
@@ -810,6 +854,14 @@ impl DmaFile {
     /// if given a guard that's not for this file.
     ///
     /// NOTE: This will panic if the unlock operation fails.
+    ///
+    /// # Weak handles
+    ///
+    /// If the guard has other clones, nothing changes and all weak handles keep working. Otherwise every
+    /// [WeakAdvisoryLockGuard] downgraded from it stops upgrading, as with [AdvisoryLockGuard::try_take_last_clone],
+    /// and that holds on `Err` as well: the guard handed back then still holds the lock, and needs downgrading again
+    /// for a weak handle that works. On `Ok`, every [WeakDmaFile] stops upgrading too, as with
+    /// [try_take_last_clone](Self::try_take_last_clone); on `Err` they keep working.
     #[expect(clippy::result_large_err)]
     pub async fn try_take_last_clone_unlocking_guard(
         mut self,
@@ -882,6 +934,10 @@ impl DmaFile {
     /// Creates a non-owning reference to this file that can be shared to a background thread.
     /// The weak reference may keep some memory alive but does not keep the underlying file descriptor
     /// open if all strong references have been dropped.
+    ///
+    /// The weak reference also stops upgrading, with the file still open, once
+    /// [try_take_last_clone](Self::try_take_last_clone) returns `Ok`. Downgrade the file it returns if you need a weak
+    /// reference after that.
     pub fn downgrade(&self) -> WeakDmaFile {
         WeakDmaFile {
             file: self.file.downgrade(),
@@ -1058,6 +1114,9 @@ impl OwnedDmaFile {
     /// Downgrade to a weak reference that doesn't keep the FD open but can be upgraded at a later
     /// date on any thread to an OwnedDmaFile. There are safety implications if multiple threads
     /// get involved (see the safety note for [OwnedDmaFile]).
+    ///
+    /// As with [DmaFile::downgrade], the weak reference stops upgrading once [DmaFile::try_take_last_clone] returns
+    /// `Ok` for the file, although the file is still open.
     pub fn downgrade(&self) -> WeakDmaFile {
         WeakDmaFile {
             file: self.file.downgrade(),
@@ -1122,6 +1181,9 @@ impl AsFd for OwnedDmaFile {
 /// to a different thread or even to provide access to the FD for use outside glommio. For example,
 /// upgrade to an OwnedDmaFile which gives you access to the underlying fd via [OwnedDmaFile::as_raw_fd].
 ///
+/// It stops upgrading when the last strong reference is dropped, and also when [DmaFile::try_take_last_clone]
+/// returns `Ok`, although the file is then still open. See that method for why.
+///
 /// SAFETY: See [OwnedDmaFile].
 #[derive(Debug, Clone)]
 pub struct WeakDmaFile {
@@ -1151,12 +1213,15 @@ impl WeakDmaFile {
     }
 
     /// The number of strong references that still remain on the file.
-    /// If created via [Self::new], this will return 0.
+    /// If created via [Self::new], this will return 0. It also returns 0 once
+    /// [DmaFile::try_take_last_clone] has returned `Ok`, although the file is still open.
     pub fn strong_count(&self) -> usize {
         self.file.strong_count()
     }
 
     /// Returns an `Option` containing ownership over the file if the file hasn't been closed yet, otherwise None.
+    ///
+    /// It also returns None once [DmaFile::try_take_last_clone] has returned `Ok`, although the file is still open.
     pub fn upgrade(&self) -> Option<OwnedDmaFile> {
         self.file.upgrade().map(|file| OwnedDmaFile {
             file,

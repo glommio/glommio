@@ -313,6 +313,11 @@ impl GlommioFile {
         self.identity() == other.identity()
     }
 
+    /// On success the fd moves into a fresh `Arc`, so weak handles taken
+    /// before the call stop upgrading. That is the point: `try_unwrap` and a
+    /// weak `upgrade` cannot both succeed, so once this returns `Ok` no such
+    /// handle on another thread can add a strong reference, and a following
+    /// `close` finds the fd unshared.
     pub(crate) fn try_take_last_clone(mut self) -> std::result::Result<Self, Self> {
         match Arc::try_unwrap(self.file.take().unwrap()) {
             Ok(took) => {

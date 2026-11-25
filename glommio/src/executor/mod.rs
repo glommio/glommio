@@ -867,6 +867,21 @@ impl LocalExecutorBuilder {
     /// 32768. `size` is the most one completion can carry; a message larger
     /// than it arrives in several.
     ///
+    /// A connection may hold what its stream can take at once, the stream's
+    /// own buffer or two receive buffers, whichever is more; past that its
+    /// request is cancelled and its socket backs up to the peer, so a
+    /// connection nobody reads leaves the buffers to the others. That ceiling is
+    /// checked as completions are reaped, so it holds only while the
+    /// executor keeps visiting the ring. After a stall (a long task within
+    /// its slice, a slow syscall), a connection nobody reads takes as many
+    /// buffers as the data that queued in its socket meanwhile, up to all of
+    /// them. Nothing is lost: the other connections still get every byte in
+    /// order, but through the plain read, slower, until that connection is
+    /// read or dropped, and [`RingIoStats::recv_buffers_exhausted`] counts
+    /// it. Reading every connection you accept, or dropping it, avoids this.
+    /// Kernels from 6.17 can bound a multishot receive in the kernel;
+    /// glommio does not use that yet.
+    ///
     /// The memory is `count * size` per executor, allocated at start, and a
     /// pool of shards multiplies it by the number of shards, which is why
     /// both numbers are here rather than chosen for you. The default is

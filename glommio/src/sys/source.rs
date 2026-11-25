@@ -179,11 +179,17 @@ pub(crate) struct RecvMultiState {
     /// several buffers.
     pub(crate) bundled: bool,
     /// The most bytes the queue may hold before the request is cancelled,
-    /// so a connection nobody reads cannot drain the executor's buffers for
-    /// every other connection: once its queue is full the kernel stops
-    /// taking its socket, the socket fills, and the peer's window closes,
-    /// which is backpressure where it belongs. The owner re-arms when it
-    /// drains the queue.
+    /// so a connection nobody reads does not drain the executor's buffers
+    /// for every other connection: once the request is cancelled the kernel
+    /// stops taking its socket, the socket fills, and the peer's window
+    /// closes, which is backpressure where it belongs. The owner re-arms
+    /// when it drains the queue.
+    ///
+    /// Checked as completions are reaped, so it bounds the queue only
+    /// between visits to the ring. Whatever the kernel takes in one visit
+    /// lands before the check: after the executor stalls with data waiting
+    /// in the socket, that is as many buffers as the data needs, up to the
+    /// whole pool.
     pub(crate) ceiling: usize,
     /// Whether the request was cancelled for exceeding the ceiling; one
     /// cancellation per request.

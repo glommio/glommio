@@ -3917,6 +3917,7 @@ pub fn std::io::error::Error::from(err: glommio::GlommioError<T>) -> Self
 impl<T> core::convert::From<std::io::error::Error> for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::from(err: std::io::error::Error) -> Self
 impl<T> core::error::Error for glommio::GlommioError<T>
+pub fn glommio::GlommioError<T>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl<T> core::fmt::Display for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::GlommioError<T> where T: core::marker::Freeze
@@ -5420,6 +5421,7 @@ pub fn std::io::error::Error::from(err: glommio::GlommioError<T>) -> Self
 impl<T> core::convert::From<std::io::error::Error> for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::from(err: std::io::error::Error) -> Self
 impl<T> core::error::Error for glommio::GlommioError<T>
+pub fn glommio::GlommioError<T>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl<T> core::fmt::Display for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::GlommioError<T> where T: core::marker::Freeze

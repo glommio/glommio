@@ -469,10 +469,11 @@ impl TaskQueue {
 pub(crate) fn bind_to_cpu_set(cpus: impl IntoIterator<Item = usize>) -> Result<()> {
     let mut cpuset = nix::sched::CpuSet::new();
     for cpu in cpus {
-        cpuset.set(cpu).map_err(|e| to_io_error!(e))?;
+        cpuset.set(cpu).map_err(io::Error::from)?;
     }
     let pid = nix::unistd::Pid::from_raw(0);
-    nix::sched::sched_setaffinity(pid, &cpuset).map_err(|e| Into::into(to_io_error!(e)))
+    nix::sched::sched_setaffinity(pid, &cpuset).map_err(io::Error::from)?;
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone, Default)]
@@ -3521,6 +3522,22 @@ mod test {
         assert!(bind_to_cpu_set(vec![0, 1, 2, 3]).is_ok());
         assert!(bind_to_cpu_set(0..1024).is_ok());
         assert!(bind_to_cpu_set(0..1025).is_err());
+    }
+
+    /// A CPU id past what the mask can hold is refused while the set is
+    /// built, before any syscall, and the caller still sees EINVAL.
+    #[test]
+    fn a_cpu_id_beyond_the_mask_reports_einval() {
+        let err = bind_to_cpu_set([1024]).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    /// An empty set is refused by `sched_setaffinity` itself, and the
+    /// caller sees the errno the kernel returned.
+    #[test]
+    fn an_empty_cpu_set_reports_the_kernel_errno() {
+        let err = bind_to_cpu_set(std::iter::empty()).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 
     #[test]

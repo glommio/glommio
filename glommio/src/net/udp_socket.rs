@@ -1032,6 +1032,27 @@ mod tests {
         });
     }
 
+    /// The receiving buffer is zeroed memory of which only the first page
+    /// is ever written.
+    #[test]
+    fn a_peek_into_a_buffer_of_four_gib_sees_the_datagram() {
+        test_executor!(async move {
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver
+                .connect(sender.local_addr().unwrap())
+                .await
+                .unwrap();
+            sender
+                .send_to(b"hello", receiver.local_addr().unwrap())
+                .await
+                .unwrap();
+            let mut buf = vec![0; 1 << 32];
+            assert_eq!(receiver.peek(&mut buf).await.unwrap(), 5);
+            assert_eq!(&buf[..5], b"hello");
+        });
+    }
+
     #[test]
     fn broadcast() {
         test_executor!(async move {

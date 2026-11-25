@@ -2993,4 +2993,24 @@ pub(crate) mod test {
             file.close().await.unwrap();
         }
     );
+
+    /// The buffer comes from the heap once it outgrows the pool, and its
+    /// pages are never touched: `/dev/null` counts the bytes without reading
+    /// them.
+    #[test]
+    fn a_write_longer_than_the_kernel_moves_at_once_is_short_not_empty() {
+        test_executor!(async move {
+            let file = OpenOptions::new()
+                .write(true)
+                .dma_open("/dev/null")
+                .await
+                .unwrap();
+            let written = file
+                .write_at(file.alloc_dma_buffer(1 << 32), 0)
+                .await
+                .unwrap();
+            assert_eq!(written, MAX_RW_COUNT);
+            file.close().await.unwrap();
+        });
+    }
 }

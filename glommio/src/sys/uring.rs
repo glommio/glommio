@@ -496,9 +496,9 @@ where
                 user_data = 0;
                 opcode::AsyncCancel::new(to_remove).build()
             }
-            UringOpDescriptor::Write(ptr, len, pos) => {
-                opcode::Write::new(fd, ptr, len as u32).offset(pos).build()
-            }
+            UringOpDescriptor::Write(ptr, len, pos) => opcode::Write::new(fd, ptr, entry_len(len))
+                .offset(pos)
+                .build(),
             UringOpDescriptor::Read(pos, len) => {
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut x| {
                     match &mut x.source_type {
@@ -623,12 +623,14 @@ where
                 })
             }
             UringOpDescriptor::WriteFixed(ptr, len, pos, buf_index) => {
-                opcode::WriteFixed::new(fd, ptr, len as u32, buf_index as u16)
+                opcode::WriteFixed::new(fd, ptr, entry_len(len), buf_index as u16)
                     .offset(pos)
                     .build()
             }
             UringOpDescriptor::SockSend(ptr, len, flags) => {
-                opcode::Send::new(fd, ptr, len as u32).flags(flags).build()
+                opcode::Send::new(fd, ptr, entry_len(len))
+                    .flags(flags)
+                    .build()
             }
             UringOpDescriptor::SockSendMsg(hdr, flags) => {
                 opcode::SendMsg::new(fd, hdr as *const libc::msghdr)
@@ -642,7 +644,7 @@ where
                             let buffer = slot
                                 .as_mut()
                                 .expect("a SockRecvInto source without its buffer");
-                            opcode::Recv::new(fd, buffer.as_mut_ptr(), buffer.len() as u32)
+                            opcode::Recv::new(fd, buffer.as_mut_ptr(), entry_len(buffer.len()))
                                 .flags(flags)
                                 .build()
                         }
@@ -659,8 +661,9 @@ where
                 }
             }
             UringOpDescriptor::SockRecv(len, flags) => {
+                let len = len.min(MAX_RW_COUNT);
                 let mut buf = DmaBuffer::new(len).expect("failed to allocate buffer");
-                let entry = opcode::Recv::new(fd, buf.as_mut_ptr(), len as u32)
+                let entry = opcode::Recv::new(fd, buf.as_mut_ptr(), entry_len(len))
                     .flags(flags)
                     .build();
                 source_map.peek_source_mut(from_user_data(op.user_data), |mut src| {
@@ -1304,6 +1307,15 @@ const RECV_BUFFER_GROUP: u16 = 0;
 /// `u32` an entry carries. Short reads are the answer to asking for more
 /// anyway, and the value is aligned for direct I/O.
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
+
+/// The length an entry carries for `len` bytes of buffer. An entry holds a
+/// `u32`, and casting a longer length wraps: four GiB became zero, which a
+/// write reports as nothing written and a receive as the end of the stream.
+/// Linux moves no more than [`MAX_RW_COUNT`] at once anyway, so asking for
+/// that much gives the caller the short count `write(2)` would.
+fn entry_len(len: usize) -> u32 {
+    len.min(MAX_RW_COUNT) as u32
+}
 
 /// `IORING_ENTER_GETEVENTS`, the same value on every architecture: an entry
 /// that asks for events, which is what runs a deferred ring's task work.
@@ -4541,6 +4553,50 @@ mod tests {
         });
 
         ring.submit_one_event(&mut queue.submissions);
+    }
+
+    /// The buffer's pages are never written; the kernel reads as many as the
+    /// socket's send buffer takes, which maps the zero page.
+    #[test]
+    fn a_send_longer_than_the_kernel_moves_at_once_is_short_not_empty() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .make()
+            .unwrap();
+        ex.run(async {
+            let (writer, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            let buf = DmaBuffer::new(1 << 32).unwrap();
+            let source = crate::executor()
+                .reactor()
+                .rushed_send(writer.as_raw_fd(), buf, None)
+                .unwrap();
+            let sent = source.collect_rw().await.unwrap();
+            assert!(sent > 0 && sent <= MAX_RW_COUNT, "sent {sent}");
+        });
+    }
+
+    /// Only the first page of the receiving buffer is ever written.
+    #[test]
+    fn a_receive_into_a_buffer_of_four_gib_is_not_an_empty_read() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .make()
+            .unwrap();
+        ex.run(async {
+            let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            std::io::Write::write_all(&mut writer, b"hello").unwrap();
+            let buffer = crate::net::OwnedRxBuf::new(vec![0; 1 << 32]);
+            let source = crate::executor()
+                .reactor()
+                .recv_into(reader.as_raw_fd(), buffer);
+            assert_eq!(source.collect_rw().await.unwrap(), 5);
+            match source.extract_source_type() {
+                SourceType::SockRecvInto(Some(buffer)) => {
+                    assert_eq!(&buffer.as_bytes()[..5], b"hello")
+                }
+                _ => unreachable!(),
+            }
+        });
     }
 
     #[test]

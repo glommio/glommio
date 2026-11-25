@@ -404,7 +404,9 @@ impl SleepNotifier {
     /// Lets foreign wakers know the owner is going to sleep, drains what they
     /// sent meanwhile, and sleeps only if that was nothing.
     ///
-    /// Notification is turned off again only after a sleep that succeeded.
+    /// Notification is turned off again on every way out, so a wake that
+    /// arrives while the owner is awake does not write the eventfd. That is
+    /// safe because the owner announces itself again before any later sleep.
     pub(super) fn sleep_unless_woken(
         &self,
         drain: impl FnOnce() -> usize,
@@ -413,11 +415,9 @@ impl SleepNotifier {
         self.prepare_to_sleep();
         membarrier::heavy();
         let events = drain();
-        if events == 0 {
-            sleep()?;
-            self.wake_up();
-        }
-        Ok(events)
+        let slept = if events == 0 { sleep() } else { Ok(()) };
+        self.wake_up();
+        slept.map(|()| events)
     }
 }
 

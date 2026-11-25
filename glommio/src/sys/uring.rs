@@ -4213,6 +4213,40 @@ mod tests {
         );
     }
 
+    fn eventfd_was_written(notifier: &sys::SleepNotifier) -> bool {
+        let mut fd = libc::pollfd {
+            fd: notifier.eventfd_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, 0) == 1 }
+    }
+
+    /// Guards against an owner that found work instead of sleeping leaving
+    /// notification on, so the next ordinary wake wrote the eventfd for an
+    /// owner that was awake.
+    #[test]
+    fn an_owner_that_finds_work_is_not_signalled_by_the_next_wake() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let events = notifier
+            .sleep_unless_woken(|| 1, || unreachable!("there was work, so no sleep"))
+            .unwrap();
+        assert_eq!(events, 1);
+        notifier.notify(false);
+        assert!(!eventfd_was_written(&notifier));
+    }
+
+    /// Guards against a failed sleep leaving notification on, the same way.
+    #[test]
+    fn an_owner_whose_sleep_failed_is_not_signalled_by_the_next_wake() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        notifier
+            .sleep_unless_woken(|| 0, || Err(io::Error::other("sleep failed")))
+            .unwrap_err();
+        notifier.notify(false);
+        assert!(!eventfd_was_written(&notifier));
+    }
+
     /// A timer the kernel did not take cannot end the sleep, so the reactor
     /// must not sleep on it. A transient `EBUSY` used to panic here.
     #[test]

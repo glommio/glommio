@@ -147,6 +147,9 @@ impl UringBufferAllocator {
         unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.size) }
     }
 
+    /// Takes the buffer from the pool, or from the heap once the pool is out
+    /// of room. The heap allocates nothing for zero bytes, so an empty buffer
+    /// takes one and is trimmed back, as the pool's smallest block is.
     fn new_buffer(self: &Rc<Self>, size: usize) -> Option<DmaBuffer> {
         let mut alloc = self.allocator.borrow_mut();
         match ptr::NonNull::new(alloc.malloc(size)) {
@@ -158,7 +161,10 @@ impl UringBufferAllocator {
                 };
                 Some(DmaBuffer::with_storage(size, BufferStorage::Uring(ub)))
             }
-            None => DmaBuffer::new(size),
+            None => DmaBuffer::new(size.max(1)).map(|mut buffer| {
+                buffer.trim_to_size(size);
+                buffer
+            }),
         }
     }
 }
@@ -1291,6 +1297,13 @@ impl UringCommon for PollRing {
 /// The buffer group a ring's provided buffers are registered under. One
 /// group per ring is all multishot receive needs.
 const RECV_BUFFER_GROUP: u16 = 0;
+
+/// The most Linux moves in one read, `MAX_RW_COUNT` with 4 KiB pages. A read
+/// asks for no more than this, so its buffer, the range a scheduler can serve
+/// from it and the length the ring is given all agree, and none exceeds the
+/// `u32` an entry carries. Short reads are the answer to asking for more
+/// anyway, and the value is aligned for direct I/O.
+pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
 
 /// `IORING_ENTER_GETEVENTS`, the same value on every architecture: an entry
 /// that asks for events, which is what runs a deferred ring's task work.

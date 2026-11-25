@@ -470,7 +470,7 @@ impl DmaStreamReader {
     pub fn skip(&mut self, bytes: u64) {
         let mut state = self.state.borrow_mut();
         let buffer_id = state.buffer_id(self.current_pos);
-        self.current_pos = std::cmp::min(self.current_pos + bytes, self.end);
+        self.current_pos = std::cmp::min(self.current_pos.saturating_add(bytes), self.end);
         let new_buffer_id = state.buffer_id(self.current_pos);
         if buffer_id != new_buffer_id {
             let candidate_read_ahead_pos = self.current_pos - self.current_pos % self.buffer_size;
@@ -565,9 +565,7 @@ impl DmaStreamReader {
             let start_id = state.buffer_id(self.current_pos);
             let offset = state.offset_of(self.current_pos);
 
-            if self.current_pos + len > state.max_pos {
-                len = state.max_pos - self.current_pos;
-            }
+            len = len.min(state.max_pos.saturating_sub(self.current_pos));
 
             (start_id, (self.buffer_size - offset as u64).min(len))
         };
@@ -2938,5 +2936,41 @@ mod test {
         std::future::poll_fn(|cx| writer.poll_seal(cx))
             .await
             .unwrap_err();
+    });
+
+    file_stream_read_test!(a_reader_that_starts_past_its_end_reads_nothing, path, _k, file, _file_size: 8192, {
+        let mut reader = DmaStreamReaderBuilder::new(file)
+            .with_start_pos(4096)
+            .with_end_pos(1024)
+            .with_buffer_size(1 << 10)
+            .build();
+        assert!(reader.get_buffer_aligned(512).await.unwrap().is_empty());
+        let mut buf = [0u8; 128];
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+        reader.close().await.unwrap();
+    });
+
+    file_stream_read_test!(skipping_further_than_the_end_stops_at_the_end, path, _k, file, _file_size: 8192, {
+        let mut reader = DmaStreamReaderBuilder::new(file)
+            .with_end_pos(8192)
+            .with_buffer_size(1 << 10)
+            .build();
+        reader.skip(100);
+        reader.skip(u64::MAX);
+        assert_eq!(reader.current_pos(), 8192);
+        let mut buf = [0u8; 128];
+        assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
+        reader.close().await.unwrap();
+    });
+
+    file_stream_read_test!(asking_for_more_than_is_left_returns_what_is_left, path, _k, file, _file_size: 8192, {
+        let mut reader = DmaStreamReaderBuilder::new(file)
+            .with_buffer_size(1 << 10)
+            .build();
+        reader.skip(1000);
+        let read = reader.get_buffer_aligned(u64::MAX).await.unwrap();
+        assert_eq!(read.len(), 24);
+        check_contents!(*read, 1000);
+        reader.close().await.unwrap();
     });
 }

@@ -31,7 +31,7 @@ use crate::{
     sys::{
         self, blocking::BlockingThreadPool, common_flags, read_flags, DirectIo, DmaBuffer,
         DmaSource, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType, StatsCollection,
-        Statx,
+        Statx, MAX_RW_COUNT,
     },
     IoRequirements, IoStats, TaskQueueHandle,
 };
@@ -570,6 +570,7 @@ impl Reactor {
             &STATS_WITHOUT_LATENCY
         };
 
+        let size = size.min(MAX_RW_COUNT);
         let source = self.new_source(raw, SourceType::Read(pollable, None), Some(stats));
 
         if let Some(scheduler) = scheduler {
@@ -594,6 +595,7 @@ impl Reactor {
         size: usize,
         scheduler: Option<&FileScheduler>,
     ) -> ScheduledSource {
+        let size = size.min(MAX_RW_COUNT);
         let source = self.new_source(
             raw,
             SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),
@@ -620,6 +622,7 @@ impl Reactor {
     /// sequence rather than by position: the ring takes an offset of -1 to mean
     /// the current one.
     pub(crate) fn read_buffered_at_cursor(&self, raw: RawFd, size: usize) -> ScheduledSource {
+        let size = size.min(MAX_RW_COUNT);
         let source = self.new_source(
             raw,
             SourceType::Read(PollableStatus::NonPollable(DirectIo::Disabled), None),

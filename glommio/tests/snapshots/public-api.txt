@@ -2282,6 +2282,7 @@ impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusi
 pub struct glommio::net::AcceptedUnixStream
 impl glommio::net::AcceptedUnixStream
 pub fn glommio::net::AcceptedUnixStream::bind_to_executor(self) -> glommio::net::UnixStream
+pub fn glommio::net::AcceptedUnixStream::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 impl core::clone::Clone for glommio::net::AcceptedUnixStream
 pub fn glommio::net::AcceptedUnixStream::clone(&self) -> glommio::net::AcceptedUnixStream
 impl core::fmt::Debug for glommio::net::AcceptedUnixStream
@@ -2813,12 +2814,16 @@ pub fn glommio::net::UnixDatagram::pair() -> glommio::Result<(glommio::net::Unix
 pub async fn glommio::net::UnixDatagram::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub async fn glommio::net::UnixDatagram::peek_from(&self, buf: &mut [u8]) -> glommio::Result<(usize, nix::sys::socket::addr::UnixAddr)>
 pub fn glommio::net::UnixDatagram::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixDatagram::read_timeout(&self) -> core::option::Option<core::time::Duration>
 pub async fn glommio::net::UnixDatagram::recv(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub async fn glommio::net::UnixDatagram::recv_from(&self, buf: &mut [u8]) -> glommio::Result<(usize, nix::sys::socket::addr::UnixAddr)>
 pub async fn glommio::net::UnixDatagram::send(&self, buf: &[u8]) -> glommio::Result<usize>
 pub async fn glommio::net::UnixDatagram::send_to<A: core::convert::AsRef<std::path::Path>>(&self, buf: &[u8], addr: A) -> glommio::Result<usize>
 pub fn glommio::net::UnixDatagram::set_buffer_size(&mut self, buffer_size: usize)
+pub fn glommio::net::UnixDatagram::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
+pub fn glommio::net::UnixDatagram::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 pub fn glommio::net::UnixDatagram::unbound() -> glommio::Result<glommio::net::UnixDatagram>
+pub fn glommio::net::UnixDatagram::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl core::fmt::Debug for glommio::net::UnixDatagram
 pub fn glommio::net::UnixDatagram::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl std::os::fd::owned::AsFd for glommio::net::UnixDatagram
@@ -2913,6 +2918,8 @@ impl<B: glommio::net::RxBuf> glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixReadHalf<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::UnixReadHalf<B>::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixReadHalf<B>::read_timeout(&self) -> core::option::Option<core::time::Duration>
+pub fn glommio::net::UnixReadHalf<B>::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 impl<'__pin, B: glommio::net::RxBuf> core::marker::Unpin for glommio::net::UnixReadHalf<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
 impl<B: core::fmt::Debug + glommio::net::RxBuf> core::fmt::Debug for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2971,7 +2978,12 @@ impl<B: glommio::net::RxBuf> glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixStream<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::UnixStream<B>::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixStream<B>::poll_shutdown(&self, cx: &mut core::task::wake::Context<'_>, how: std::net::Shutdown) -> core::task::poll::Poll<glommio::Result<()>>
+pub fn glommio::net::UnixStream<B>::read_timeout(&self) -> core::option::Option<core::time::Duration>
+pub fn glommio::net::UnixStream<B>::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
+pub fn glommio::net::UnixStream<B>::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 pub async fn glommio::net::UnixStream<B>::shutdown(&self, how: std::net::Shutdown) -> glommio::Result<()>
+pub fn glommio::net::UnixStream<B>::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl<B: glommio::net::RxBuf> glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::reunite(rx: glommio::net::UnixReadHalf<B>, tx: glommio::net::UnixWriteHalf) -> core::result::Result<Self, (glommio::net::UnixReadHalf<B>, glommio::net::UnixWriteHalf)>
 pub fn glommio::net::UnixStream<B>::split(self) -> (glommio::net::UnixReadHalf<B>, glommio::net::UnixWriteHalf)
@@ -3035,7 +3047,9 @@ pub struct glommio::net::UnixWriteHalf
 impl glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub fn glommio::net::UnixWriteHalf::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixWriteHalf::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 pub async fn glommio::net::UnixWriteHalf::shutdown(&self) -> glommio::Result<()>
+pub fn glommio::net::UnixWriteHalf::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl core::fmt::Debug for glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl futures_io::if_std::AsyncWrite for glommio::net::UnixWriteHalf

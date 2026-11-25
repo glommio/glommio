@@ -479,6 +479,13 @@ pub(crate) fn bind_to_cpu_set(cpus: impl IntoIterator<Item = usize>) -> Result<(
 #[derive(Debug, Copy, Clone, Default)]
 /// Allows information about the current state of this executor to be consumed
 /// by applications.
+///
+/// The counters cover the interval since the stats were last read:
+/// [`executor_stats`] returns them and resets them to zero. Two readers each
+/// see only part of the total, so keep a single reader and sum its readings
+/// for a running total.
+///
+/// [`executor_stats`]: crate::ExecutorProxy::executor_stats
 pub struct ExecutorStats {
     executor_runtime: Duration,
     /// `total_runtime` includes poll io time, excludes spin loop time.
@@ -497,7 +504,8 @@ impl ExecutorStats {
         }
     }
 
-    /// The total amount of runtime in this executor so far.
+    /// The total amount of runtime in this executor since the stats were last
+    /// read.
     ///
     /// This is especially important for spinning executors, since the amount of
     /// CPU time you will see in the operating system will be a far cry from
@@ -529,6 +537,20 @@ impl ExecutorStats {
 #[derive(Debug, Copy, Clone)]
 /// Allows information about the current state of a particular task queue to be
 /// consumed by applications.
+///
+/// [`runtime`] and [`queue_selected`] cover the interval since this queue's
+/// stats were last read: [`task_queue_stats`] and [`all_task_queue_stats`]
+/// both return them and reset them to zero, so reading one also resets what
+/// the other will see. Two readers each see only part of the total, so keep
+/// a single reader and sum its readings for a running total. [`index`] and
+/// [`current_shares`] are not reset.
+///
+/// [`runtime`]: TaskQueueStats::runtime
+/// [`queue_selected`]: TaskQueueStats::queue_selected
+/// [`index`]: TaskQueueStats::index
+/// [`current_shares`]: TaskQueueStats::current_shares
+/// [`task_queue_stats`]: crate::ExecutorProxy::task_queue_stats
+/// [`all_task_queue_stats`]: crate::ExecutorProxy::all_task_queue_stats
 pub struct TaskQueueStats {
     index: TaskQueueHandle,
     /// So we can easily produce a handle.
@@ -562,15 +584,15 @@ impl TaskQueueStats {
         ((1u64 << 22) / self.reciprocal_shares) as usize
     }
 
-    /// Returns the accumulated runtime this task queue had received since the
-    /// beginning of its execution
+    /// Returns the runtime this task queue has received since its stats were
+    /// last read
     pub fn runtime(&self) -> Duration {
         self.runtime
     }
 
-    /// Returns the number of times this queue was selected to be executed. In
-    /// conjunction with the runtime, you can extract an average of the
-    /// amount of time this queue tends to run for
+    /// Returns the number of times this queue was selected to be executed since
+    /// its stats were last read. In conjunction with the runtime, you can
+    /// extract an average of the amount of time this queue tends to run for
     pub fn queue_selected(&self) -> u64 {
         self.queue_selected
     }
@@ -796,6 +818,10 @@ impl LocalExecutorBuilder {
     ///
     /// The system will always try to allocate at least 64 kiB for I/O memory,
     /// and the default is 10 MiB.
+    ///
+    /// The registration is charged to the `memlock` resource limit, once for
+    /// each of three rings. If it does not fit, the memory is used without
+    /// being registered. See [Before using Glommio](crate#before-using-glommio).
     #[must_use = "The builder must be built to be useful"]
     pub fn io_memory(mut self, io_memory: usize) -> LocalExecutorBuilder {
         self.io_memory = io_memory;
@@ -2822,6 +2848,11 @@ impl ExecutorProxy {
     /// or a [`GlommioError`] of type `[QueueErrorKind`] if there is no task
     /// queue with this handle
     ///
+    /// Reading resets the queue's counters: each call returns what accumulated
+    /// since the previous call to this or to [`all_task_queue_stats`].
+    ///
+    /// [`all_task_queue_stats`]: ExecutorProxy::all_task_queue_stats
+    ///
     /// # Examples
     /// ```
     /// use glommio::{Latency, LocalExecutorBuilder, Shares};
@@ -2872,6 +2903,11 @@ impl ExecutorProxy {
     /// The collection can be anything that implements [`Extend`] and it is
     /// initially passed by the user, so they can control how allocations are
     /// done.
+    ///
+    /// Reading resets every queue's counters, as [`task_queue_stats`] does for
+    /// one.
+    ///
+    /// [`task_queue_stats`]: ExecutorProxy::task_queue_stats
     ///
     /// # Examples
     /// ```
@@ -2931,6 +2967,10 @@ impl ExecutorProxy {
 
     /// Returns a [`ExecutorStats`] struct with information about this Executor
     ///
+    /// Reading resets the counters: each call returns what accumulated since
+    /// the previous call. The task queue counters are separate and are not
+    /// reset by this.
+    ///
     /// # Examples:
     ///
     /// ```
@@ -2967,6 +3007,10 @@ impl ExecutorProxy {
     /// Returns an [`IoStats`] struct with information about IO performed by
     /// this executor's reactor
     ///
+    /// Reading resets the counters and latency distributions of every ring:
+    /// each call returns what accumulated since the previous call. The per
+    /// task queue IO stats are separate and are not reset by this.
+    ///
     /// # Examples:
     ///
     /// ```
@@ -2998,6 +3042,12 @@ impl ExecutorProxy {
 
     /// Returns an [`IoStats`] struct with information about IO performed from
     /// the provided TaskQueue by this executor's reactor
+    ///
+    /// Reading resets this queue's IO counters and latency distributions: each
+    /// call returns what accumulated since the previous call for this queue.
+    /// The executor-wide [`io_stats`] are separate and are not reset by this.
+    ///
+    /// [`io_stats`]: ExecutorProxy::io_stats
     ///
     /// # Examples:
     ///

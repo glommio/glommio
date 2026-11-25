@@ -212,14 +212,30 @@
 //!
 //! ## Before using Glommio
 //!
-//! Please note Glommio requires at least 512 KiB of locked memory for
-//! `io_uring` to work. You can increase the `memlock` resource limit (rlimit)
-//! as follows:
+//! Please note an executor checks the `memlock` resource limit (the soft
+//! `RLIMIT_MEMLOCK`) when it is built, and refuses to start if the limit is
+//! below 512 KiB. The error is an I/O error whose message reads
+//! `MemLockLimit(<limit>/<minimum>)`, both in bytes.
+//! [`LocalExecutorBuilder::make`] returns it, an executor started with
+//! [`LocalExecutorBuilder::spawn`] returns it from
+//! [`ExecutorJoinHandle::join`], and [`LocalExecutor::default`] panics with it.
+//!
+//! Passing that check is not enough for full performance. Each executor
+//! registers its I/O memory ([`LocalExecutorBuilder::io_memory`], 10 MiB by
+//! default) as fixed buffers with three of its rings, and the kernel charges
+//! each registration to the same limit, counted per user across all of the
+//! user's processes. If a registration does not fit, Glommio logs a warning
+//! and carries on without fixed buffers: I/O still works, but more slowly.
+//! Every registration succeeds with a limit of about three times `io_memory`
+//! per executor, on top of what the user's processes have locked otherwise.
+//!
+//! You can increase the `memlock` resource limit (rlimit) as follows. The
+//! values are in KiB, and `unlimited` avoids the arithmetic:
 //!
 //! ```sh
 //! $ vi /etc/security/limits.conf
-//! *    hard    memlock        512
-//! *    soft    memlock        512
+//! *    hard    memlock        unlimited
+//! *    soft    memlock        unlimited
 //! ```
 //!
 //! To make the new limits effective, you need to log in to the machine again.
@@ -227,7 +243,7 @@
 //!
 //! ```sh
 //! $ ulimit -l
-//! 512
+//! unlimited
 //! ```
 //!
 //! Glommio also needs a recent enough `io_uring`. The documented minimum is
@@ -593,6 +609,14 @@ impl IoRequirements {
 }
 
 /// Stores information about IO performed in a specific ring
+///
+/// The counters and distributions cover the interval since the stats were
+/// last read: [`io_stats`] and [`task_queue_io_stats`] return them and reset
+/// them. Two readers each see only part of the total, so keep a single reader
+/// and sum its readings for a running total.
+///
+/// [`io_stats`]: crate::ExecutorProxy::io_stats
+/// [`task_queue_io_stats`]: crate::ExecutorProxy::task_queue_io_stats
 #[derive(Clone)]
 pub struct RingIoStats {
     pub(crate) files_opened: u64,
@@ -667,9 +691,14 @@ impl Debug for RingIoStats {
 }
 
 impl RingIoStats {
-    /// The total amount of files opened in this executor so far.
+    /// The number of files opened in this executor since the stats were last
+    /// read.
     ///
-    /// [`files_opened`] - [`files_closed`] gives the current open files count
+    /// Since reading resets both counters, [`files_opened`] - [`files_closed`]
+    /// is the change over that interval, not the current open files count. A
+    /// single reader can keep a running total by summing those changes. Only
+    /// files closed with an explicit `close` count as closed: a file that is
+    /// dropped instead is closed without being counted.
     ///
     /// [`files_opened`]: RingIoStats::files_opened
     /// [`files_closed`]: RingIoStats::files_closed
@@ -677,12 +706,12 @@ impl RingIoStats {
         self.files_opened
     }
 
-    /// The total amount of files closed in this executor so far.
+    /// The number of files closed in this executor since the stats were last
+    /// read.
     ///
-    /// [`files_opened`] - [`files_closed`] gives the current open files count
+    /// See [`files_opened`] for what the difference of the two means.
     ///
     /// [`files_opened`]: RingIoStats::files_opened
-    /// [`files_closed`]: RingIoStats::files_closed
     pub fn files_closed(&self) -> u64 {
         self.files_closed
     }

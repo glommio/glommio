@@ -334,7 +334,7 @@ impl UnixStream {
         let reactor = crate::executor().reactor();
 
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::other)?;
+        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::from)?;
         let source = reactor.connect(socket.as_raw_fd(), addr);
         source.collect_rw().await?;
 
@@ -696,7 +696,7 @@ impl UnixDatagram {
     /// [`send`]: UnixDatagram::send
     /// [`recv`]: UnixDatagram::recv
     pub async fn connect<A: AsRef<Path>>(&self, addr: A) -> Result<()> {
-        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::other)?;
+        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::from)?;
 
         let reactor = self.socket.reactor.upgrade().unwrap();
         let source = reactor.connect(self.socket.as_raw_fd(), addr);
@@ -865,7 +865,7 @@ impl UnixDatagram {
     /// })
     /// ```
     pub async fn send_to<A: AsRef<Path>>(&self, buf: &[u8], addr: A) -> Result<usize> {
-        let addr = nix::sys::socket::UnixAddr::new(addr.as_ref()).map_err(io::Error::other)?;
+        let addr = nix::sys::socket::UnixAddr::new(addr.as_ref()).map_err(io::Error::from)?;
         self.socket.send_to(buf, addr).await.map_err(Into::into)
     }
 
@@ -1130,6 +1130,29 @@ mod tests {
         let (sz, addr) = p1.recv_from(&mut buf).await.unwrap();
         assert_eq!(sz, 4);
         assert!(addr.path().is_none());
+    });
+
+    unix_socket_test!(a_path_too_long_for_an_address_reports_enametoolong, dir, {
+        let path = dir.join("x".repeat(200));
+        let errno = |err: crate::GlommioError<()>| io::Error::from(err).raw_os_error();
+
+        let err = UnixStream::connect(&path).await.unwrap_err();
+        assert_eq!(errno(err), Some(libc::ENAMETOOLONG), "UnixStream::connect");
+
+        let socket = UnixDatagram::unbound().unwrap();
+        let err = socket.connect(&path).await.unwrap_err();
+        assert_eq!(
+            errno(err),
+            Some(libc::ENAMETOOLONG),
+            "UnixDatagram::connect"
+        );
+
+        let err = socket.send_to(b"x", &path).await.unwrap_err();
+        assert_eq!(
+            errno(err),
+            Some(libc::ENAMETOOLONG),
+            "UnixDatagram::send_to"
+        );
     });
 
     unix_socket_test!(datagram_connect_unbounded, dir, {

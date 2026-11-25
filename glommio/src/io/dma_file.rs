@@ -14,7 +14,7 @@ use crate::{
         read_result::ReadResult,
         ScheduledSource,
     },
-    sys::{self, sysfs, DirectIo, DmaBuffer, DmaSource, PollableStatus},
+    sys::{self, sysfs, DirectIo, DmaBuffer, DmaSource, PollableStatus, MAX_RW_COUNT},
 };
 use futures_lite::{Stream, StreamExt};
 use nix::sys::statfs::*;
@@ -480,7 +480,7 @@ impl DmaFile {
         let eff_pos = self.align_down(pos);
         let b = (pos - eff_pos) as usize;
 
-        let eff_size = self.align_up((size + b) as u64) as usize;
+        let eff_size = self.align_up((size.min(MAX_RW_COUNT) + b) as u64) as usize;
         let source = self.file.reactor.upgrade().unwrap().read_dma(
             self.as_raw_fd(),
             eff_pos,
@@ -2912,4 +2912,85 @@ pub(crate) mod test {
         assert_eq!(short.unwrap().len(), 4096);
         file.close().await.unwrap();
     });
+
+    dma_file_test!(
+        a_zero_length_read_with_the_buffer_pool_exhausted_returns_nothing,
+        path,
+        _k,
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .dma_open(path.join("testfile"))
+                .await
+                .unwrap();
+            let pool = (0..=crate::executor::DEFAULT_IO_MEMORY / 4096)
+                .map(|_| file.alloc_dma_buffer(4096))
+                .collect::<Vec<_>>();
+            assert!(file.read_at(0, 0).await.unwrap().is_empty());
+            assert!(file.read_at_aligned(0, 0).await.unwrap().is_empty());
+            assert!(file.alloc_dma_buffer(0).is_empty());
+            drop(pool);
+            file.close().await.unwrap();
+        }
+    );
+
+    dma_file_test!(
+        a_read_longer_than_the_kernel_moves_at_once_returns_the_bytes_there_are,
+        path,
+        _k,
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .dma_open(path.join("testfile"))
+                .await
+                .unwrap();
+            let mut buf = file.alloc_dma_buffer(4096);
+            buf.as_bytes_mut().fill(7);
+            file.write_at(buf, 0).await.unwrap();
+            assert_eq!(file.read_at_aligned(0, 1 << 32).await.unwrap().len(), 4096);
+            let rest = file.read_at(1, usize::MAX).await.unwrap();
+            assert_eq!(&rest[..], &[7; 4095][..]);
+            file.close().await.unwrap();
+        }
+    );
+
+    dma_file_test!(
+        an_oversized_aligned_read_beside_a_held_one_returns_the_bytes_to_the_end,
+        path,
+        _k,
+        {
+            let data = (0..8192u32).map(|x| x as u8).collect::<Vec<_>>();
+            std::fs::write(path.join("f"), &data).unwrap();
+            let file = DmaFile::open(path.join("f")).await.unwrap();
+            file.attach_scheduler();
+            let held = file.read_at_aligned(0, 8192).await.unwrap();
+            let rest = file.read_at_aligned(4096, usize::MAX - 4095).await.unwrap();
+            assert_eq!(&rest[..], &data[4096..]);
+            assert_eq!(&held[..], &data[..]);
+            drop((held, rest));
+            file.close().await.unwrap();
+        }
+    );
+
+    dma_file_test!(
+        a_read_at_the_last_offsets_is_refused_rather_than_served_from_the_start,
+        path,
+        _k,
+        {
+            let data = (0..8192u32).map(|x| x as u8).collect::<Vec<_>>();
+            std::fs::write(path.join("f"), &data).unwrap();
+            let file = DmaFile::open(path.join("f")).await.unwrap();
+            file.attach_scheduler();
+            let held = file.read_at_aligned(0, 8192).await.unwrap();
+            file.read_at_aligned(u64::MAX - 4095, 8192)
+                .await
+                .expect_err("a range past u64::MAX was served from a held read");
+            drop(held);
+            file.close().await.unwrap();
+        }
+    );
 }

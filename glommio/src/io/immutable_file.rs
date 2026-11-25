@@ -597,4 +597,24 @@ mod test {
 
         stream.close().await.unwrap();
     });
+
+    immutable_file_test!(
+        an_oversized_read_beside_a_held_one_returns_the_bytes_to_the_end,
+        path,
+        {
+            let fname = path.join("testfile");
+            let mut immutable = ImmutableFileBuilder::new(fname).build_sink().await.unwrap();
+            let data = (0..8192u32).map(|x| x as u8).collect::<Vec<_>>();
+            immutable.write_all(&data).await.unwrap();
+            let stream = immutable.seal().await.unwrap();
+
+            let held = stream.read_at(0, 8192).await.unwrap();
+            let rest = stream.read_at(4096, usize::MAX - 4095).await.unwrap();
+            assert_eq!(&rest[..], &data[4096..]);
+            assert_eq!(&held[..], &data[..]);
+
+            drop((held, rest));
+            stream.close().await.unwrap();
+        }
+    );
 }

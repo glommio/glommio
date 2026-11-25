@@ -469,4 +469,60 @@ mod test {
         writer.close().await.unwrap();
         reader.close().await.unwrap();
     });
+
+    buffered_file_test!(
+        a_zero_length_buffered_read_with_the_buffer_pool_exhausted_returns_nothing,
+        path,
+        _k,
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .buffered_open(path.join("testfile"))
+                .await
+                .unwrap();
+            let reactor = crate::executor().reactor();
+            let pool = (0..=crate::executor::DEFAULT_IO_MEMORY / 4096)
+                .map(|_| reactor.alloc_dma_buffer(4096))
+                .collect::<Vec<_>>();
+            assert!(file.read_at(0, 0).await.unwrap().is_empty());
+            drop(pool);
+            file.close().await.unwrap();
+        }
+    );
+
+    buffered_file_test!(
+        a_buffered_read_longer_than_the_kernel_moves_at_once_returns_the_bytes_there_are,
+        path,
+        _k,
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .buffered_open(path.join("testfile"))
+                .await
+                .unwrap();
+            file.write_at(vec![7; 4096], 0).await.unwrap();
+            assert_eq!(file.read_at(0, 1 << 32).await.unwrap().len(), 4096);
+            assert_eq!(file.read_at(1, usize::MAX).await.unwrap().len(), 4095);
+            file.close().await.unwrap();
+        }
+    );
+
+    buffered_file_test!(a_buffered_read_at_the_last_offsets_is_refused, path, _k, {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .buffered_open(path.join("testfile"))
+            .await
+            .unwrap();
+        file.write_at(vec![7; 4096], 0).await.unwrap();
+        file.read_at(u64::MAX - 4095, 8192)
+            .await
+            .expect_err("a read past the largest offset succeeded");
+        file.close().await.unwrap();
+    });
 }

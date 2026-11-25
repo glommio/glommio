@@ -260,6 +260,16 @@ impl Reactor {
         ids.len()
     }
 
+    /// How many wakers wait on the shared channel half `id`.
+    #[cfg(test)]
+    pub(crate) fn shared_channel_wakers(&self, id: u64) -> usize {
+        self.shared_channels
+            .borrow()
+            .pending
+            .get(&id)
+            .map_or(0, |wakers| wakers.len())
+    }
+
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
         let mut channels = self.shared_channels.borrow_mut();
         let removed = (
@@ -309,9 +319,13 @@ impl Reactor {
         drop(removed);
     }
 
-    pub(crate) fn add_shared_channel_waker(&self, id: u64, waker: Waker) {
+    /// Queues `waker` for the half `id`, unless it is queued there already.
+    pub(crate) fn add_shared_channel_waker(&self, id: u64, waker: &Waker) {
         let mut channels = self.shared_channels.borrow_mut();
-        channels.pending.entry(id).or_default().push(waker);
+        let wakers = channels.pending.entry(id).or_default();
+        if !wakers.iter().any(|queued| queued.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
     }
 
     pub(crate) fn alloc_dma_buffer(&self, size: usize) -> DmaBuffer {

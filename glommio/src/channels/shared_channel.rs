@@ -362,7 +362,7 @@ impl<T: Send + Sized> ConnectedSender<T> {
                 self.reactor
                     .upgrade()
                     .unwrap()
-                    .add_shared_channel_waker(self.id, cx.waker().clone());
+                    .add_shared_channel_waker(self.id, cx.waker());
                 Poll::Pending
             }
         }
@@ -488,7 +488,7 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
                     self.reactor
                         .upgrade()
                         .unwrap()
-                        .add_shared_channel_waker(self.id, cx.waker().clone());
+                        .add_shared_channel_waker(self.id, cx.waker());
                     Poll::Pending
                 }
             }
@@ -1386,5 +1386,68 @@ mod test {
         for _ in 0..50 {
             connect_from_two_executors(Duration::ZERO, Duration::ZERO);
         }
+    }
+
+    /// Guards against a receiver polled again and again on a quiet channel,
+    /// as `select!` against a timer does, queueing its waker once per poll.
+    #[test]
+    fn repolling_a_pending_recv_keeps_one_waker() {
+        let (sender, receiver) = new_bounded::<u32>(1);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let sender = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let sender = sender.connect().await;
+                done_rx.recv().unwrap();
+                drop(sender);
+            })
+            .unwrap();
+        let receiver = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let receiver = receiver.connect().await;
+                for _ in 0..100 {
+                    assert!(futures_lite::future::poll_once(receiver.recv())
+                        .await
+                        .is_none());
+                }
+                let wakers = crate::executor()
+                    .reactor()
+                    .shared_channel_wakers(receiver.id);
+                done_tx.send(()).unwrap();
+                assert_eq!(wakers, 1, "one task queued {wakers} wakers");
+            })
+            .unwrap();
+        receiver.join().unwrap();
+        sender.join().unwrap();
+    }
+
+    /// Guards against a sender polled again and again on a full channel
+    /// queueing its waker once per poll.
+    #[test]
+    fn repolling_a_pending_send_keeps_one_waker() {
+        let (sender, receiver) = new_bounded::<u32>(1);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let receiver = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let receiver = receiver.connect().await;
+                done_rx.recv().unwrap();
+                drop(receiver);
+            })
+            .unwrap();
+        let sender = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let sender = sender.connect().await;
+                sender.try_send(0).unwrap();
+                for i in 1..=100 {
+                    assert!(futures_lite::future::poll_once(sender.send(i))
+                        .await
+                        .is_none());
+                }
+                let wakers = crate::executor().reactor().shared_channel_wakers(sender.id);
+                done_tx.send(()).unwrap();
+                assert_eq!(wakers, 1, "one task queued {wakers} wakers");
+            })
+            .unwrap();
+        sender.join().unwrap();
+        receiver.join().unwrap();
     }
 }

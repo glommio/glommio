@@ -204,7 +204,7 @@ impl DmaFile {
     }
 
     async fn open_at(
-        dir: RawFd,
+        dir: Option<&GlommioFile>,
         path: &Path,
         flags: libc::c_int,
         mode: libc::mode_t,
@@ -242,7 +242,7 @@ impl DmaFile {
     }
 
     pub(super) async fn open_with_options<'a>(
-        dir: RawFd,
+        dir: Option<&'a GlommioFile>,
         path: &'a Path,
         opdesc: &'static str,
         opts: &'a OpenOptions,
@@ -253,7 +253,12 @@ impl DmaFile {
             | (opts.custom_flags as libc::c_int & !libc::O_ACCMODE);
 
         let res = DmaFile::open_at(dir, path, flags, opts.mode).await;
-        Ok(enhanced_try!(res, opdesc, Some(path), None)?)
+        Ok(enhanced_try!(
+            res,
+            opdesc,
+            Some(GlommioFile::named_under(dir, path)),
+            None
+        )?)
     }
 
     pub(super) fn attach_scheduler(&self) {

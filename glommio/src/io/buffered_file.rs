@@ -104,7 +104,7 @@ impl BufferedFile {
     }
 
     pub(super) async fn open_with_options<'a>(
-        dir: RawFd,
+        dir: Option<&'a GlommioFile>,
         path: &'a Path,
         opdesc: &'static str,
         opts: &'a OpenOptions,
@@ -115,7 +115,14 @@ impl BufferedFile {
             | (opts.custom_flags as libc::c_int & !libc::O_ACCMODE);
         GlommioFile::open_at(dir, path, flags, opts.mode)
             .await
-            .map_err(|source| GlommioError::create_enhanced(source, opdesc, Some(path), None))
+            .map_err(|source| {
+                GlommioError::create_enhanced(
+                    source,
+                    opdesc,
+                    Some(GlommioFile::named_under(dir, path)),
+                    None,
+                )
+            })
             .map(|file| BufferedFile { file })
     }
 

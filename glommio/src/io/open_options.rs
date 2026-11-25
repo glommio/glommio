@@ -212,7 +212,7 @@ impl OpenOptions {
     /// DMA file
     pub async fn dma_open<P: AsRef<Path>>(&self, path: P) -> Result<DmaFile> {
         DmaFile::open_with_options(
-            -1_i32,
+            None,
             path.as_ref(),
             if self.create || self.create_new || self.tmpfile {
                 "Creating"
@@ -228,7 +228,7 @@ impl OpenOptions {
     /// Buffered file
     pub async fn buffered_open<P: AsRef<Path>>(&self, path: P) -> Result<BufferedFile> {
         BufferedFile::open_with_options(
-            -1_i32,
+            None,
             path.as_ref(),
             if self.create || self.create_new || self.tmpfile {
                 "Creating"

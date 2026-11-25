@@ -452,8 +452,17 @@ impl TaskQueue {
         }
     }
 
+    /// Charges `delta` of runtime to this queue, scaled by its shares, and
+    /// returns the new vruntime, or `None` when adding it would overflow.
+    ///
+    /// The scaling is done in 128 bits: at one share the product passes
+    /// `u64::MAX` once a single run exceeds about 73 minutes, though the
+    /// shifted result still fits. A delta too large to fit even then saturates.
     fn account_vruntime(&mut self, delta: Duration) -> Option<u64> {
-        let delta_scaled = (self.stats.reciprocal_shares * (delta.as_nanos() as u64)) >> 12;
+        let delta_scaled =
+            (u128::from(self.stats.reciprocal_shares).saturating_mul(delta.as_nanos()) >> 12)
+                .try_into()
+                .unwrap_or(u64::MAX);
         self.stats.runtime += delta;
         self.stats.queue_selected += 1;
         self.active = !self.runnables.is_empty();
@@ -3517,6 +3526,40 @@ mod test {
             }
             await_eventfd_count(initial_eventfds, "after 100 rounds");
         }
+    }
+
+    /// A queue that runs for hours at one share scales its runtime past
+    /// `u64`'s range before the shift brings it back, and a run longer than
+    /// the vruntime can hold at all pins it at the top.
+    #[test]
+    fn a_long_run_at_one_share_accounts_its_vruntime_without_overflow() {
+        let ex = LocalExecutor::default();
+        let queue = TaskQueue::new(
+            Default::default(),
+            "long",
+            Shares::Static(1),
+            IoRequirements::default(),
+            0,
+            ex.task_registry(),
+        );
+        let two_hours = Duration::from_secs(2 * 3600);
+        assert_eq!(
+            queue.borrow_mut().account_vruntime(two_hours),
+            Some(1024 * two_hours.as_nanos() as u64)
+        );
+
+        let queue = TaskQueue::new(
+            Default::default(),
+            "longer",
+            Shares::Static(1),
+            IoRequirements::default(),
+            0,
+            ex.task_registry(),
+        );
+        assert_eq!(
+            queue.borrow_mut().account_vruntime(Duration::MAX),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

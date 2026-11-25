@@ -575,16 +575,16 @@ impl Reactor {
 
         if let Some(scheduler) = scheduler {
             if let Some(source) =
-                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
+                scheduler.consume_scheduled(pos..pos.saturating_add(size as u64), Some(&self.sys))
             {
                 source
             } else {
                 self.sys.read_dma(&source, pos, size);
-                scheduler.schedule(source, pos..pos + size as u64)
+                scheduler.schedule(source, pos..pos.saturating_add(size as u64))
             }
         } else {
             self.sys.read_dma(&source, pos, size);
-            ScheduledSource::new_raw(source, pos..pos + size as u64)
+            ScheduledSource::new_raw(source, pos..pos.saturating_add(size as u64))
         }
     }
 
@@ -604,16 +604,16 @@ impl Reactor {
 
         if let Some(scheduler) = scheduler {
             if let Some(source) =
-                scheduler.consume_scheduled(pos..pos + size as u64, Some(&self.sys))
+                scheduler.consume_scheduled(pos..pos.saturating_add(size as u64), Some(&self.sys))
             {
                 source
             } else {
                 self.sys.read_buffered(&source, pos, size);
-                scheduler.schedule(source, pos..pos + size as u64)
+                scheduler.schedule(source, pos..pos.saturating_add(size as u64))
             }
         } else {
             self.sys.read_buffered(&source, pos, size);
-            ScheduledSource::new_raw(source, pos..pos + size as u64)
+            ScheduledSource::new_raw(source, pos..pos.saturating_add(size as u64))
         }
     }
 

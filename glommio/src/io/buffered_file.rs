@@ -510,4 +510,19 @@ mod test {
             file.close().await.unwrap();
         }
     );
+
+    buffered_file_test!(a_buffered_read_at_the_last_offsets_is_refused, path, _k, {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .buffered_open(path.join("testfile"))
+            .await
+            .unwrap();
+        file.write_at(vec![7; 4096], 0).await.unwrap();
+        file.read_at(u64::MAX - 4095, 8192)
+            .await
+            .expect_err("a read past the largest offset succeeded");
+        file.close().await.unwrap();
+    });
 }

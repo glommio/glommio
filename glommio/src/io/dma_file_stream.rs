@@ -193,11 +193,17 @@ struct DmaStreamReaderState {
 }
 
 impl DmaStreamReaderState {
-    fn discard_buffer(&mut self, id: u64) {
-        self.buffermap.remove(&id);
-        if let Some(handle) = self.pending.remove(&id) {
-            handle.cancel();
-        }
+    /// Drops the buffers before `id`, cached or still being read. Only the
+    /// read-ahead window is held, so this looks at what is there rather than
+    /// at every id a long skip passed over.
+    fn discard_buffers_before(&mut self, id: u64) {
+        self.buffermap.retain(|&held, _| held >= id);
+        self.pending.retain(|&held, handle| {
+            if held < id {
+                handle.cancel();
+            }
+            held >= id
+        });
     }
 
     fn replenish_read_ahead(&mut self, state: Rc<RefCell<Self>>, file: Rc<DmaFile>) {
@@ -209,7 +215,7 @@ impl DmaStreamReaderState {
     fn fill_buffer(&mut self, read_state: Rc<RefCell<Self>>, file: Rc<DmaFile>) {
         let pos = self.buffer_read_ahead_current_pos;
         if self.fetch_buffer_at(pos, read_state, file) {
-            self.buffer_read_ahead_current_pos += self.buffer_size;
+            self.buffer_read_ahead_current_pos = pos.saturating_add(self.buffer_size);
         }
     }
 
@@ -470,7 +476,9 @@ impl DmaStreamReader {
     pub fn skip(&mut self, bytes: u64) {
         let mut state = self.state.borrow_mut();
         let buffer_id = state.buffer_id(self.current_pos);
-        self.current_pos = std::cmp::min(self.current_pos.saturating_add(bytes), self.end);
+        if self.current_pos < self.end {
+            self.current_pos = std::cmp::min(self.current_pos.saturating_add(bytes), self.end);
+        }
         let new_buffer_id = state.buffer_id(self.current_pos);
         if buffer_id != new_buffer_id {
             let candidate_read_ahead_pos = self.current_pos - self.current_pos % self.buffer_size;
@@ -479,9 +487,7 @@ impl DmaStreamReader {
                 candidate_read_ahead_pos,
             );
 
-            for id in buffer_id..new_buffer_id {
-                state.discard_buffer(id);
-            }
+            state.discard_buffers_before(new_buffer_id);
             state.replenish_read_ahead(self.state.clone(), self.file.clone());
         }
     }
@@ -2962,6 +2968,42 @@ mod test {
         assert_eq!(reader.read(&mut buf).await.unwrap(), 0);
         reader.close().await.unwrap();
     });
+
+    file_stream_read_test!(skipping_from_past_the_end_does_not_move_back, path, _k, file, _file_size: 8192, {
+        let mut reader = DmaStreamReaderBuilder::new(file)
+            .with_start_pos(4096)
+            .with_end_pos(1024)
+            .with_buffer_size(1 << 10)
+            .build();
+        reader.skip(1);
+        assert_eq!(reader.current_pos(), 4096);
+        reader.close().await.unwrap();
+    });
+
+    /// A reader with no end skipped to the last position must not walk every
+    /// buffer in between. It runs on a thread with a deadline so a walk shows
+    /// as a failed assertion rather than a hung test run.
+    #[test]
+    fn skipping_to_the_end_of_an_unbounded_reader_returns_at_once() {
+        let dir = make_test_directories("skip-unbounded").remove(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            test_executor!(async move {
+                let file = DmaFile::create(dir.path.join("testfile")).await.unwrap();
+                let mut reader = DmaStreamReaderBuilder::new(file)
+                    .with_buffer_size(1 << 10)
+                    .build();
+                reader.skip(u64::MAX);
+                tx.send(reader.current_pos()).unwrap();
+                let _ = reader.close().await;
+            });
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(u64::MAX),
+            "skip did not return"
+        );
+    }
 
     file_stream_read_test!(asking_for_more_than_is_left_returns_what_is_left, path, _k, file, _file_size: 8192, {
         let mut reader = DmaStreamReaderBuilder::new(file)

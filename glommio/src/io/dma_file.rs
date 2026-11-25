@@ -2975,4 +2975,22 @@ pub(crate) mod test {
             file.close().await.unwrap();
         }
     );
+
+    dma_file_test!(
+        a_read_at_the_last_offsets_is_refused_rather_than_served_from_the_start,
+        path,
+        _k,
+        {
+            let data = (0..8192u32).map(|x| x as u8).collect::<Vec<_>>();
+            std::fs::write(path.join("f"), &data).unwrap();
+            let file = DmaFile::open(path.join("f")).await.unwrap();
+            file.attach_scheduler();
+            let held = file.read_at_aligned(0, 8192).await.unwrap();
+            file.read_at_aligned(u64::MAX - 4095, 8192)
+                .await
+                .expect_err("a range past u64::MAX was served from a held read");
+            drop(held);
+            file.close().await.unwrap();
+        }
+    );
 }

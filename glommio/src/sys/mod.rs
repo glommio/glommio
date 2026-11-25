@@ -72,8 +72,10 @@ pub(crate) fn truncate_file(fd: RawFd, size: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// A duplicate of `fd` that is closed on exec, like every descriptor glommio
+/// opens.
 pub(crate) fn duplicate_file(fd: RawFd) -> io::Result<RawFd> {
-    syscall!(dup(fd))
+    syscall!(fcntl(fd, libc::F_DUPFD_CLOEXEC, 0))
 }
 
 pub(crate) fn create_eventfd() -> io::Result<RawFd> {

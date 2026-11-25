@@ -550,4 +550,20 @@ mod test {
             .await
             .unwrap();
     });
+
+    /// The buffer is zeroed memory the kernel never touches: `/dev/null`
+    /// counts the bytes without reading them.
+    #[test]
+    fn a_buffered_write_longer_than_the_kernel_moves_at_once_is_short_not_empty() {
+        test_executor!(async move {
+            let file = OpenOptions::new()
+                .write(true)
+                .buffered_open("/dev/null")
+                .await
+                .unwrap();
+            let written = file.write_at(vec![0; 1 << 32], 0).await.unwrap();
+            assert_eq!(written, crate::sys::MAX_RW_COUNT);
+            file.close().await.unwrap();
+        });
+    }
 }

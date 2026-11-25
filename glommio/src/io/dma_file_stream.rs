@@ -380,6 +380,12 @@ impl DmaStreamReader {
     ///
     /// It is illegal to close the [`DmaStreamReader`] more than once.
     ///
+    /// If a clone of the file made with [`DmaFile::clone`] or
+    /// [`OwnedDmaFile`](crate::io::OwnedDmaFile) still holds the descriptor,
+    /// this returns [`GlommioError::CanNotBeClosed`](crate::GlommioError::CanNotBeClosed)
+    /// and the descriptor stays open for that clone, as [`DmaFile::close`]
+    /// does. An error the stream met earlier is returned in its place.
+    ///
     /// # Examples
     /// ```no_run
     /// use glommio::{
@@ -403,12 +409,12 @@ impl DmaStreamReader {
         let to_cancel = handles.len();
         let cancelled = stream::iter(handles).then(|f| f).count().await;
         assert_eq!(to_cancel, cancelled);
-        self.file.close_rc().await.unwrap();
+        let closed = self.file.close_rc().await;
 
         let mut state = self.state.borrow_mut();
         match state.error.take() {
             Some(err) => Err(err.into()),
-            None => Ok(()),
+            None => closed.map(drop),
         }
     }
 
@@ -1731,6 +1737,22 @@ mod test {
             _ => panic!("unexpected success"),
         }
         reader.close().await.unwrap();
+    });
+
+    file_stream_read_test!(closing_a_reader_while_a_clone_holds_the_file_is_an_error, path, _k, file, _file_size: 4096, {
+        let clone = file.clone();
+        let reader = DmaStreamReaderBuilder::new(file).build();
+        assert!(matches!(
+            reader.close().await,
+            Err(crate::GlommioError::CanNotBeClosed(..))
+        ));
+        let owned: crate::io::OwnedDmaFile = clone.clone().into();
+        let reader = DmaStreamReaderBuilder::new(clone).build();
+        assert!(matches!(
+            reader.close().await,
+            Err(crate::GlommioError::CanNotBeClosed(..))
+        ));
+        DmaFile::from(owned).close().await.unwrap();
     });
 
     file_stream_write_test!(write_nothing, path, _k, filename, file, {

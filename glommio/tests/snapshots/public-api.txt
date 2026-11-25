@@ -2564,6 +2564,61 @@ pub unsafe fn glommio::net::TcpListener::init(init: <T as crossbeam_epoch::atomi
 impl<T> tracing::instrument::Instrument for glommio::net::TcpListener
 impl<T> tracing::instrument::WithSubscriber for glommio::net::TcpListener
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::TcpListener where T: ?core::marker::Sized
+pub struct glommio::net::TcpListenerBuilder
+impl glommio::net::TcpListenerBuilder
+pub fn glommio::net::TcpListenerBuilder::backlog(self, backlog: u32) -> Self
+pub fn glommio::net::TcpListenerBuilder::bind<A: std::net::socket_addr::ToSocketAddrs>(&self, addr: A) -> glommio::Result<glommio::net::TcpListener>
+pub fn glommio::net::TcpListenerBuilder::new() -> Self
+pub fn glommio::net::TcpListenerBuilder::reuse_address(self, reuse_address: bool) -> Self
+pub fn glommio::net::TcpListenerBuilder::reuse_port(self, reuse_port: bool) -> Self
+impl core::clone::Clone for glommio::net::TcpListenerBuilder
+pub fn glommio::net::TcpListenerBuilder::clone(&self) -> glommio::net::TcpListenerBuilder
+impl core::default::Default for glommio::net::TcpListenerBuilder
+pub fn glommio::net::TcpListenerBuilder::default() -> Self
+impl core::fmt::Debug for glommio::net::TcpListenerBuilder
+pub fn glommio::net::TcpListenerBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for glommio::net::TcpListenerBuilder
+impl core::marker::Freeze for glommio::net::TcpListenerBuilder
+impl core::marker::Send for glommio::net::TcpListenerBuilder
+impl core::marker::Sync for glommio::net::TcpListenerBuilder
+impl core::marker::Unpin for glommio::net::TcpListenerBuilder
+impl core::marker::UnsafeUnpin for glommio::net::TcpListenerBuilder
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::net::TcpListenerBuilder
+impl core::panic::unwind_safe::UnwindSafe for glommio::net::TcpListenerBuilder
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::net::TcpListenerBuilder where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::net::TcpListenerBuilder where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::net::TcpListenerBuilder where U: core::convert::From<T>
+pub fn glommio::net::TcpListenerBuilder::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::net::TcpListenerBuilder where U: core::convert::Into<T>
+pub type glommio::net::TcpListenerBuilder::Error = core::convert::Infallible
+pub fn glommio::net::TcpListenerBuilder::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::net::TcpListenerBuilder where U: core::convert::TryFrom<T>
+pub type glommio::net::TcpListenerBuilder::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::net::TcpListenerBuilder::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::net::TcpListenerBuilder where T: core::clone::Clone
+pub type glommio::net::TcpListenerBuilder::Owned = T
+pub fn glommio::net::TcpListenerBuilder::clone_into(&self, target: &mut T)
+pub fn glommio::net::TcpListenerBuilder::to_owned(&self) -> T
+impl<T> core::any::Any for glommio::net::TcpListenerBuilder where T: 'static + ?core::marker::Sized
+pub fn glommio::net::TcpListenerBuilder::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::net::TcpListenerBuilder where T: ?core::marker::Sized
+pub fn glommio::net::TcpListenerBuilder::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::net::TcpListenerBuilder where T: ?core::marker::Sized
+pub fn glommio::net::TcpListenerBuilder::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::net::TcpListenerBuilder where T: core::clone::Clone
+pub unsafe fn glommio::net::TcpListenerBuilder::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::net::TcpListenerBuilder
+pub fn glommio::net::TcpListenerBuilder::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::net::TcpListenerBuilder
+pub type glommio::net::TcpListenerBuilder::Init = T
+pub const glommio::net::TcpListenerBuilder::ALIGN: usize
+pub unsafe fn glommio::net::TcpListenerBuilder::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::net::TcpListenerBuilder::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::net::TcpListenerBuilder::drop(ptr: usize)
+pub unsafe fn glommio::net::TcpListenerBuilder::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::net::TcpListenerBuilder
+impl<T> tracing::instrument::WithSubscriber for glommio::net::TcpListenerBuilder
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::TcpListenerBuilder where T: ?core::marker::Sized
 pub struct glommio::net::TcpReadHalf<B: glommio::net::RxBuf>
 impl<B: glommio::net::RxBuf> glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::local_addr(&self) -> glommio::Result<core::net::socket_addr::SocketAddr>

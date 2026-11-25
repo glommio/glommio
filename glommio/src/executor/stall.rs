@@ -73,7 +73,10 @@ pub trait StallDetectionHandler: std::fmt::Debug + Send + Sync {
     }
 
     /// What signal number to use; see values in libc::SIG*.
-    /// The default is [`nix::libc::SIGUSR1`].
+    /// The default is [`nix::libc::SIGUSR1`]. `SIGKILL`, `SIGSTOP`,
+    /// `SIGILL`, `SIGFPE` and `SIGSEGV` cannot be handled, and enabling
+    /// stall detection with one of them fails with
+    /// [`std::io::ErrorKind::InvalidInput`].
     fn signal(&self) -> u8 {
         nix::libc::SIGUSR1 as u8
     }
@@ -117,6 +120,13 @@ impl StallDetector {
         executor_id: usize,
         stall_handler: Box<dyn StallDetectionHandler + 'static>,
     ) -> std::io::Result<StallDetector> {
+        let sig = stall_handler.signal();
+        if signal_hook::consts::FORBIDDEN.contains(&sig.into()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("signal {sig} cannot be used for stall detection, signal-hook forbids it"),
+            ));
+        }
         let timer = Arc::new(
             sys::timerfd::TimerFd::new(
                 sys::timerfd::ClockId::CLOCK_MONOTONIC,
@@ -125,7 +135,6 @@ impl StallDetector {
             .map_err(std::io::Error::from)?,
         );
         let terminated = Arc::new(AtomicBool::new(false));
-        let sig = stall_handler.signal();
         let (tx, rx) = crossbeam::channel::bounded(1 << 10);
         let signal_id = StallDetector::install_handler(tx, sig)?;
         let timer_handler =
@@ -565,6 +574,28 @@ mod test {
                     .is_err());
             }
             assert_eq!(threads_and_timerfds(), before);
+        }
+
+        /// signal-hook panics when asked to handle one of its forbidden
+        /// signals, so the detector must refuse them first. The fork keeps
+        /// the counts and the `SIGUSR1` handler installed afterwards out of
+        /// the other tests.
+        #[test]
+        fn a_forbidden_signal_is_an_error_and_the_executor_still_works() {
+            let ex = LocalExecutor::default();
+            let before = threads_and_timerfds();
+            for &signal in signal_hook::consts::FORBIDDEN {
+                let err = std::io::Error::from(
+                    ex.detect_stalls(Some(Box::new(TestHandler::new(signal as u8))))
+                        .unwrap_err(),
+                );
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(err.to_string().contains(&format!("signal {signal} ")), "{err}");
+            }
+            assert_eq!(threads_and_timerfds(), before);
+            ex.detect_stalls(Some(Box::new(TestHandler::new(nix::libc::SIGUSR1 as u8))))
+                .unwrap();
+            assert_eq!(ex.run(async { 1 + 1 }), 2);
         }
     }
 }

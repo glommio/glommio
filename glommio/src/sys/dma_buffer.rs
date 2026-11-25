@@ -38,6 +38,18 @@ impl SysAlloc {
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.data.as_ptr()
     }
+
+    /// An aligned, owned copy of `bytes`. An empty slice still gets one byte,
+    /// because a zero-sized layout cannot be allocated, and that byte is never
+    /// addressable through the buffer.
+    fn copy_of(bytes: &[u8]) -> Self {
+        let layout = Layout::from_size_align(bytes.len().max(1), 4096).unwrap();
+        let data = unsafe { alloc::alloc::alloc(layout) };
+        let data =
+            ptr::NonNull::new(data).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout));
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_ptr(), bytes.len()) };
+        SysAlloc { data, layout }
+    }
 }
 
 impl Drop for SysAlloc {
@@ -72,7 +84,7 @@ impl BufferStorage {
             BufferStorage::Uring(x) => x.as_mut_ptr(),
             BufferStorage::EventFd(x) => *x,
             BufferStorage::ReadResult(_) => {
-                unreachable!("Attempt to access immutable ReadResult as a mutable pointer")
+                unreachable!("DmaBuffer::make_owned replaces ReadResult storage before any write")
             }
         }
     }
@@ -154,7 +166,19 @@ impl DmaBuffer {
     /// Returns a representation of the current addressable contents of this
     /// `DmaBuffer` as mutable pointer
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.make_owned();
         unsafe { self.storage.as_mut_ptr().add(self.trim) }
+    }
+
+    /// A buffer made from a [`ReadResult`] shares its bytes with every other
+    /// clone of that read, so before the first write the addressable bytes
+    /// are copied into storage this buffer owns alone.
+    fn make_owned(&mut self) {
+        if let BufferStorage::ReadResult(shared) = &self.storage {
+            let owned = SysAlloc::copy_of(&shared[self.trim..self.trim + self.size]);
+            self.storage = BufferStorage::Sys(owned);
+            self.trim = 0;
+        }
     }
 
     /// Returns a representation of the current addressable contents of this
@@ -191,6 +215,23 @@ impl From<ReadResult> for DmaBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        io::{DmaFile, OpenOptions},
+        test_utils::make_test_directories,
+        LocalExecutor,
+    };
+    use std::path::Path;
+
+    async fn read_write(path: &Path) -> DmaFile {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .dma_open(path)
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn new_buffer_does_not_expose_freed_memory() {
@@ -199,5 +240,70 @@ mod tests {
         drop(first);
         let second = DmaBuffer::new(1 << 16).unwrap();
         assert!(second.as_bytes().iter().all(|&b| b == 0));
+    }
+
+    /// `From<ReadResult>` is public and safe, so every method on the buffer it
+    /// builds has to work, and writing through it must not reach the storage
+    /// other clones of the read still share.
+    #[test]
+    fn a_buffer_from_a_read_can_be_mutated_without_changing_the_read() {
+        for dir in make_test_directories("dma-buffer-from-read") {
+            let path = dir.path.clone();
+            LocalExecutor::default().run(async move {
+                let file = read_write(&path.join("testfile")).await;
+                let mut source = file.alloc_dma_buffer(8192);
+                source.as_bytes_mut().fill(0xaa);
+                file.write_at(source, 0).await.unwrap();
+
+                let read = file.read_at(0, 4096).await.unwrap();
+                let other = read.clone();
+                let mut buffer: DmaBuffer = read.into();
+                buffer.as_bytes_mut().fill(0x55);
+                assert_eq!(buffer.len(), 4096);
+                assert!(buffer.as_bytes().iter().all(|&b| b == 0x55));
+                assert!(other.iter().all(|&b| b == 0xaa));
+
+                file.write_at(buffer, 4096).await.unwrap();
+                let back = file.read_at(4096, 4096).await.unwrap();
+                assert!(back.iter().all(|&b| b == 0x55));
+                assert!(other.iter().all(|&b| b == 0xaa));
+                file.close().await.unwrap();
+            });
+        }
+    }
+
+    /// A trimmed or sliced read keeps its length and contents when it is first
+    /// mutated, and an empty one still hands out an empty slice.
+    #[test]
+    fn a_sliced_trimmed_or_empty_read_keeps_its_bytes_when_mutated() {
+        for dir in make_test_directories("dma-buffer-from-sliced-read") {
+            let path = dir.path.clone();
+            LocalExecutor::default().run(async move {
+                let file = read_write(&path.join("testfile")).await;
+                let mut source = file.alloc_dma_buffer(4096);
+                for (i, b) in source.as_bytes_mut().iter_mut().enumerate() {
+                    *b = i as u8;
+                }
+                file.write_at(source, 0).await.unwrap();
+
+                let read = file.read_at(0, 4096).await.unwrap();
+                let slice = crate::io::ReadResult::slice(&read, 10, 100).unwrap();
+                let mut buffer: DmaBuffer = slice.into();
+                buffer.trim_to_size(50);
+                buffer.as_bytes_mut()[0] = 0xff;
+                assert_eq!(buffer.len(), 50);
+                assert_eq!(buffer.as_bytes()[0], 0xff);
+                for (i, &b) in buffer.as_bytes().iter().enumerate().skip(1) {
+                    assert_eq!(b, (i + 10) as u8);
+                }
+                assert_eq!(read[10], 10);
+
+                let past_end = file.read_at(1 << 20, 4096).await.unwrap();
+                let mut empty: DmaBuffer = past_end.into();
+                assert!(empty.as_bytes_mut().is_empty());
+                assert!(!empty.as_mut_ptr().is_null());
+                file.close().await.unwrap();
+            });
+        }
     }
 }

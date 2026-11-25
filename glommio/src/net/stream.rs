@@ -24,15 +24,43 @@ use crate::Result;
 /// A receive buffer on loan to the kernel.
 ///
 /// It lives in the `Source` until the completion arrives, so the read can
-/// outlive the future that started it.
+/// outlive the future that started it. An [`RxBuf`] opts in to completion
+/// reads by handing its memory over in one of these from
+/// [`take_kernel_buffer`](RxBuf::take_kernel_buffer), and gets it back in
+/// [`restore_kernel_buffer`](RxBuf::restore_kernel_buffer).
 #[derive(Debug)]
 pub struct OwnedRxBuf {
     memory: Vec<u8>,
 }
 
 impl OwnedRxBuf {
-    pub(crate) fn new(memory: Vec<u8>) -> Self {
+    /// Wraps memory to lend to the kernel.
+    ///
+    /// The kernel writes into `memory[..memory.len()]`, so the vector's
+    /// length is what it may fill, not its capacity: `vec![0; 8192]` lends
+    /// 8 KiB, `Vec::with_capacity(8192)` lends nothing.
+    ///
+    /// # Panics
+    ///
+    /// If `memory` is empty. A read into no room completes with 0 bytes,
+    /// which is what the end of the stream looks like, so lending it would
+    /// silently close a healthy connection.
+    pub fn new(memory: Vec<u8>) -> Self {
+        assert!(
+            !memory.is_empty(),
+            "an OwnedRxBuf needs a non-zero length: the kernel fills memory[..len], \
+             and a read into no room looks like the end of the stream. \
+             Use vec![0; size] rather than Vec::with_capacity(size)"
+        );
         OwnedRxBuf { memory }
+    }
+
+    /// Takes the memory back, with whatever the kernel wrote at its start.
+    ///
+    /// How much it wrote arrives separately, through
+    /// [`RxBuf::handle_result`].
+    pub fn into_vec(self) -> Vec<u8> {
+        self.memory
     }
 
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -107,8 +135,9 @@ pub trait RxBuf {
         None
     }
 
-    /// Takes the buffer back, empty. The byte count arrives separately,
-    /// through [`handle_result`](Self::handle_result).
+    /// Takes the buffer back, with what the kernel wrote at its start. How
+    /// many bytes that was arrives separately, through
+    /// [`handle_result`](Self::handle_result), unless the read failed.
     fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
         let _ = buffer;
         unreachable!(
@@ -262,7 +291,7 @@ impl RxBuf for Preallocated {
     }
 
     fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
-        self.buf = buffer.memory;
+        self.buf = buffer.into_vec();
         self.head = 0;
         self.tail = 0;
     }

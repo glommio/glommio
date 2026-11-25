@@ -2337,8 +2337,8 @@ pub fn glommio::net::NonBuffered::handle_result(&mut self, _result: usize)
 pub fn glommio::net::NonBuffered::is_empty(&self) -> bool
 pub fn glommio::net::NonBuffered::peek(&self, _buf: &mut [u8]) -> usize
 pub fn glommio::net::NonBuffered::read(&mut self, _buf: &mut [u8]) -> usize
-pub fn glommio::net::NonBuffered::restore_kernel_buffer(&mut self, buffer: glommio::net::stream::OwnedRxBuf)
-pub fn glommio::net::NonBuffered::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::stream::OwnedRxBuf>
+pub fn glommio::net::NonBuffered::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::NonBuffered::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
 pub fn glommio::net::NonBuffered::unfilled(&mut self) -> &mut [u8]
 impl core::marker::Freeze for glommio::net::NonBuffered
 impl core::marker::Send for glommio::net::NonBuffered
@@ -2375,6 +2375,47 @@ pub unsafe fn glommio::net::NonBuffered::init(init: <T as crossbeam_epoch::atomi
 impl<T> tracing::instrument::Instrument for glommio::net::NonBuffered
 impl<T> tracing::instrument::WithSubscriber for glommio::net::NonBuffered
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::NonBuffered where T: ?core::marker::Sized
+pub struct glommio::net::OwnedRxBuf
+impl glommio::net::OwnedRxBuf
+pub fn glommio::net::OwnedRxBuf::into_vec(self) -> alloc::vec::Vec<u8>
+pub fn glommio::net::OwnedRxBuf::new(memory: alloc::vec::Vec<u8>) -> Self
+impl core::fmt::Debug for glommio::net::OwnedRxBuf
+pub fn glommio::net::OwnedRxBuf::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for glommio::net::OwnedRxBuf
+impl core::marker::Send for glommio::net::OwnedRxBuf
+impl core::marker::Sync for glommio::net::OwnedRxBuf
+impl core::marker::Unpin for glommio::net::OwnedRxBuf
+impl core::marker::UnsafeUnpin for glommio::net::OwnedRxBuf
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::net::OwnedRxBuf
+impl core::panic::unwind_safe::UnwindSafe for glommio::net::OwnedRxBuf
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::net::OwnedRxBuf where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::net::OwnedRxBuf where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::net::OwnedRxBuf where U: core::convert::From<T>
+pub fn glommio::net::OwnedRxBuf::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::net::OwnedRxBuf where U: core::convert::Into<T>
+pub type glommio::net::OwnedRxBuf::Error = core::convert::Infallible
+pub fn glommio::net::OwnedRxBuf::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::net::OwnedRxBuf where U: core::convert::TryFrom<T>
+pub type glommio::net::OwnedRxBuf::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::net::OwnedRxBuf::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for glommio::net::OwnedRxBuf where T: 'static + ?core::marker::Sized
+pub fn glommio::net::OwnedRxBuf::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::net::OwnedRxBuf where T: ?core::marker::Sized
+pub fn glommio::net::OwnedRxBuf::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::net::OwnedRxBuf where T: ?core::marker::Sized
+pub fn glommio::net::OwnedRxBuf::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for glommio::net::OwnedRxBuf
+pub fn glommio::net::OwnedRxBuf::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::net::OwnedRxBuf
+pub type glommio::net::OwnedRxBuf::Init = T
+pub const glommio::net::OwnedRxBuf::ALIGN: usize
+pub unsafe fn glommio::net::OwnedRxBuf::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::net::OwnedRxBuf::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::net::OwnedRxBuf::drop(ptr: usize)
+pub unsafe fn glommio::net::OwnedRxBuf::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::net::OwnedRxBuf
+impl<T> tracing::instrument::WithSubscriber for glommio::net::OwnedRxBuf
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::OwnedRxBuf where T: ?core::marker::Sized
 pub struct glommio::net::Preallocated
 impl glommio::net::Preallocated
 pub fn glommio::net::Preallocated::new(size: usize) -> Self
@@ -2391,8 +2432,8 @@ pub fn glommio::net::Preallocated::handle_result(&mut self, result: usize)
 pub fn glommio::net::Preallocated::is_empty(&self) -> bool
 pub fn glommio::net::Preallocated::peek(&self, buf: &mut [u8]) -> usize
 pub fn glommio::net::Preallocated::read(&mut self, buf: &mut [u8]) -> usize
-pub fn glommio::net::Preallocated::restore_kernel_buffer(&mut self, buffer: glommio::net::stream::OwnedRxBuf)
-pub fn glommio::net::Preallocated::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::stream::OwnedRxBuf>
+pub fn glommio::net::Preallocated::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::Preallocated::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
 pub fn glommio::net::Preallocated::unfilled(&mut self) -> &mut [u8]
 impl core::marker::Freeze for glommio::net::Preallocated
 impl core::marker::Send for glommio::net::Preallocated
@@ -3020,8 +3061,8 @@ pub fn glommio::net::RxBuf::handle_result(&mut self, result: usize)
 pub fn glommio::net::RxBuf::is_empty(&self) -> bool
 pub fn glommio::net::RxBuf::peek(&self, buf: &mut [u8]) -> usize
 pub fn glommio::net::RxBuf::read(&mut self, buf: &mut [u8]) -> usize
-pub fn glommio::net::RxBuf::restore_kernel_buffer(&mut self, buffer: glommio::net::stream::OwnedRxBuf)
-pub fn glommio::net::RxBuf::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::stream::OwnedRxBuf>
+pub fn glommio::net::RxBuf::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::RxBuf::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
 pub fn glommio::net::RxBuf::unfilled(&mut self) -> &mut [u8]
 impl glommio::net::RxBuf for glommio::net::NonBuffered
 pub fn glommio::net::NonBuffered::as_bytes(&self) -> &[u8]
@@ -3031,8 +3072,8 @@ pub fn glommio::net::NonBuffered::handle_result(&mut self, _result: usize)
 pub fn glommio::net::NonBuffered::is_empty(&self) -> bool
 pub fn glommio::net::NonBuffered::peek(&self, _buf: &mut [u8]) -> usize
 pub fn glommio::net::NonBuffered::read(&mut self, _buf: &mut [u8]) -> usize
-pub fn glommio::net::NonBuffered::restore_kernel_buffer(&mut self, buffer: glommio::net::stream::OwnedRxBuf)
-pub fn glommio::net::NonBuffered::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::stream::OwnedRxBuf>
+pub fn glommio::net::NonBuffered::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::NonBuffered::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
 pub fn glommio::net::NonBuffered::unfilled(&mut self) -> &mut [u8]
 impl glommio::net::RxBuf for glommio::net::Preallocated
 pub fn glommio::net::Preallocated::as_bytes(&self) -> &[u8]
@@ -3042,8 +3083,8 @@ pub fn glommio::net::Preallocated::handle_result(&mut self, result: usize)
 pub fn glommio::net::Preallocated::is_empty(&self) -> bool
 pub fn glommio::net::Preallocated::peek(&self, buf: &mut [u8]) -> usize
 pub fn glommio::net::Preallocated::read(&mut self, buf: &mut [u8]) -> usize
-pub fn glommio::net::Preallocated::restore_kernel_buffer(&mut self, buffer: glommio::net::stream::OwnedRxBuf)
-pub fn glommio::net::Preallocated::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::stream::OwnedRxBuf>
+pub fn glommio::net::Preallocated::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::Preallocated::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
 pub fn glommio::net::Preallocated::unfilled(&mut self) -> &mut [u8]
 pub mod glommio::prelude
 pub mod glommio::prelude::executor

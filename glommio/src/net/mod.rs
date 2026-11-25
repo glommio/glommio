@@ -104,9 +104,8 @@ mod stream;
 mod tcp_socket;
 mod udp_socket;
 mod unix;
-pub(crate) use self::stream::OwnedRxBuf;
 pub use self::{
-    stream::{Buffered, NonBuffered, Preallocated, RxBuf},
+    stream::{Buffered, NonBuffered, OwnedRxBuf, Preallocated, RxBuf},
     tcp_socket::{AcceptedTcpStream, TcpListener, TcpReadHalf, TcpStream, TcpWriteHalf},
     udp_socket::UdpSocket,
     unix::{

@@ -5,15 +5,16 @@
 //! only supply if the traits involved can be named from outside the crate.
 //!
 //! An integration test sees exactly what a dependent crate sees: this file
-//! compiles only if `RxBuf` and `NonBuffered` are reachable.
+//! compiles only if `RxBuf`, `NonBuffered` and `OwnedRxBuf` are reachable.
 //! From inside the crate they always were, which is why no unit test could
 //! notice that `buffered_with` had exactly one possible argument.
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::{
-    net::{Buffered, NonBuffered, RxBuf, TcpListener, TcpStream},
+    net::{Buffered, NonBuffered, OwnedRxBuf, RxBuf, TcpListener, TcpStream},
     LocalExecutor,
 };
+use std::{cell::Cell, rc::Rc, time::Duration};
 
 /// The smallest thing that can hold bytes between the socket and the caller.
 ///
@@ -123,4 +124,104 @@ fn a_foreign_rx_buf_need_not_lend_its_buffer() {
         RxBuf::take_kernel_buffer(&mut buffer).is_none(),
         "the default must keep an implementation on the readiness path"
     );
+}
+
+/// The same buffer, opting in to completion reads, and counting what it lent
+/// and got back so the test can tell which path the read took.
+struct LendingBuffer {
+    inner: MyBuffer,
+    lent: Rc<Cell<usize>>,
+    restored: Rc<Cell<usize>>,
+}
+
+impl RxBuf for LendingBuffer {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        self.inner.read(buf)
+    }
+
+    fn peek(&self, buf: &mut [u8]) -> usize {
+        self.inner.peek(buf)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        self.inner.as_bytes()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt)
+    }
+
+    fn buffer_size(&self) -> usize {
+        self.inner.buffer_size()
+    }
+
+    fn handle_result(&mut self, result: usize) {
+        self.inner.handle_result(result)
+    }
+
+    fn unfilled(&mut self) -> &mut [u8] {
+        self.inner.unfilled()
+    }
+
+    fn take_kernel_buffer(&mut self) -> Option<OwnedRxBuf> {
+        self.lent.set(self.lent.get() + 1);
+        self.inner.head = 0;
+        self.inner.tail = 0;
+        Some(OwnedRxBuf::new(std::mem::take(&mut self.inner.bytes)))
+    }
+
+    fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
+        self.restored.set(self.restored.get() + 1);
+        self.inner.bytes = buffer.into_vec();
+        self.inner.head = 0;
+        self.inner.tail = 0;
+    }
+}
+
+impl Buffered for LendingBuffer {}
+
+#[test]
+fn a_foreign_rx_buf_can_lend_its_buffer_to_the_kernel() {
+    LocalExecutor::default().run(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let lent = Rc::new(Cell::new(0));
+        let restored = Rc::new(Cell::new(0));
+
+        let buffer = LendingBuffer {
+            inner: MyBuffer::default(),
+            lent: lent.clone(),
+            restored: restored.clone(),
+        };
+        let reader = glommio::spawn_local(async move {
+            let mut stream = listener.accept().await.unwrap().buffered_with(buffer);
+            let mut got = [0u8; 64];
+            let read = stream.read(&mut got).await.unwrap();
+            got[..read].to_vec()
+        })
+        .detach();
+
+        let mut writer = TcpStream::connect(addr).await.unwrap();
+        while lent.get() == 0 {
+            glommio::timer::sleep(Duration::from_millis(1)).await;
+        }
+        writer.write_all(b"filled by the kernel").await.unwrap();
+
+        assert_eq!(reader.await.unwrap(), b"filled by the kernel".to_vec());
+        assert_eq!(
+            (lent.get(), restored.get()),
+            (1, 1),
+            "the read went through the lent buffer and gave it back"
+        );
+    });
+}
+
+#[test]
+#[should_panic(expected = "non-zero length")]
+fn lending_an_empty_buffer_is_refused() {
+    let _ = OwnedRxBuf::new(Vec::with_capacity(4096));
 }

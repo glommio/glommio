@@ -398,6 +398,14 @@ impl StreamWriter {
         }
     }
 
+    /// The error for a write, flush or seek once closing has begun. The
+    /// writer's one source slot then holds the sync or close in flight,
+    /// which only `close` knows how to take back, and the file may be gone.
+    fn closed_error(&self) -> Option<io::Error> {
+        (!matches!(self.file_status, FileStatus::Open))
+            .then(|| io::Error::from_raw_os_error(libc::EBADF))
+    }
+
     /// Takes back the buffer a finished write used, without the bytes the
     /// write took. A write the kernel cut short leaves its tail at the front
     /// of the buffer, to go out with the next write as `write(2)` callers
@@ -536,6 +544,9 @@ macro_rules! do_seek {
                     return Poll::Pending;
                 }
                 Some(source) => {
+                    if let Some(Err(err)) = source.result() {
+                        return Poll::Ready(Err(err));
+                    }
                     let stype = source.extract_source_type();
                     let stat_buf: Statx = stype.try_into().unwrap();
                     stat_buf.stx_size.checked_add_signed(delta)
@@ -577,6 +588,9 @@ impl AsyncSeek for StreamWriter {
         cx: &mut Context<'_>,
         pos: SeekFrom,
     ) -> Poll<io::Result<u64>> {
+        if let Some(err) = self.closed_error() {
+            return Poll::Ready(Err(err));
+        }
         ready!(self.do_poll_flush(cx))?;
         let current = self.file_pos;
         do_seek!(
@@ -661,6 +675,9 @@ impl AsyncWrite for StreamWriter {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if let Some(err) = self.closed_error() {
+            return Poll::Ready(Err(err));
+        }
         if let Some(source) = ready!(take_completed(&mut self.source, cx)) {
             if let Err(x) = self.consume_flush_result(source) {
                 return Poll::Ready(Err(x));
@@ -677,6 +694,9 @@ impl AsyncWrite for StreamWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if let Some(err) = self.closed_error() {
+            return Poll::Ready(Err(err));
+        }
         self.do_poll_flush(cx)
     }
 
@@ -894,6 +914,48 @@ mod test {
                 - before;
             assert_eq!(writes, 3);
             assert_eq!(std::fs::read(&path).unwrap(), data);
+        });
+    }
+
+    /// A close cancelled while its sync is in flight leaves the writer
+    /// closing: writes and flushes are refused, not fed the sync's result,
+    /// and a second close finishes the job.
+    #[test]
+    fn a_writer_whose_close_was_cancelled_refuses_writes() {
+        let dir = make_test_directories("writer-cancelled-close").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("out");
+            let mut writer =
+                StreamWriterBuilder::new(BufferedFile::create(&path).await.unwrap()).build();
+            assert!(futures_lite::future::poll_once(writer.close())
+                .await
+                .is_none());
+            writer
+                .write(b"x")
+                .await
+                .expect_err("a write after a cancelled close");
+            writer
+                .flush()
+                .await
+                .expect_err("a flush after a cancelled close");
+            writer.close().await.unwrap();
+        });
+    }
+
+    /// Once closed, a writer refuses writes rather than buffering bytes that
+    /// can never reach the file.
+    #[test]
+    fn a_closed_writer_refuses_writes() {
+        let dir = make_test_directories("writer-closed").remove(0);
+        test_executor!(async move {
+            let path = dir.path.join("out");
+            let mut writer =
+                StreamWriterBuilder::new(BufferedFile::create(&path).await.unwrap()).build();
+            writer.write_all(b"abc").await.unwrap();
+            writer.close().await.unwrap();
+            writer.write(b"x").await.expect_err("a write after close");
+            writer.flush().await.expect_err("a flush after close");
+            assert_eq!(std::fs::read(&path).unwrap(), b"abc");
         });
     }
 

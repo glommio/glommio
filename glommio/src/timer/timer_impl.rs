@@ -770,6 +770,7 @@ impl TimerActionRepeat {
 mod test {
     use super::*;
     use crate::LocalExecutorBuilder;
+    use rusty_fork::rusty_fork_test;
     use std::{
         cell::{Cell, RefCell},
         rc::Rc,
@@ -1408,20 +1409,59 @@ mod test {
         handle.join().unwrap();
     }
 
-    #[test]
-    fn first_timer_finishes_with_expected_duration() {
-        test_executor!(async move {
-            let start = Instant::now();
-            Timer::new(Duration::from_millis(3)).await;
-            let elapsed = start.elapsed();
-            assert!(
-                elapsed >= Duration::from_millis(3),
-                "Timer expired too soon: {elapsed:?}"
+    /// Whether this process may issue private expedited `membarrier`
+    /// commands, which the kernel refuses until the process registers, or
+    /// `None` where the kernel does not offer them.
+    fn membarrier_registered() -> Option<bool> {
+        const QUERY: libc::c_int = 0;
+        const PRIVATE_EXPEDITED: libc::c_int = 1 << 3;
+        const REGISTER_PRIVATE_EXPEDITED: libc::c_int = 1 << 4;
+        let wanted = (PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED) as libc::c_long;
+        let offered = unsafe { libc::syscall(libc::SYS_membarrier, QUERY, 0) };
+        if offered < 0 || offered & wanted != wanted {
+            return None;
+        }
+        Some(unsafe { libc::syscall(libc::SYS_membarrier, PRIVATE_EXPEDITED, 0) } == 0)
+    }
+
+    rusty_fork_test! {
+        /// The first timer of a process sleeps for its duration, without
+        /// paying for the executor's `membarrier` registration, which took
+        /// 30-80ms when it waited for the first sleep. Building the executor
+        /// registers instead.
+        ///
+        /// Forked, because registration is per process and any earlier
+        /// executor in the test binary would already have done it. The
+        /// registration is asked of the kernel rather than read off a clock:
+        /// a loaded machine delays a 3ms timer by as much as registering
+        /// costs, so a bound on the elapsed time measured the load.
+        #[test]
+        fn first_timer_finishes_with_expected_duration() {
+            let before = membarrier_registered();
+            assert_ne!(
+                before,
+                Some(true),
+                "a fresh process is registered already, so this cannot see who registers it"
             );
-            assert!(
-                elapsed <= Duration::from_millis(5),
-                "Timer took way too long to run: {elapsed:?}"
-            );
-        });
+            let local_ex = LocalExecutorBuilder::new(crate::Placement::Unbound)
+                .make()
+                .unwrap();
+            if before.is_some() {
+                assert_eq!(
+                    membarrier_registered(),
+                    Some(true),
+                    "the executor left its membarrier registration to the first sleep"
+                );
+            }
+            local_ex.run(async {
+                let start = Instant::now();
+                Timer::new(Duration::from_millis(3)).await;
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed >= Duration::from_millis(3),
+                    "Timer expired too soon: {elapsed:?}"
+                );
+            });
+        }
     }
 }

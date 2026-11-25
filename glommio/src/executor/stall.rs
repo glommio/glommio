@@ -127,9 +127,15 @@ impl StallDetector {
         let terminated = Arc::new(AtomicBool::new(false));
         let sig = stall_handler.signal();
         let (tx, rx) = crossbeam::channel::bounded(1 << 10);
-        let timer_handler =
-            StallDetector::install_trigger(terminated.clone(), timer.clone(), sig.into());
         let signal_id = StallDetector::install_handler(tx, sig)?;
+        let timer_handler =
+            match StallDetector::install_trigger(terminated.clone(), timer.clone(), sig.into()) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    signal_hook::low_level::unregister(signal_id);
+                    return Err(err);
+                }
+            };
 
         Ok(Self {
             timer,
@@ -170,11 +176,11 @@ impl StallDetector {
         terminated: Arc<AtomicBool>,
         timer: Arc<sys::timerfd::TimerFd>,
         signal: i32,
-    ) -> JoinHandle<()> {
+    ) -> std::io::Result<JoinHandle<()>> {
         struct SendWrapper(libc::pthread_t);
         unsafe impl Send for SendWrapper {}
         let tid = SendWrapper(nix::sys::pthread::pthread_self());
-        std::thread::spawn(move || {
+        thread::Builder::new().spawn(move || {
             let tid = tid;
             while timer.wait().is_ok() {
                 if terminated.load(Ordering::Relaxed) {
@@ -304,9 +310,11 @@ mod test {
             TaskQueueHandle,
         },
         timer::sleep,
-        LocalExecutorBuilder,
+        LocalExecutor, LocalExecutorBuilder,
     };
+    use rusty_fork::rusty_fork_test;
     use std::{
+        fs,
         sync::{Arc, RwLock},
         thread,
         time::{Duration, Instant},
@@ -531,5 +539,32 @@ mod test {
             .unwrap();
         assert!(detector.rx.is_empty());
         drop(guard);
+    }
+
+    /// Counts this process's threads and timerfds.
+    fn threads_and_timerfds() -> (usize, usize) {
+        let threads = fs::read_dir("/proc/self/task").unwrap().count();
+        let timerfds = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target == std::path::Path::new("anon_inode:[timerfd]"))
+            .count();
+        (threads, timerfds)
+    }
+
+    rusty_fork_test! {
+        /// Thread and descriptor counts are process-wide, so this test forks.
+        /// Signal 0 and signals above `SIGRTMAX` make `sigaction` fail.
+        #[test]
+        fn a_rejected_signal_leaves_no_trigger_thread_or_timerfd_behind() {
+            let ex = LocalExecutor::default();
+            let before = threads_and_timerfds();
+            for signal in [0, 65, 200] {
+                assert!(ex
+                    .detect_stalls(Some(Box::new(TestHandler::new(signal))))
+                    .is_err());
+            }
+            assert_eq!(threads_and_timerfds(), before);
+        }
     }
 }

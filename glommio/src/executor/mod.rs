@@ -1459,7 +1459,9 @@ pub struct LocalExecutorConfig {
 #[derive(Debug)]
 pub struct LocalExecutor {
     context: ExecutorContext,
-    stall_detector: RefCell<Option<StallDetector>>,
+    /// Shared so a queue run can hold the detector without borrowing this
+    /// cell, which a task replaces through [`LocalExecutor::detect_stalls`].
+    stall_detector: RefCell<Option<Rc<StallDetector>>>,
 }
 
 /// What a pass over the task queues left behind.
@@ -1553,7 +1555,7 @@ impl LocalExecutor {
             stall_detector: RefCell::new(
                 config
                     .detect_stalls
-                    .map(|x| StallDetector::new(id, x))
+                    .map(|x| StallDetector::new(id, x).map(Rc::new))
                     .transpose()?,
             ),
         })
@@ -1574,7 +1576,7 @@ impl LocalExecutor {
     ) -> Result<()> {
         self.stall_detector.replace(
             handler
-                .map(|x| StallDetector::new(self.context.id, x))
+                .map(|x| StallDetector::new(self.context.id, x).map(Rc::new))
                 .transpose()?,
         );
         Ok(())
@@ -1720,38 +1722,48 @@ impl LocalExecutor {
             now
         };
 
-        let (runtime, tasks_executed_this_loop) = {
-            let detector = self.stall_detector.borrow();
-            let guard = detector.as_ref().map(|x| {
-                let queue = queue.borrow_mut();
-                x.enter_task_queue(
-                    queue.stats.index,
-                    queue.name.clone(),
-                    time,
-                    self.preempt_timer_duration(),
-                )
-            });
+        let detector = self.stall_detector.borrow().clone();
+        let _stall_guard = detector.as_ref().map(|x| {
+            let queue = queue.borrow_mut();
+            x.enter_task_queue(
+                queue.stats.index,
+                queue.name.clone(),
+                time,
+                self.preempt_timer_duration(),
+            )
+        });
 
-            let mut tasks_executed_this_loop = 0;
-            loop {
-                let mut queue_ref = queue.borrow_mut();
-                if self.need_preempt() || queue_ref.yielded() {
-                    break;
-                }
-
-                if let Some(r) = queue_ref.get_task() {
-                    drop(queue_ref);
-                    r.run();
-                    tasks_executed_this_loop += 1;
-                } else {
-                    break;
-                }
+        let mut run = scopeguard::guard((queue, 0), |(queue, tasks_executed)| {
+            self.finish_task_queue_run(queue, time.elapsed(), tasks_executed)
+        });
+        loop {
+            let mut queue_ref = run.0.borrow_mut();
+            if self.need_preempt() || queue_ref.yielded() {
+                break;
             }
-            let elapsed = time.elapsed();
-            drop(guard);
-            (elapsed, tasks_executed_this_loop)
-        };
 
+            if let Some(r) = queue_ref.get_task() {
+                drop(queue_ref);
+                r.run();
+                run.1 += 1;
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
+    /// Accounts a queue's run and returns it to the scheduler.
+    ///
+    /// Runs on unwind as well: a panicking task leaves its queue active, and a
+    /// queue left active outside the heap is never pushed again, so the
+    /// executor would park forever on its next `run`.
+    fn finish_task_queue_run(
+        &self,
+        queue: Rc<RefCell<TaskQueue>>,
+        runtime: Duration,
+        tasks_executed_this_loop: u64,
+    ) {
         let (need_repush, vruntime) = {
             let mut state = queue.borrow_mut();
             let last_vruntime = state.account_vruntime(runtime);
@@ -1784,8 +1796,6 @@ impl LocalExecutor {
             .peek()
             .map(|x| x.borrow().vruntime)
             .unwrap_or(vruntime);
-
-        true
     }
 
     /// Runs the executor until the given future completes.
@@ -4964,5 +4974,36 @@ mod test {
         #[cfg(all(nightly, feature = "native-tls"))]
 
         assert!(unsafe { LOCAL_EX.is_null() });
+    }
+
+    #[test]
+    fn a_task_can_toggle_stall_detection_on_its_own_executor() {
+        let ex = LocalExecutor::default();
+        ex.run(async {
+            ex.detect_stalls(Some(Box::new(stall::DefaultStallDetectionHandler {})))
+                .unwrap();
+            crate::executor().yield_task_queue_now().await;
+            ex.detect_stalls(None).unwrap();
+            crate::executor().yield_task_queue_now().await;
+        });
+    }
+
+    #[test]
+    fn an_executor_runs_again_after_a_task_panic_was_caught() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ex = LocalExecutor::default();
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ex.run(async { panic!("the first run panics") })
+            }));
+            assert!(first.is_err());
+            let second = ex.run(async { crate::spawn_local(async { 7 }).await });
+            tx.send(second).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(7),
+            "the second run never finished"
+        );
     }
 }

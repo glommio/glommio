@@ -1103,6 +1103,12 @@ impl AsRawFd for OwnedDmaFile {
     }
 }
 
+impl AsFd for OwnedDmaFile {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
+    }
+}
+
 /// This holds a weak non-owning reference to the file that can attempt to be upgraded to an owned
 /// reference on any thread. Underneath it uses Arc so there is an atomic cost involved in constructing
 /// it / cloning. However, it can be useful if you want to grant conditional access at a future date

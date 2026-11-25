@@ -10,7 +10,10 @@ use crate::{
 };
 use std::{
     cell::Ref,
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::io::{AsRawFd, FromRawFd, RawFd},
+    },
     path::{Path, PathBuf},
 };
 
@@ -33,6 +36,12 @@ pub struct BufferedFile {
 impl AsRawFd for BufferedFile {
     fn as_raw_fd(&self) -> RawFd {
         self.file.as_raw_fd()
+    }
+}
+
+impl AsFd for BufferedFile {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.file.as_fd()
     }
 }
 

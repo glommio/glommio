@@ -19,9 +19,12 @@ use socket2::{Domain, Socket, Type};
 use std::{
     io::{self, IoSlice},
     net::Shutdown,
-    os::unix::{
-        io::{AsRawFd, FromRawFd, RawFd},
-        net::{self, SocketAddr},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::{
+            io::{AsRawFd, FromRawFd, RawFd},
+            net::{self, SocketAddr},
+        },
     },
     path::Path,
     pin::Pin,
@@ -69,6 +72,18 @@ use crate::Result;
 pub struct UnixListener {
     reactor: Weak<Reactor>,
     listener: net::UnixListener,
+}
+
+impl AsRawFd for UnixListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.listener.as_fd()
+    }
 }
 
 impl UnixListener {
@@ -289,6 +304,18 @@ impl FromRawFd for UnixStream {
     }
 }
 
+impl<B: RxBuf> AsRawFd for UnixStream<B> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.stream().as_raw_fd()
+    }
+}
+
+impl<B: RxBuf> AsFd for UnixStream<B> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
+    }
+}
+
 impl UnixStream {
     /// Creates an unnamed pair of connected Unix stream sockets.
     ///
@@ -465,9 +492,21 @@ impl<B: RxBuf> AsRawFd for UnixReadHalf<B> {
     }
 }
 
+impl<B: RxBuf> AsFd for UnixReadHalf<B> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
+    }
+}
+
 impl AsRawFd for UnixWriteHalf {
     fn as_raw_fd(&self) -> RawFd {
         self.stream.stream().as_raw_fd()
+    }
+}
+
+impl AsFd for UnixWriteHalf {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
     }
 }
 
@@ -615,6 +654,18 @@ impl<B: RxBuf + Unpin> AsyncWrite for UnixStream<B> {
 /// A Unix Datagram Socket.
 pub struct UnixDatagram {
     socket: GlommioDatagram<net::UnixDatagram>,
+}
+
+impl AsRawFd for UnixDatagram {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixDatagram {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.socket.as_fd()
+    }
 }
 
 impl UnixDatagram {

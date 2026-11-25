@@ -719,6 +719,12 @@ impl AsRawFd for OwnedGlommioFile {
     }
 }
 
+impl AsFd for OwnedGlommioFile {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_ref().unwrap().as_fd()
+    }
+}
+
 impl Drop for OwnedGlommioFile {
     fn drop(&mut self) {
         if let Some(fd) = self.fd.take().and_then(Arc::into_inner) {

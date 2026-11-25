@@ -7,7 +7,7 @@
 use crate::sys::Statx;
 
 /// Represents the status information about a file.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stat {
     /// The reported file size, in bytes. This will likely differ from
     /// allocated_file_size which returns how many bytes were allocated on

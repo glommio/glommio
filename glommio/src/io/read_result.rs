@@ -20,6 +20,22 @@ impl core::ops::Deref for ReadResult {
     }
 }
 
+impl AsRef<[u8]> for ReadResult {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+/// Two results are equal when they hold the same bytes, whichever buffers
+/// those bytes live in.
+impl PartialEq for ReadResult {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for ReadResult {}
+
 #[derive(Clone, Debug)]
 /// This (usage of `NonZeroUsize`) is probably needed to make sure that rustc
 /// doesn't need to reserve additional memory for the surrounding `Option`
@@ -150,6 +166,32 @@ impl ReadResultInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_results_compare_by_their_bytes_not_their_buffers() {
+        for dir in crate::test_utils::make_test_directories("read-result-eq") {
+            let path = dir.path.join("abab");
+            std::fs::write(&path, b"abab").unwrap();
+            test_executor!(async move {
+                let file = crate::io::DmaFile::open(&path).await.unwrap();
+                let read = file.read_at(0, 4).await.unwrap();
+                let first = ReadResult::slice(&read, 0, 2).unwrap();
+                let second = ReadResult::slice(&read, 2, 2).unwrap();
+                assert_ne!(first.as_ptr(), second.as_ptr());
+                assert_eq!(first, second);
+                assert_eq!(first.as_ref(), b"ab");
+
+                let a = ReadResult::slice(&read, 0, 1).unwrap();
+                let b = ReadResult::slice(&read, 1, 1).unwrap();
+                assert_ne!(a, b);
+
+                let empty = ReadResult::slice(&read, 4, 0).unwrap();
+                assert_eq!(empty, ReadResult::default());
+                assert_ne!(read, ReadResult::default());
+                file.close().await.unwrap();
+            });
+        }
+    }
 
     #[test]
     fn equal_struct_size() {

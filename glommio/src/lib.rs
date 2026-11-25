@@ -575,7 +575,7 @@ pub mod prelude {
 /// the faces of pending events for latency classes.
 ///
 /// [`TaskQueue`]: struct.TaskQueueHandle.html
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Latency {
     /// Tasks marked as `Latency::Matters` will cooperatively signal to other
     /// tasks that they should preempt often. The `Duration` argument
@@ -821,7 +821,7 @@ impl<'a> Sum<&'a RingIoStats> for RingIoStats {
 }
 
 /// Stores information about IO
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct IoStats {
     /// The IO stats of the main ring
     pub main_ring: RingIoStats,

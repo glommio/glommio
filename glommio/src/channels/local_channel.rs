@@ -3,7 +3,10 @@
 //!
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
-use crate::{channels::ChannelCapacity, GlommioError, ResourceType};
+use crate::{
+    channels::{ChannelCapacity, TryRecvError},
+    GlommioError, ResourceType,
+};
 use futures_lite::{stream::Stream, Future};
 use std::{
     cell::{Cell, RefCell},
@@ -766,6 +769,41 @@ impl<T> LocalReceiver<T> {
         ChannelStream::new(&self.channel)
     }
 
+    /// Receives an item if one is queued, without waiting.
+    ///
+    /// Returns [`TryRecvError::Empty`] when nothing is queued but the sender
+    /// is still there, and [`TryRecvError::Closed`] only once the sender is
+    /// gone and every item it sent has been received. Taking an item makes
+    /// room in a bounded channel, and wakes a sender waiting for it, just as
+    /// [`recv`] does.
+    ///
+    /// # Examples
+    /// ```
+    /// use glommio::{
+    ///     channels::{local_channel, TryRecvError},
+    ///     LocalExecutor,
+    /// };
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async move {
+    ///     let (sender, receiver) = local_channel::new_bounded(1);
+    ///     assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    ///     sender.try_send(0).unwrap();
+    ///     drop(sender);
+    ///     assert_eq!(receiver.try_recv(), Ok(0));
+    ///     assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+    /// });
+    /// ```
+    ///
+    /// [`recv`]: Self::recv
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        match self.recv_one() {
+            PollResult::Ready(Some(item)) => Ok(item),
+            PollResult::Ready(None) => Err(TryRecvError::Closed),
+            PollResult::Pending(_) => Err(TryRecvError::Empty),
+        }
+    }
+
     fn recv_one(&self) -> PollResult<Option<T>> {
         let result = self.channel.state.borrow_mut().recv_one();
         match result {
@@ -1127,5 +1165,45 @@ mod test {
             let recvd = stream::iter(ret).then(|f| f).count().await;
             assert_eq!(recvd, 10);
         });
+    }
+
+    #[test]
+    fn try_recv_is_empty_until_the_sender_goes_then_closed() {
+        let (sender, receiver) = new_unbounded::<u32>();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        drop(sender);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+    }
+
+    #[test]
+    fn try_recv_drains_what_a_departed_sender_left_before_closing() {
+        let (sender, receiver) = new_unbounded();
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        drop(sender);
+        assert_eq!(receiver.try_recv(), Ok(1));
+        assert_eq!(receiver.try_recv(), Ok(2));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+    }
+
+    /// Guards against `try_recv` making room in a bounded channel without
+    /// waking the sender waiting for it.
+    #[test]
+    fn try_recv_wakes_a_sender_waiting_for_room() {
+        let (sender, receiver) = new_bounded(1);
+        sender.try_send(0).unwrap();
+        let (woken, waker) = flagged();
+        let mut cx = Context::from_waker(&waker);
+        let mut send = Box::pin(sender.send(1));
+        assert!(send.as_mut().poll(&mut cx).is_pending());
+
+        assert_eq!(receiver.try_recv(), Ok(0));
+
+        assert!(
+            woken.0.load(Ordering::Relaxed),
+            "the waiting sender was never woken"
+        );
+        assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        assert_eq!(receiver.try_recv(), Ok(1));
     }
 }

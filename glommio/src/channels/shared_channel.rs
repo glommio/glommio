@@ -5,7 +5,10 @@
 //!
 //!
 use crate::{
-    channels::spsc_queue::{make, BufferHalf, Consumer, Producer},
+    channels::{
+        spsc_queue::{make, BufferHalf, Consumer, Producer},
+        TryRecvError,
+    },
     enclose,
     reactor::Reactor,
     sys::{self, SleepNotifier},
@@ -471,32 +474,84 @@ impl<T: Send + Sized> ConnectedReceiver<T> {
         waiter.await
     }
 
-    fn recv_one(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        self.do_recv_one(cx, false)
+    /// Receives an item if one is queued, without waiting.
+    ///
+    /// Returns [`TryRecvError::Empty`] when nothing is queued but the sender
+    /// is still there, and [`TryRecvError::Closed`] only once the sender is
+    /// gone and every item it sent has been received. Taking an item makes
+    /// room in the channel, and wakes a sender waiting for it on the other
+    /// executor, just as [`recv`] does.
+    ///
+    /// # Examples
+    /// ```
+    /// use glommio::{
+    ///     channels::{shared_channel, TryRecvError},
+    ///     prelude::*,
+    /// };
+    ///
+    /// let (sender, receiver) = shared_channel::new_bounded(1);
+    /// let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    /// let producer = LocalExecutorBuilder::default()
+    ///     .spawn(move || async move {
+    ///         let sender = sender.connect().await;
+    ///         sender.try_send(0u32).unwrap();
+    ///         drop(sender);
+    ///         sent_tx.send(()).unwrap();
+    ///     })
+    ///     .unwrap();
+    /// let consumer = LocalExecutorBuilder::default()
+    ///     .spawn(move || async move {
+    ///         let receiver = receiver.connect().await;
+    ///         sent_rx.recv().unwrap();
+    ///         assert_eq!(receiver.try_recv(), Ok(0));
+    ///         assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+    ///     })
+    ///     .unwrap();
+    /// producer.join().unwrap();
+    /// consumer.join().unwrap();
+    /// ```
+    ///
+    /// [`recv`]: Self::recv
+    pub fn try_recv(&self) -> std::result::Result<T, TryRecvError> {
+        let buffer = &self.state.buffer;
+        let item = pop_or_closed(
+            || buffer.buffer.try_pop(),
+            || buffer.producer_disconnected(),
+        )?;
+        self.notifier.notify(false);
+        Ok(item)
     }
 
-    fn do_recv_one(&self, cx: &mut Context<'_>, disconnected: bool) -> Poll<Option<T>> {
-        match self.state.buffer.buffer.try_pop() {
-            None => {
-                if disconnected {
-                    Poll::Ready(None)
-                } else if self.state.buffer.producer_disconnected() {
-                    // Double check in case the producer sent the last message and
-                    // disconnected right after a `None` is returned from `try_pop`
-                    self.do_recv_one(cx, true)
-                } else {
-                    self.reactor
-                        .upgrade()
-                        .unwrap()
-                        .add_shared_channel_waker(self.id, cx.waker());
-                    Poll::Pending
-                }
-            }
-            res => {
-                self.notifier.notify(false);
-                Poll::Ready(res)
+    fn recv_one(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        match self.try_recv() {
+            Ok(item) => Poll::Ready(Some(item)),
+            Err(TryRecvError::Closed) => Poll::Ready(None),
+            Err(TryRecvError::Empty) => {
+                self.reactor
+                    .upgrade()
+                    .unwrap()
+                    .add_shared_channel_waker(self.id, cx.waker());
+                Poll::Pending
             }
         }
+    }
+}
+
+/// Pops an item, or says why there is none.
+///
+/// A pop that finds nothing is retried once the producer is seen gone: the
+/// producer may have pushed its last item and disconnected between the two
+/// looks, and that item must be returned rather than reported as closed.
+fn pop_or_closed<T>(
+    pop: impl Fn() -> Option<T>,
+    producer_disconnected: impl Fn() -> bool,
+) -> std::result::Result<T, TryRecvError> {
+    if let Some(item) = pop() {
+        Ok(item)
+    } else if producer_disconnected() {
+        pop().ok_or(TryRecvError::Closed)
+    } else {
+        Err(TryRecvError::Empty)
     }
 }
 
@@ -1467,5 +1522,111 @@ mod test {
             .unwrap();
         sender.join().unwrap();
         receiver.join().unwrap();
+    }
+
+    #[test]
+    fn try_recv_on_a_shared_channel_is_empty_then_yields_then_closes() {
+        let (sender, receiver) = new_bounded::<u32>(4);
+        let (checked_tx, checked_rx) = mpsc::channel::<()>();
+        let (sent_tx, sent_rx) = mpsc::channel::<()>();
+        let sender = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let sender = sender.connect().await;
+                checked_rx.recv().unwrap();
+                sender.try_send(5).unwrap();
+                drop(sender);
+                sent_tx.send(()).unwrap();
+            })
+            .unwrap();
+        let receiver = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let receiver = receiver.connect().await;
+                assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+                checked_tx.send(()).unwrap();
+                sent_rx.recv().unwrap();
+                assert_eq!(receiver.try_recv(), Ok(5));
+                assert_eq!(receiver.try_recv(), Err(TryRecvError::Closed));
+            })
+            .unwrap();
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    /// Guards against `try_recv` freeing a slot without notifying the
+    /// sender's executor, which then sleeps on with its send parked.
+    ///
+    /// The receiver waits a little after the sender has parked so the
+    /// sender's executor is asleep when the slot frees: popped any earlier,
+    /// the executor's own check before sleeping finds the room and hides a
+    /// missing notify. The sender's deadline turns that miss into a failure
+    /// rather than a hang.
+    #[test]
+    fn try_recv_wakes_a_sender_parked_on_a_full_shared_channel() {
+        const DEADLINE: Duration = Duration::from_secs(5);
+        let (sender, receiver) = new_bounded::<u32>(1);
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let sender = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let sender = sender.connect().await;
+                sender.try_send(0).unwrap();
+                let mut send = Box::pin(sender.send(1));
+                assert!(futures_lite::future::poll_once(send.as_mut())
+                    .await
+                    .is_none());
+                parked_tx.send(()).unwrap();
+                let started = std::time::Instant::now();
+                let sent = crate::timer::timeout(DEADLINE, async { Ok(send.await) }).await;
+                let took = started.elapsed();
+                done_tx.send(()).unwrap();
+                assert!(
+                    matches!(sent, Ok(Ok(()))),
+                    "the parked send never completed"
+                );
+                assert!(
+                    took < DEADLINE / 2,
+                    "the parked send waited {took:?} after its slot was freed"
+                );
+            })
+            .unwrap();
+        let receiver = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                let receiver = receiver.connect().await;
+                parked_rx.recv().unwrap();
+                sleep(Duration::from_millis(100)).await;
+                assert_eq!(receiver.try_recv(), Ok(0));
+                done_rx.recv().unwrap();
+                assert_eq!(receiver.try_recv(), Ok(1));
+            })
+            .unwrap();
+        sender.join().unwrap();
+        receiver.join().unwrap();
+    }
+
+    /// Guards against reporting a channel closed while it still holds the
+    /// producer's last item, pushed just before it disconnected and just
+    /// after the receiver's first pop found nothing.
+    ///
+    /// The pop here plays the producer's part right after its first look,
+    /// so the interleaving that two threads would only hit by chance happens
+    /// every run.
+    #[test]
+    fn a_last_item_pushed_as_the_producer_leaves_is_not_reported_closed() {
+        let (producer, consumer) = make::<u32>(1);
+        let producer = std::cell::RefCell::new(producer);
+        let raced = std::cell::Cell::new(false);
+        let received = pop_or_closed(
+            || {
+                let item = consumer.buffer.try_pop();
+                if !raced.replace(true) {
+                    let mut producer = producer.borrow_mut();
+                    assert!(producer.try_push(7).is_none());
+                    producer.disconnect();
+                }
+                item
+            },
+            || consumer.producer_disconnected(),
+        );
+        assert_eq!(received, Ok(7));
     }
 }

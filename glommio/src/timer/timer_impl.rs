@@ -37,15 +37,16 @@ struct Inner {
 }
 
 impl Inner {
-    /// Deregisters the timer from the reactor, updates the timeout, and
-    /// re-registers the timer with the new timeout.
-    fn reset(&mut self, dur: Duration) {
+    /// Deregisters the timer from the reactor, updates the deadline, and
+    /// re-registers the timer with the new deadline. `None` is a deadline
+    /// that never comes.
+    fn reset(&mut self, when: Option<Instant>) {
         let mut waker = self.parked.take();
         if let Some(id) = self.id.take() {
             waker = self.reactor.upgrade().unwrap().remove_timer(id).or(waker);
         }
 
-        self.when = Instant::now().checked_add(dur);
+        self.when = when;
 
         if let Some(waker) = waker {
             match self.when {
@@ -111,15 +112,66 @@ impl Timer {
     /// });
     /// ```
     pub fn new(dur: Duration) -> Timer {
+        Self::with_deadline(Instant::now().checked_add(dur))
+    }
+
+    /// Creates a timer that expires at the given instant.
+    ///
+    /// An instant already in the past expires the timer at its first poll.
+    /// The timer resolves to `when` itself, as [`deadline`] reports it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glommio::{timer::Timer, LocalExecutor};
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async move {
+    ///     let when = Instant::now() + Duration::from_millis(100);
+    ///     assert_eq!(Timer::at(when).await, when);
+    /// });
+    /// ```
+    /// [`deadline`]: Timer::deadline
+    pub fn at(when: Instant) -> Timer {
+        Self::with_deadline(Some(when))
+    }
+
+    fn with_deadline(when: Option<Instant>) -> Timer {
         let reactor = crate::executor().reactor();
         Timer {
             inner: Rc::new(RefCell::new(Inner {
                 id: None,
-                when: Instant::now().checked_add(dur),
+                when,
                 parked: None,
                 reactor: Rc::downgrade(&reactor),
             })),
         }
+    }
+
+    /// The instant this timer expires at, or `None` for a timer that never
+    /// does.
+    ///
+    /// This is the deadline as asked for, not rounded to the resolution of
+    /// the reactor's timer wheel, and it is what the timer resolves to.
+    /// A duration too large for an [`Instant`] to hold, such as
+    /// [`Duration::MAX`], has no deadline.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glommio::{timer::Timer, LocalExecutor};
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async move {
+    ///     let when = Instant::now() + Duration::from_secs(1);
+    ///     assert_eq!(Timer::at(when).deadline(), Some(when));
+    ///     assert_eq!(Timer::new(Duration::MAX).deadline(), None);
+    /// });
+    /// ```
+    pub fn deadline(&self) -> Option<Instant> {
+        self.inner.borrow().when
     }
 
     /// Resets the timer to expire after the new duration of time.
@@ -143,7 +195,32 @@ impl Timer {
     /// ```
     pub fn reset(&mut self, dur: Duration) {
         let mut inner = self.inner.borrow_mut();
-        inner.reset(dur);
+        inner.reset(Instant::now().checked_add(dur));
+    }
+
+    /// Resets the timer to expire at the given instant.
+    ///
+    /// Like [`reset()`][`Timer::reset()`], this keeps the waker of the task
+    /// polling the timer. An instant already in the past expires the timer
+    /// at its next poll.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glommio::{timer::Timer, LocalExecutor};
+    /// use std::time::{Duration, Instant};
+    ///
+    /// let ex = LocalExecutor::default();
+    /// ex.run(async move {
+    ///     let mut t = Timer::new(Duration::from_secs(1));
+    ///     let sooner = Instant::now() + Duration::from_millis(100);
+    ///     t.reset_at(sooner);
+    ///     assert_eq!(t.await, sooner);
+    /// });
+    /// ```
+    pub fn reset_at(&mut self, when: Instant) {
+        let mut inner = self.inner.borrow_mut();
+        inner.reset(Some(when));
     }
 }
 
@@ -542,7 +619,7 @@ impl<T: 'static> TimerActionOnce<T> {
     /// [`Duration`]: https://doc.rust-lang.org/std/time/struct.Duration.html
     pub fn rearm_in(&self, dur: Duration) {
         let mut inner = self.inner.borrow_mut();
-        inner.reset(dur);
+        inner.reset(Instant::now().checked_add(dur));
     }
 
     /// Rearm a [`TimerActionOnce`], so it fires at the specified [`Instant`]
@@ -618,9 +695,9 @@ impl TimerActionRepeat {
     /// [`Duration`]: https://doc.rust-lang.org/std/time/struct.Duration.html
     /// [`TimerActionRepeat`]: struct.TimerActionRepeat.html
     /// [`TaskQueueHandle`]: ../struct.TaskQueueHandle.html
-    pub fn repeat_into<G, F>(action_gen: G, tq: TaskQueueHandle) -> Result<TimerActionRepeat>
+    pub fn repeat_into<G, F>(mut action_gen: G, tq: TaskQueueHandle) -> Result<TimerActionRepeat>
     where
-        G: Fn() -> F + 'static,
+        G: FnMut() -> F + 'static,
         F: Future<Output = Option<Duration>> + 'static,
     {
         let task = crate::spawn_local_into(
@@ -667,7 +744,7 @@ impl TimerActionRepeat {
     /// [`TimerActionRepeat`]: struct.TimerActionRepeat.html
     pub fn repeat<G, F>(action_gen: G) -> TimerActionRepeat
     where
-        G: Fn() -> F + 'static,
+        G: FnMut() -> F + 'static,
         F: Future<Output = Option<Duration>> + 'static,
     {
         Self::repeat_into(action_gen, crate::executor().current_task_queue()).unwrap()
@@ -953,6 +1030,91 @@ mod test {
             assert!(inner.borrow().parked.is_some());
             drop(timer);
             assert!(inner.borrow().parked.is_none());
+        });
+    }
+
+    #[test]
+    fn a_timer_at_an_instant_reports_it_as_its_deadline_and_fires_with_it() {
+        test_executor!(async move {
+            let when = Instant::now() + Duration::from_millis(20);
+            let timer = Timer::at(when);
+            assert_eq!(timer.deadline(), Some(when));
+            assert_eq!(timer.await, when);
+            assert!(Instant::now() >= when);
+        });
+    }
+
+    #[test]
+    fn a_timer_at_a_past_instant_is_ready_at_its_first_poll() {
+        test_executor!(async move {
+            let past = Instant::now();
+            let mut timer = Timer::at(past);
+            assert_eq!(futures::poll!(&mut timer), Poll::Ready(past));
+        });
+    }
+
+    #[test]
+    fn a_timer_reports_the_deadline_its_duration_asked_for() {
+        test_executor!(async move {
+            let before = Instant::now();
+            let mut timer = Timer::new(Duration::from_secs(60));
+            let after = Instant::now();
+            let deadline = timer.deadline().expect("a finite timer has a deadline");
+            assert!(deadline >= before + Duration::from_secs(60));
+            assert!(deadline <= after + Duration::from_secs(60));
+
+            timer.reset(Duration::MAX);
+            assert_eq!(timer.deadline(), None);
+            assert_eq!(Timer::new(Duration::MAX).deadline(), None);
+        });
+    }
+
+    #[test]
+    fn reset_at_moves_a_registered_timer_to_the_new_instant() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::from_secs(60));
+            assert!(futures::poll!(&mut timer).is_pending());
+            let sooner = Instant::now() + Duration::from_millis(10);
+            timer.reset_at(sooner);
+            assert_eq!(timer.deadline(), Some(sooner));
+            let fired = crate::timer::timeout(Duration::from_secs(10), async { Ok(timer.await) })
+                .await
+                .expect("the timer kept its old deadline");
+            assert_eq!(fired, sooner);
+            assert!(
+                Instant::now() < sooner + Duration::from_secs(2),
+                "the timer was woken at its old registration, not the new instant"
+            );
+        });
+    }
+
+    #[test]
+    fn reset_at_gives_a_forever_timer_a_deadline() {
+        test_executor!(async move {
+            let mut timer = Timer::new(Duration::MAX);
+            assert!(futures::poll!(&mut timer).is_pending());
+            let soon = Instant::now() + Duration::from_millis(10);
+            timer.reset_at(soon);
+            let fired = crate::timer::timeout(Duration::from_secs(5), async { Ok(timer.await) })
+                .await
+                .expect("the parked waker was not registered at the new deadline");
+            assert_eq!(fired, soon);
+        });
+    }
+
+    #[test]
+    fn a_repeat_action_may_mutate_the_state_of_its_generator() {
+        test_executor!(async move {
+            let mut runs = 0;
+            let action = TimerActionRepeat::repeat(move || {
+                runs += 1;
+                let again = runs < 3;
+                async move { again.then_some(Duration::from_millis(1)) }
+            });
+            crate::timer::timeout(Duration::from_secs(5), async { Ok(action.join().await) })
+                .await
+                .expect("the repeat action did not stop after its third run")
+                .expect("the repeat action was cancelled");
         });
     }
 

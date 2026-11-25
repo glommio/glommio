@@ -5324,8 +5324,11 @@ impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusi
 pub mod glommio::timer
 pub struct glommio::timer::Timer
 impl glommio::timer::Timer
+pub fn glommio::timer::Timer::at(when: std::time::Instant) -> glommio::timer::Timer
+pub fn glommio::timer::Timer::deadline(&self) -> core::option::Option<std::time::Instant>
 pub fn glommio::timer::Timer::new(dur: core::time::Duration) -> glommio::timer::Timer
 pub fn glommio::timer::Timer::reset(&mut self, dur: core::time::Duration)
+pub fn glommio::timer::Timer::reset_at(&mut self, when: std::time::Instant)
 impl core::fmt::Debug for glommio::timer::Timer
 pub fn glommio::timer::Timer::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::future::future::Future for glommio::timer::Timer
@@ -5426,8 +5429,8 @@ impl glommio::timer::TimerActionRepeat
 pub async fn glommio::timer::TimerActionRepeat::cancel(self)
 pub fn glommio::timer::TimerActionRepeat::destroy(&self)
 pub async fn glommio::timer::TimerActionRepeat::join(self) -> core::option::Option<()>
-pub fn glommio::timer::TimerActionRepeat::repeat<G, F>(action_gen: G) -> glommio::timer::TimerActionRepeat where G: core::ops::function::Fn() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
-pub fn glommio::timer::TimerActionRepeat::repeat_into<G, F>(action_gen: G, tq: glommio::TaskQueueHandle) -> glommio::Result<glommio::timer::TimerActionRepeat> where G: core::ops::function::Fn() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
+pub fn glommio::timer::TimerActionRepeat::repeat<G, F>(action_gen: G) -> glommio::timer::TimerActionRepeat where G: core::ops::function::FnMut() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
+pub fn glommio::timer::TimerActionRepeat::repeat_into<G, F>(action_gen: G, tq: glommio::TaskQueueHandle) -> glommio::Result<glommio::timer::TimerActionRepeat> where G: core::ops::function::FnMut() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
 impl core::fmt::Debug for glommio::timer::TimerActionRepeat
 pub fn glommio::timer::TimerActionRepeat::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::timer::TimerActionRepeat

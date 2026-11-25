@@ -294,7 +294,19 @@ impl<T> fmt::Display for GlommioError<T> {
     }
 }
 
-impl<T> std::error::Error for GlommioError<T> {}
+impl<T> std::error::Error for GlommioError<T> {
+    /// The wrapped [`io::Error`] for [`IoError`](GlommioError::IoError) and
+    /// [`EnhancedIoError`](GlommioError::EnhancedIoError). No other variant
+    /// wraps an error.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GlommioError::IoError(source) | GlommioError::EnhancedIoError { source, .. } => {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+}
 
 impl GlommioError<()> {
     pub(crate) fn create_enhanced<P: AsRef<Path>>(
@@ -728,5 +740,35 @@ mod test {
             s,
             "Bad file descriptor (os error 9), op: testing enhancer path: None with fd: Some(32)"
         );
+    }
+
+    /// The raw OS error of whatever `source()` returned, or `None` when it
+    /// returned nothing or something other than an [`io::Error`].
+    fn source_errno<T>(err: &GlommioError<T>) -> Option<i32> {
+        std::error::Error::source(err)?
+            .downcast_ref::<io::Error>()?
+            .raw_os_error()
+    }
+
+    #[test]
+    fn an_io_error_is_reported_as_the_source() {
+        let plain = GlommioError::<()>::IoError(io::Error::from_raw_os_error(2));
+        assert_eq!(source_errno(&plain), Some(2));
+
+        let enhanced = GlommioError::<()>::create_enhanced::<PathBuf>(
+            io::Error::from_raw_os_error(9),
+            "testing source",
+            None,
+            Some(32),
+        );
+        assert_eq!(source_errno(&enhanced), Some(9));
+    }
+
+    #[test]
+    fn an_error_wrapping_nothing_has_no_source() {
+        let timed_out = GlommioError::<()>::TimedOut(Duration::from_secs(1));
+        assert!(std::error::Error::source(&timed_out).is_none());
+        let closed = GlommioError::<u8>::Closed(ResourceType::Channel(7));
+        assert!(std::error::Error::source(&closed).is_none());
     }
 }

@@ -707,12 +707,34 @@ impl UnixDatagram {
         source.collect_rw().await.map(|_| {}).map_err(Into::into)
     }
 
-    /// Sets the buffer size used on the receive path
+    /// Stores a receive buffer size that nothing reads.
+    ///
+    /// Every receive is sized by the buffer handed to it: [`recv`],
+    /// [`recv_from`], [`peek`] and [`peek_from`] read at most `buf.len()`
+    /// bytes, whatever was set here. Size that buffer instead.
+    ///
+    /// [`recv`]: UnixDatagram::recv
+    /// [`recv_from`]: UnixDatagram::recv_from
+    /// [`peek`]: UnixDatagram::peek
+    /// [`peek_from`]: UnixDatagram::peek_from
+    #[deprecated(
+        since = "0.12.1",
+        note = "has no effect: receives are sized by the buffer passed to recv, recv_from, peek \
+                and peek_from"
+    )]
     pub fn set_buffer_size(&mut self, buffer_size: usize) {
         self.socket.rx_buf_size = buffer_size;
     }
 
-    /// gets the buffer size used
+    /// Returns the value last given to [`set_buffer_size`], which nothing on
+    /// the receive path reads.
+    ///
+    /// [`set_buffer_size`]: UnixDatagram::set_buffer_size
+    #[deprecated(
+        since = "0.12.1",
+        note = "has no effect: receives are sized by the buffer passed to recv, recv_from, peek \
+                and peek_from"
+    )]
     pub fn buffer_size(&mut self) -> usize {
         self.socket.rx_buf_size
     }

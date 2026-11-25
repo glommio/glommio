@@ -1056,7 +1056,7 @@ pub fn glommio::io::BufferedFile::path(&self) -> core::option::Option<core::cell
 pub async fn glommio::io::BufferedFile::pre_allocate(&self, size: u64, keep_size: bool) -> glommio::Result<()>
 pub async fn glommio::io::BufferedFile::read_at(&self, pos: u64, size: usize) -> glommio::Result<glommio::io::ReadResult>
 pub async fn glommio::io::BufferedFile::remove(&self) -> glommio::Result<()>
-pub async fn glommio::io::BufferedFile::rename<P: core::convert::AsRef<std::path::Path>>(&mut self, new_path: P) -> glommio::Result<()>
+pub async fn glommio::io::BufferedFile::rename<P: core::convert::AsRef<std::path::Path>>(&self, new_path: P) -> glommio::Result<()>
 pub async fn glommio::io::BufferedFile::stat(&self) -> glommio::Result<glommio::io::Stat>
 pub async fn glommio::io::BufferedFile::truncate(&self, size: u64) -> glommio::Result<()>
 pub async fn glommio::io::BufferedFile::write_at(&self, buf: alloc::vec::Vec<u8>, pos: u64) -> glommio::Result<usize>
@@ -3917,6 +3917,7 @@ pub fn std::io::error::Error::from(err: glommio::GlommioError<T>) -> Self
 impl<T> core::convert::From<std::io::error::Error> for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::from(err: std::io::error::Error) -> Self
 impl<T> core::error::Error for glommio::GlommioError<T>
+pub fn glommio::GlommioError<T>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl<T> core::fmt::Display for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::GlommioError<T> where T: core::marker::Freeze
@@ -5420,6 +5421,7 @@ pub fn std::io::error::Error::from(err: glommio::GlommioError<T>) -> Self
 impl<T> core::convert::From<std::io::error::Error> for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::from(err: std::io::error::Error) -> Self
 impl<T> core::error::Error for glommio::GlommioError<T>
+pub fn glommio::GlommioError<T>::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl<T> core::fmt::Display for glommio::GlommioError<T>
 pub fn glommio::GlommioError<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::marker::Freeze for glommio::GlommioError<T> where T: core::marker::Freeze

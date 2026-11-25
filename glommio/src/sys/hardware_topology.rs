@@ -128,9 +128,12 @@ fn get_cache_domain_id(sysfs_path: &Path, cpu: usize) -> Option<usize> {
 /// always at `/sys` per: <https://www.kernel.org/doc/html/latest/admin-guide/sysfs-rules.html>
 ///
 /// Assigns a virtual core id to each CPU. The basic strategy is to sort CPUs
-/// by their (NUMA node id, core id) and assign virtual core id in this order.
-/// Note we need to ensure that the CPUs on the same core will have the same
-/// core id. A `BTree` is used over `HashMap` for 2 reasons:
+/// by their (NUMA node id, package id, core id) and assign virtual core id in
+/// this order. Note we need to ensure that the CPUs on the same core will have
+/// the same core id. The package is part of the key because the kernel's
+/// `core_id` is only unique within a package, and a NUMA node can span several
+/// packages (node interleaving, or a kernel without NUMA support, where every
+/// CPU is on node 0). A `BTree` is used over `HashMap` for 2 reasons:
 /// 1. to keep mapping consitent between different invocations.
 /// 2. to assign smaller virtual core ids to smaller numa node id.
 ///
@@ -138,8 +141,16 @@ fn get_cache_domain_id(sysfs_path: &Path, cpu: usize) -> Option<usize> {
 /// placement tree assumes ids at a level are unique and consecutive, and the
 /// raw value so far is "lowest CPU sharing this cache", which is neither.
 /// `BTreeMap` keeps the mapping stable across invocations.
+///
+/// Both remaps run whether or not the kernel reports NUMA nodes, so the
+/// fields mean the same thing on either kind of machine.
 pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
-    let sysfs_path = Path::new("/sys/devices/system");
+    machine_topology_at(Path::new("/sys/devices/system"))
+}
+
+/// [`get_machine_topology_unsorted`] against the sysfs tree rooted at
+/// `sysfs_path`, so tests can describe machines this one is not.
+fn machine_topology_at(sysfs_path: &Path) -> io::Result<Vec<CpuLocation>> {
     let mut cpus_online = HashSet::new();
     for cpu in ListIterator::from_path(&sysfs_path.join("cpu/online"))? {
         cpus_online.insert(cpu?);
@@ -148,14 +159,14 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
     let mut cpu_to_core = HashMap::new();
 
     let nodes_online = match ListIterator::from_path(&sysfs_path.join("node/online")) {
-        Ok(x) => x,
+        Ok(x) => Some(x),
         Err(x) => match x.kind() {
             io::ErrorKind::NotFound => {
                 for cpu in cpus_online.drain() {
                     let cpu_location = build_cpu_location(sysfs_path, cpu, 0, &mut cpu_to_core)?;
                     cpu_locations.push(cpu_location);
                 }
-                return Ok(cpu_locations);
+                None
             }
             _ => {
                 return Err(x);
@@ -163,7 +174,7 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
         },
     };
 
-    for node in nodes_online {
+    for node in nodes_online.into_iter().flatten() {
         let node = node?;
         let node_path = sysfs_path.join(format!("node/node{node}"));
         let node_cpus = ListIterator::from_path(&node_path.join("cpulist"))?;
@@ -178,22 +189,16 @@ pub fn get_machine_topology_unsorted() -> io::Result<Vec<CpuLocation>> {
         }
     }
 
-    let mut node_to_core_to_cpus: BTreeMap<usize, BTreeMap<usize, Vec<usize>>> = BTreeMap::new();
+    let mut core_to_cpus: BTreeMap<(usize, usize, usize), Vec<usize>> = BTreeMap::new();
     for l in &cpu_locations {
-        node_to_core_to_cpus
-            .entry(l.numa_node)
-            .or_default()
-            .entry(l.core)
+        core_to_cpus
+            .entry((l.numa_node, l.package, l.core))
             .or_default()
             .push(l.cpu)
     }
 
     let mut cpu_to_vcore = HashMap::new();
-    for (vcore, cpu_on_same_core) in node_to_core_to_cpus
-        .values()
-        .flat_map(BTreeMap::values)
-        .enumerate()
-    {
+    for (vcore, cpu_on_same_core) in core_to_cpus.values().enumerate() {
         for &cpu in cpu_on_same_core {
             cpu_to_vcore.insert(cpu, vcore);
         }
@@ -377,8 +382,11 @@ mod test {
 
 #[cfg(test)]
 mod cache_domain_tests {
-    use super::get_cache_domain_id;
+    use super::{
+        get_cache_domain_id, machine_topology_at, test_helpers::check_topolgy, CpuLocation,
+    };
     use std::{
+        collections::HashSet,
         fs,
         path::{Path, PathBuf},
         sync::atomic::{AtomicUsize, Ordering},
@@ -421,11 +429,104 @@ mod cache_domain_tests {
                 .expect("write shared_cpu_list");
             self
         }
+
+        /// Writes `relative` under the root, with the trailing newline sysfs
+        /// has.
+        fn file(&self, relative: &str, contents: &str) -> &Self {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().expect("a parent")).expect("create parent");
+            fs::write(path, format!("{contents}\n")).expect("write sysfs file");
+            self
+        }
+
+        /// Adds `cpu`'s topology directory: its package, the kernel's
+        /// `core_id` (unique only within a package) and its hyper-thread
+        /// siblings.
+        fn cpu(&self, cpu: usize, package: usize, core_id: usize, siblings: &str) -> &Self {
+            let topology = format!("cpu/cpu{cpu}/topology");
+            self.file(
+                &format!("{topology}/physical_package_id"),
+                &package.to_string(),
+            )
+            .file(&format!("{topology}/core_id"), &core_id.to_string())
+            .file(&format!("{topology}/core_cpus_list"), siblings)
+        }
+
+        /// Reads the tree back, sorted by cpu so two layouts compare.
+        fn topology(&self) -> Vec<CpuLocation> {
+            let mut topology = machine_topology_at(self.path()).expect("parse the fake tree");
+            topology.sort_by_key(|l| l.cpu);
+            topology
+        }
     }
 
     impl Drop for FakeSysfs {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One package of four hyper-threaded cores, with the gapped `core_id`s
+    /// real parts report and two L3 domains, described once with NUMA nodes
+    /// and once without. A kernel built without NUMA support has no `node`
+    /// directory, and that must not change what the fields mean.
+    #[test]
+    fn a_machine_without_numa_nodes_gets_the_same_dense_ids() {
+        let lay_out = |numa: bool| {
+            let sysfs = FakeSysfs::new();
+            sysfs.file("cpu/online", "0-7");
+            if numa {
+                sysfs
+                    .file("node/online", "0")
+                    .file("node/node0/cpulist", "0-7");
+            }
+            for (cpu, core_id) in [(0, 0), (1, 1), (2, 8), (3, 9)] {
+                let siblings = format!("{cpu},{}", cpu + 4);
+                let l3 = if cpu < 2 { "0-1,4-5" } else { "2-3,6-7" };
+                for thread in [cpu, cpu + 4] {
+                    sysfs
+                        .cpu(thread, 0, core_id, &siblings)
+                        .cache(thread, 0, "3", "Unified", l3);
+                }
+            }
+            sysfs
+        };
+
+        let with_nodes = lay_out(true).topology();
+        let without_nodes = lay_out(false).topology();
+
+        assert_eq!(
+            without_nodes, with_nodes,
+            "core and cache_domain are densified on both paths"
+        );
+    }
+
+    /// Two packages of four cores in one NUMA node, the way node interleaving
+    /// or a kernel without NUMA support presents a two-socket machine. The
+    /// kernel numbers cores from 0 in each package, so `core_id` alone says
+    /// cpu 0 and cpu 4 share a core when they are on different sockets.
+    #[test]
+    fn same_numbered_cores_on_different_packages_stay_distinct() {
+        for numa in [true, false] {
+            let sysfs = FakeSysfs::new();
+            sysfs.file("cpu/online", "0-7");
+            if numa {
+                sysfs
+                    .file("node/online", "0")
+                    .file("node/node0/cpulist", "0-7");
+            }
+            for cpu in 0..8 {
+                sysfs.cpu(cpu, cpu / 4, cpu % 4, &cpu.to_string());
+            }
+
+            let topology = sysfs.topology();
+            let cores: HashSet<usize> = topology.iter().map(|l| l.core).collect();
+            assert_eq!(
+                cores.len(),
+                8,
+                "numa nodes reported: {numa}, cores: {topology:?}"
+            );
+            check_topolgy(topology);
         }
     }
 

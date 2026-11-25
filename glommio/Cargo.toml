@@ -113,6 +113,10 @@ name    = "shared_channel"
 
 [[bench]]
 harness = false
+name    = "channel_handoff"
+
+[[bench]]
+harness = false
 name    = "preempt"
 
 [[bench]]

@@ -228,7 +228,7 @@ impl BufferedFile {
     ///
     /// Note: this syscall might be issued in a background thread depending on
     /// the system's capabilities.
-    pub async fn rename<P: AsRef<Path>>(&mut self, new_path: P) -> Result<()> {
+    pub async fn rename<P: AsRef<Path>>(&self, new_path: P) -> Result<()> {
         self.file.rename(new_path).await
     }
 
@@ -524,5 +524,30 @@ mod test {
             .await
             .expect_err("a read past the largest offset succeeded");
         file.close().await.unwrap();
+    });
+
+    buffered_file_test!(a_shared_buffered_file_can_be_renamed, path, _k, {
+        let file = std::rc::Rc::new(
+            BufferedFile::create(path.join("before"))
+                .await
+                .expect("failed to create file"),
+        );
+        let reader = file.clone();
+        file.rename(path.join("after"))
+            .await
+            .expect("rename failed");
+
+        assert!(!path.join("before").exists());
+        assert!(path.join("after").exists());
+        assert_eq!(&*reader.path().unwrap(), path.join("after").as_path());
+        reader.remove().await.expect("remove after rename failed");
+        assert!(!path.join("after").exists());
+
+        drop(reader);
+        std::rc::Rc::into_inner(file)
+            .unwrap()
+            .close()
+            .await
+            .unwrap();
     });
 }

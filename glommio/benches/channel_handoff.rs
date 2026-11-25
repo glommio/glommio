@@ -17,12 +17,18 @@
 //! setup and channel connection stay outside it. A `Barrier` lines the
 //! executors up so that every timed loop starts together, and the slowest one
 //! is the sample.
+//!
+//! To compare two arms of a change, run at least three rounds, alternating the
+//! arms (A, B, A, B, A, B), and compare the spread of each case's median
+//! across rounds. One run's confidence interval says nothing about drift
+//! between runs, and on a loaded machine the median of the same arm has moved
+//! by nearly a factor of two from one round to the next.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use glommio::{
     channels::{
         channel_mesh::{MeshBuilder, Role},
-        local_channel, shared_channel,
+        local_channel, shared_channel, TryRecvError,
     },
     enclose, spawn_local, ExecutorJoinHandle, LocalExecutorBuilder, Placement,
 };
@@ -44,6 +50,11 @@ const RECEIVER_CPU: usize = 0;
 /// Senders in the fan-in case, each on its own core.
 const FAN_IN_PRODUCERS: usize = 4;
 
+/// How long the fan-in executors spin before parking, far longer than any
+/// wait for room or data in that case, so none of them parks and every
+/// `should_notify` stays false while messages flow.
+const FAN_IN_SPIN: Duration = Duration::from_millis(10);
+
 /// Whether this machine has `n` CPUs to pin to, reporting the skip if not.
 fn have_cpus(case: &str, n: usize) -> bool {
     let available = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -53,17 +64,19 @@ fn have_cpus(case: &str, n: usize) -> bool {
     available >= n
 }
 
-/// Runs `fut_gen` on a new executor pinned to `cpu`.
-fn pinned<G, F, T>(cpu: usize, fut_gen: G) -> ExecutorJoinHandle<T>
+/// An executor builder pinned to `cpu`.
+fn on_cpu(cpu: usize) -> LocalExecutorBuilder {
+    LocalExecutorBuilder::new(Placement::Fixed(cpu)).name(&format!("bench-cpu{cpu}"))
+}
+
+/// Runs `fut_gen` on a new executor from `builder`.
+fn pinned<G, F, T>(builder: LocalExecutorBuilder, fut_gen: G) -> ExecutorJoinHandle<T>
 where
     G: FnOnce() -> F + Send + 'static,
     F: Future<Output = T> + 'static,
     T: Send + 'static,
 {
-    LocalExecutorBuilder::new(Placement::Fixed(cpu))
-        .name(&format!("bench-cpu{cpu}"))
-        .spawn(fut_gen)
-        .expect("pinned executor")
+    builder.spawn(fut_gen).expect("pinned executor")
 }
 
 /// The slowest of the timed windows the executors report.
@@ -81,7 +94,7 @@ fn shared_one_way(capacity: usize, iters: u64) -> Duration {
     let barrier = Arc::new(Barrier::new(2));
 
     let producer = pinned(
-        RECEIVER_CPU + 1,
+        on_cpu(RECEIVER_CPU + 1),
         enclose! {(barrier) move || async move {
             let tx = tx.connect().await;
             for i in 0..WARM_UP {
@@ -96,7 +109,7 @@ fn shared_one_way(capacity: usize, iters: u64) -> Duration {
         }},
     );
 
-    let consumer = pinned(RECEIVER_CPU, move || async move {
+    let consumer = pinned(on_cpu(RECEIVER_CPU), move || async move {
         let rx = rx.connect().await;
         for _ in 0..WARM_UP {
             rx.recv().await.unwrap();
@@ -119,7 +132,7 @@ fn shared_round_trip(iters: u64) -> Duration {
     let barrier = Arc::new(Barrier::new(2));
 
     let client = pinned(
-        RECEIVER_CPU + 1,
+        on_cpu(RECEIVER_CPU + 1),
         enclose! {(barrier) move || async move {
             let ping = ping_tx.connect().await;
             let pong = pong_rx.connect().await;
@@ -137,7 +150,7 @@ fn shared_round_trip(iters: u64) -> Duration {
         }},
     );
 
-    let echo = pinned(RECEIVER_CPU, move || async move {
+    let echo = pinned(on_cpu(RECEIVER_CPU), move || async move {
         let ping = ping_rx.connect().await;
         let pong = pong_tx.connect().await;
         for _ in 0..WARM_UP {
@@ -154,9 +167,40 @@ fn shared_round_trip(iters: u64) -> Duration {
     slowest(vec![client, echo])
 }
 
+/// Takes `count` messages from every stream, one stream after the next, so
+/// each producer's message lands between the others' instead of one stream
+/// draining while the rest sit full. Awaits a single stream only when a whole
+/// pass found nothing.
+async fn drain_round_robin(streams: &[shared_channel::ConnectedReceiver<u64>], count: u64) {
+    let mut left = vec![count; streams.len()];
+    let mut pending = count * streams.len() as u64;
+    let mut empty_in_a_row = 0;
+    let mut next = 0;
+    while pending > 0 {
+        let stream = next;
+        next = (next + 1) % streams.len();
+        if left[stream] == 0 {
+            continue;
+        }
+        let message = match streams[stream].try_recv() {
+            Ok(message) => message,
+            Err(TryRecvError::Empty) if empty_in_a_row < streams.len() => {
+                empty_in_a_row += 1;
+                continue;
+            }
+            Err(TryRecvError::Empty) => streams[stream].recv().await.unwrap(),
+            Err(TryRecvError::Closed) => panic!("producer {stream} closed early"),
+        };
+        black_box(message);
+        empty_in_a_row = 0;
+        left[stream] -= 1;
+        pending -= 1;
+    }
+}
+
 /// `FAN_IN_PRODUCERS` executors on CPUs 1 and up each send `iters` messages
-/// through a partial mesh to one consumer on CPU 0, which reads each producer
-/// from its own task.
+/// through a partial mesh to one consumer on CPU 0, which takes them round
+/// robin. Every executor spins rather than parks, see `FAN_IN_SPIN`.
 fn mesh_fan_in(capacity: usize, iters: u64) -> Duration {
     let mesh = MeshBuilder::<u64, _>::partial(FAN_IN_PRODUCERS + 1, capacity);
     let barrier = Arc::new(Barrier::new(FAN_IN_PRODUCERS + 1));
@@ -164,7 +208,7 @@ fn mesh_fan_in(capacity: usize, iters: u64) -> Duration {
     let mut handles: Vec<_> = (1..=FAN_IN_PRODUCERS)
         .map(|cpu| {
             pinned(
-                RECEIVER_CPU + cpu,
+                on_cpu(RECEIVER_CPU + cpu).spin_before_park(FAN_IN_SPIN),
                 enclose! {(mesh, barrier) move || async move {
                     let (senders, _) = mesh.join(Role::Producer).await.unwrap();
                     assert_eq!(senders.nr_consumers(), 1);
@@ -182,34 +226,18 @@ fn mesh_fan_in(capacity: usize, iters: u64) -> Duration {
         })
         .collect();
 
-    handles.push(pinned(RECEIVER_CPU, move || async move {
-        let (_, mut receivers) = mesh.join(Role::Consumer).await.unwrap();
-        let drain = |count: u64, streams: Vec<_>| {
-            streams
-                .into_iter()
-                .map(|rx: shared_channel::ConnectedReceiver<u64>| {
-                    spawn_local(async move {
-                        for _ in 0..count {
-                            black_box(rx.recv().await.unwrap());
-                        }
-                        rx
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let streams = receivers.streams().into_iter().map(|(_, rx)| rx).collect();
-        let mut streams_back = Vec::with_capacity(FAN_IN_PRODUCERS);
-        for task in drain(WARM_UP, streams) {
-            streams_back.push(task.await);
-        }
-        barrier.wait();
-        let started = Instant::now();
-        for task in drain(iters, streams_back) {
-            task.await;
-        }
-        started.elapsed()
-    }));
+    handles.push(pinned(
+        on_cpu(RECEIVER_CPU).spin_before_park(FAN_IN_SPIN),
+        move || async move {
+            let (_, mut receivers) = mesh.join(Role::Consumer).await.unwrap();
+            let streams: Vec<_> = receivers.streams().into_iter().map(|(_, rx)| rx).collect();
+            drain_round_robin(&streams, WARM_UP).await;
+            barrier.wait();
+            let started = Instant::now();
+            drain_round_robin(&streams, iters).await;
+            started.elapsed()
+        },
+    ));
 
     slowest(handles)
 }
@@ -220,11 +248,11 @@ fn mesh_fan_in(capacity: usize, iters: u64) -> Duration {
 /// Capacity 1024 is the busy pipe, where neither side parks. It decides the
 /// load-before-CAS in `SleepNotifier::notify` and the `try_send`-first
 /// `ConnectedSender::send`, each of which removes a cross-core RMW or read
-/// from every message. Capacity 16 is the control: the sender parks on most
-/// refills and an eventfd write dominates, so neither change should move it.
-/// The round trip is the latency regime: each hop usually finds the peer
-/// parked and wakes it through its eventfd, which is the cost those changes
-/// must not raise.
+/// from every message. Capacity 16 is the control: both sides park about once
+/// per 16 messages and the eventfd writes that wake them dominate, so neither
+/// change should move it. The round trip is the latency regime: each hop
+/// usually finds the peer parked and wakes it through its eventfd, which is the
+/// cost those changes must not raise.
 fn shared_channel_cross_core(c: &mut Criterion) {
     if !have_cpus("shared_channel_cross_core", RECEIVER_CPU + 2) {
         return;
@@ -247,10 +275,15 @@ fn shared_channel_cross_core(c: &mut Criterion) {
 /// Throughput of four producers on four cores into one consumer, counted as
 /// four messages per iteration.
 ///
-/// Every message writes the consumer's `SleepNotifier` line from one of the
-/// producers' cores, so this is where padding `should_notify` onto its own
-/// line could show, and where the load-before-CAS in `notify` keeps that line
-/// shared instead of bouncing it. Run it with and without each.
+/// The consumer takes the producers' messages interleaved and no executor
+/// parks, so four cores keep writing the consumer's `SleepNotifier` line at
+/// once: today through the CAS in `notify` on every message. This is the
+/// case for the load-before-CAS, which leaves that line shared instead of
+/// bouncing it between them.
+///
+/// It cannot decide padding `should_notify`. The other fields on that line are
+/// written only by foreign task wakes, and this case has none, so no layout
+/// change can show here. Padding needs a case with a foreign-wake writer.
 fn shared_channel_fan_in(c: &mut Criterion) {
     if !have_cpus("shared_channel_fan_in", RECEIVER_CPU + FAN_IN_PRODUCERS + 1) {
         return;
@@ -269,10 +302,11 @@ fn shared_channel_fan_in(c: &mut Criterion) {
 /// message per iteration.
 ///
 /// At capacity 1 every send wakes the parked receiver and every receive wakes
-/// the parked sender, so the iteration is two task wakes. It decides whether
-/// `RawTask::wake` should hand its reference to the scheduled task instead of
-/// taking a new one and dropping its own. Capacity 1024 is the control, where
-/// wakes are rare and the change should not show.
+/// the parked sender, so the iteration is two task wakes, two task switches
+/// and two waker clones. It decides whether `RawTask::wake` should hand its
+/// reference to the scheduled task instead of taking a new one and dropping
+/// its own. Capacity 1024 is the control, where wakes are rare and the change
+/// should not show.
 ///
 /// `make` pins the calling thread, so this group runs last.
 fn local_channel_contended(c: &mut Criterion) {

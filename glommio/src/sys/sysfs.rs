@@ -370,6 +370,9 @@ impl ListIterator {
         Ok(RangeIterStatus::HasNext)
     }
 
+    /// A parse error ends the list. The failed parse leaves `idx` where it
+    /// was, so without moving it to the end every later call would fail at
+    /// the same place and a caller that skips errors would never finish.
     fn next(&mut self) -> Option<io::Result<usize>> {
         loop {
             if let Some(ref mut iter) = self.range_iter {
@@ -380,7 +383,10 @@ impl ListIterator {
             match self.set_range_iter() {
                 Ok(RangeIterStatus::HasNext) => {}
                 Ok(RangeIterStatus::Done) => return None,
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    self.idx = self.list_str.len();
+                    return Some(Err(e));
+                }
             }
         }
     }
@@ -872,6 +878,35 @@ mod test {
             .collect_ok::<Vec<_>>()
             .is_err());
 
+        Ok(())
+    }
+
+    /// A caller that discards errors, as `get_cache_domain_id` does with
+    /// `filter_map(Result::ok)`, only finishes if the error is the last item.
+    /// The `take` bounds the check so an iterator that repeats its error fails
+    /// the assertion instead of hanging the test.
+    #[test]
+    fn a_malformed_list_yields_its_error_once_and_ends() -> io::Result<()> {
+        let cases: [(&str, &[usize]); 6] = [
+            ("-\n", &[]),
+            ("all\n", &[]),
+            ("0,-3\n", &[0]),
+            ("0-3,8,12\0\n", &[0, 1, 2, 3, 8, 12]),
+            ("1,5-80:9\0", &[1]),
+            ("5-80:0/0\0", &[]),
+        ];
+        for (list, prefix) in cases {
+            let items: Vec<_> = ListIterator::from_str(list)?.take(64).collect();
+            let oks: Vec<usize> = items
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .copied()
+                .collect();
+            let errs = items.iter().filter(|r| r.is_err()).count();
+            assert_eq!(oks, prefix, "{list:?}");
+            assert_eq!(errs, 1, "{list:?} yielded {} items", items.len());
+            assert!(items.last().unwrap().is_err(), "{list:?}");
+        }
         Ok(())
     }
 

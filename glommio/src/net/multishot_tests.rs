@@ -545,6 +545,15 @@ fn a_reply_beside_a_cpu_bound_queue_waits_one_slice_not_two() {
 /// byte in order, through a re-armed request. The flood comes as small
 /// writes a moment apart, since one bundle takes whatever the socket holds
 /// at that moment and the ceiling acts between bundles.
+///
+/// The writes come from the executor's own thread, each followed by a
+/// timer, so every write is received and its completion seen before the
+/// next is sent. A writer on another thread races the executor instead: a
+/// starved executor finds several writes waiting in the socket and takes
+/// them in one bundle, and the bound below then measures the machine's
+/// load rather than the ceiling. So this exercises the ceiling between
+/// reaps only: an executor that stalls while the flood arrives can still
+/// exceed it, as the docs on `LocalExecutorBuilder::recv_buffers` say.
 #[test]
 fn an_unread_connection_is_throttled_and_the_others_keep_their_buffers() {
     executor(16, 64).run(async {
@@ -552,28 +561,11 @@ fn an_unread_connection_is_throttled_and_the_others_keep_their_buffers() {
         let (mut writer, mut reader) = pair(Preallocated::default()).await;
         let flood: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let fd = std::os::fd::AsRawFd::as_raw_fd(&flooder);
-        let flooder_thread = std::thread::spawn(move || {
-            for chunk in flood.chunks(100) {
-                let mut sent = 0;
-                while sent < chunk.len() {
-                    let n = unsafe {
-                        libc::send(
-                            fd,
-                            chunk[sent..].as_ptr() as *const _,
-                            chunk.len() - sent,
-                            0,
-                        )
-                    };
-                    if n < 0 {
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
-                    }
-                    sent += n as usize;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        });
-        Timer::new(Duration::from_millis(100)).await;
+        for chunk in flood.chunks(100) {
+            let n = unsafe { libc::send(fd, chunk.as_ptr() as *const _, chunk.len(), 0) };
+            assert_eq!(n, chunk.len() as isize, "loopback refused a flood write");
+            Timer::new(Duration::from_millis(1)).await;
+        }
         let held = buffers_held();
         assert!(
             held <= 8,
@@ -602,7 +594,6 @@ fn an_unread_connection_is_throttled_and_the_others_keep_their_buffers() {
             got.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8),
             "the throttled connection lost or reordered bytes"
         );
-        flooder_thread.join().unwrap();
         drop(flooder);
     });
 }

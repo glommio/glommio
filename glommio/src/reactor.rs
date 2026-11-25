@@ -543,9 +543,10 @@ impl Reactor {
     /// executor has no receive buffers or the kernel refused the flag.
     /// `wanted` is how many bytes the owner can take at once, its own
     /// buffer; the request is cancelled once it has queued more than that.
-    /// At least two kernel buffers, so a bundle can always land. One bundle
-    /// can still overshoot by what the socket held at that moment, which
-    /// the kernel bounds by the socket's receive queue, not by this.
+    /// At least two kernel buffers, so a bundle can always land. The
+    /// ceiling is checked as completions are reaped, so one visit to the
+    /// ring can still overshoot by whatever the socket held, up to every
+    /// free buffer; see [`sys::RecvMultiState::ceiling`].
     pub(crate) fn recv_multi(&self, fd: RawFd, wanted: usize) -> Option<Source> {
         let buffers = self.sys.recv_buffers()?;
         let bundle = self.sys.recv_multi_bundles();

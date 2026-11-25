@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  high_level_summary: true
+  collapse_walkthrough: true
+  changed_files_summary: true
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  related_issues: true
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 3
+  path_filters:
+    - "!glommio/tests/snapshots/**"
+  path_instructions:
+    - path: "glommio/src/**/*.rs"
+      instructions: |
+        glommio is a thread-per-core io_uring runtime; each executor is single-threaded and owns its rings.
+        - Every `unsafe` block and `unsafe impl` needs an argument for why it is sound. Check aliasing, Pin, Send/Sync and drop/panic safety, and whether the change moves an invariant that unsafe code elsewhere relies on.
+        - Watch for RefCell borrows held across a waker call, an await, or a call back into the reactor.
+        - Plain `//` and `/* */` comments are not allowed under glommio/src; prose goes in `///` or `//!` docs. The dylint job enforces this, so only point it out when CI would miss it.
+        - Public API changes must be additive for the current minor release (cargo-semver-checks runs in CI). New public API needs an integration test under glommio/tests that drives it from outside the crate.
+        - Prefer findings you can show with a concrete sequence or input over style remarks.
+    - path: "glommio/tests/**/*.rs"
+      instructions: |
+        Tests here compile as a separate crate and see only the public API. Flag tests that can pass without the behaviour happening: fixed sleeps standing in for synchronisation, assertions that hold when nothing was measured, timing bounds that pass if the work never ran.
+    - path: "glommio/benches/**/*.rs"
+      instructions: |
+        Benchmarks use criterion. Check that each case measures what its doc comment says, that setup stays outside the timed region, and that results are not compared across differently loaded runs.

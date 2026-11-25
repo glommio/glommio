@@ -1784,6 +1784,11 @@ mod tests {
         assert_eq!(connected.load(Ordering::Relaxed), 2);
     }
 
+    /// Once the listener is dropped its port must refuse connections. A
+    /// process another test spawns holds a copy of every descriptor until
+    /// it execs, which can keep the listening socket open for a moment
+    /// after the drop, so an attempt that still reaches it (accepted, reset,
+    /// or timed out on a full backlog) is retried until the refusal arrives.
     #[test]
     fn stream_of_connections() {
         test_executor!(async move {
@@ -1813,8 +1818,25 @@ mod tests {
             }
             listener_handle.await.unwrap();
 
-            let res = TcpStream::connect(addr).await;
-            assert!(res.is_err(), "server is now dead, connection must fail")
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let attempt = TcpStream::connect_timeout(addr, Duration::from_secs(1)).await;
+                match attempt.map_err(io::Error::from) {
+                    Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => break,
+                    Ok(_) => {}
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::ConnectionReset | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(err) => panic!("expected a refusal, got {err}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "server is now dead, connection must fail"
+                );
+                Timer::new(Duration::from_millis(1)).await;
+            }
         });
     }
 

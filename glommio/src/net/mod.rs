@@ -35,8 +35,13 @@ fn yolo_accept(fd: BorrowedFd<'_>) -> Option<io::Result<RawFd>> {
     unless_would_block(socket::accept4(fd.as_raw_fd(), SockFlag::SOCK_CLOEXEC))
 }
 
+/// The flags every send on a socket passes. `MSG_NOSIGNAL` turns a write to
+/// a closed peer into `EPIPE`; without it the kernel also raises `SIGPIPE`,
+/// which kills a process that leaves the signal at its default.
+pub(crate) const SEND_FLAGS: MsgFlags = MsgFlags::MSG_NOSIGNAL;
+
 fn yolo_send(fd: RawFd, buf: &[u8]) -> Option<io::Result<usize>> {
-    unless_would_block(socket::send(fd, buf, MsgFlags::MSG_DONTWAIT))
+    unless_would_block(socket::send(fd, buf, SEND_FLAGS | MsgFlags::MSG_DONTWAIT))
 }
 
 fn yolo_peek(fd: RawFd, buf: &mut [u8]) -> Option<io::Result<usize>> {
@@ -80,7 +85,7 @@ fn yolo_sendv(fd: RawFd, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
         fd,
         &bufs[..len],
         &[],
-        MsgFlags::MSG_DONTWAIT,
+        SEND_FLAGS | MsgFlags::MSG_DONTWAIT,
         None,
     ))
 }
@@ -90,7 +95,7 @@ fn yolo_sendmsg(fd: RawFd, buf: &[u8], addr: &impl SockaddrLike) -> Option<io::R
         fd,
         &[IoSlice::new(buf)],
         &[],
-        MsgFlags::MSG_DONTWAIT,
+        SEND_FLAGS | MsgFlags::MSG_DONTWAIT,
         Some(addr),
     ))
 }
@@ -112,3 +117,93 @@ pub use self::{
         AcceptedUnixStream, UnixDatagram, UnixListener, UnixReadHalf, UnixStream, UnixWriteHalf,
     },
 };
+
+#[cfg(test)]
+mod test {
+    use super::{TcpListener, UnixStream};
+    use crate::timer::Timer;
+    use futures_lite::io::{AsyncWrite, AsyncWriteExt};
+    use rusty_fork::rusty_fork_test;
+    use std::{
+        io::{self, IoSlice},
+        time::Duration,
+    };
+
+    /// Puts `SIGPIPE` back to the default that kills the process, as a host
+    /// that is not a Rust binary can leave it.
+    fn restore_default_sigpipe() {
+        assert_ne!(
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+            libc::SIG_ERR
+        );
+    }
+
+    /// Writes to a stream whose peer is gone until the write reports the
+    /// broken pipe. A reset may come first, and a write may still be
+    /// accepted before the peer's close arrives.
+    async fn write_until_broken(stream: &mut (impl AsyncWrite + Unpin), vectored: bool) {
+        for _ in 0..100 {
+            let res = if vectored {
+                stream.write_vectored(&[IoSlice::new(b"x")]).await
+            } else {
+                stream.write(b"x").await
+            };
+            match res {
+                Ok(_) => {
+                    Timer::new(Duration::from_millis(1)).await;
+                }
+                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => {}
+                Err(err) => {
+                    assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+                    return;
+                }
+            }
+        }
+        panic!("the closed peer was never reported");
+    }
+
+    async fn tcp_stream_with_a_closed_peer() -> super::TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let stream = listener.accept().await.unwrap();
+        drop(peer);
+        stream
+    }
+
+    rusty_fork_test! {
+        /// A write to a TCP peer that has gone returns `EPIPE` and leaves
+        /// the process alive. Forked, since the signal disposition is per
+        /// process.
+        #[test]
+        fn a_write_to_a_closed_tcp_peer_is_an_error_not_a_signal() {
+            restore_default_sigpipe();
+            test_executor!(async move {
+                let mut stream = tcp_stream_with_a_closed_peer().await;
+                write_until_broken(&mut stream, false).await;
+            });
+        }
+
+        /// The vectored write takes its own syscall, and must not raise
+        /// `SIGPIPE` either.
+        #[test]
+        fn a_vectored_write_to_a_closed_tcp_peer_is_an_error_not_a_signal() {
+            restore_default_sigpipe();
+            test_executor!(async move {
+                let mut stream = tcp_stream_with_a_closed_peer().await;
+                write_until_broken(&mut stream, true).await;
+            });
+        }
+
+        /// A Unix stream reports a closed peer on the first write, with
+        /// `SIGPIPE` unless the send says otherwise.
+        #[test]
+        fn a_write_to_a_closed_unix_peer_is_an_error_not_a_signal() {
+            restore_default_sigpipe();
+            test_executor!(async move {
+                let (mut stream, peer) = UnixStream::pair().unwrap();
+                drop(peer);
+                write_until_broken(&mut stream, false).await;
+            });
+        }
+    }
+}

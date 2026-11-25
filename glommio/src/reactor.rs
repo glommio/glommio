@@ -397,7 +397,7 @@ impl Reactor {
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.send(&source, MsgFlags::empty());
+        self.sys.send(&source, crate::net::SEND_FLAGS);
         self.rush_dispatch(&source)?;
         Ok(source)
     }
@@ -424,7 +424,7 @@ impl Reactor {
             source.set_timeout(timeout);
         }
 
-        self.sys.sendmsg(&source, MsgFlags::empty());
+        self.sys.sendmsg(&source, crate::net::SEND_FLAGS);
         self.rush_dispatch(&source)?;
         Ok(source)
     }

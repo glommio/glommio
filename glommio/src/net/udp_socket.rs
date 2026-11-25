@@ -26,7 +26,9 @@ pub struct UdpSocket {
     /// Set once the socket is known to be connected, so `recv` and `peek`
     /// stop asking the kernel. Never set back: glommio cannot disconnect a
     /// socket, `connect` only takes an IP address, and a failed `connect`
-    /// leaves the previous peer in place. An unconnected answer is not kept,
+    /// leaves the previous peer in place. A `connect` to port 0 is not taken
+    /// as connected, since the kernel still reports no peer for it. An
+    /// unconnected answer is not kept,
     /// since the socket may be connected later through its descriptor. A
     /// disconnect made through the descriptor (`connect` with `AF_UNSPEC`)
     /// is not seen: `recv` then takes datagrams from any sender.
@@ -175,7 +177,7 @@ impl UdpSocket {
             let source = reactor.connect(self.socket.as_raw_fd(), SockaddrStorage::from(addr));
             match source.collect_rw().await {
                 Ok(_) => {
-                    self.connected.set(true);
+                    self.connected.set(addr.port() != 0);
                     return Ok(());
                 }
                 Err(x) => {
@@ -1254,6 +1256,24 @@ mod tests {
                 assert_eq!(receiver.recv(&mut buf).await.unwrap(), 4);
             }
             assert_eq!(crate::sys::test_support::peer_lookups() - before, 1);
+        });
+    }
+
+    /// A `connect` to port 0 succeeds but leaves no peer, so `recv` keeps
+    /// failing with `ENOTCONN` as `getpeername` does.
+    #[test]
+    fn a_socket_connected_to_port_zero_still_refuses_recv() {
+        test_executor!(async move {
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver.connect("127.0.0.1:0").await.unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut buf = [0u8; 8];
+            let err = receiver.recv(&mut buf).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN));
+            let err = receiver.peek(&mut buf).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN));
         });
     }
 

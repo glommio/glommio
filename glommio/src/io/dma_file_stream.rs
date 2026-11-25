@@ -886,7 +886,9 @@ impl DmaStreamWriterState {
         if self.flushed_pos() >= target || self.error.is_some() || self.write_failed {
             return Poll::Ready(());
         }
-        self.flush_waiters.push(cx.waker().clone());
+        if !self.flush_waiters.iter().any(|w| w.will_wake(cx.waker())) {
+            self.flush_waiters.push(cx.waker().clone());
+        }
         Poll::Pending
     }
 
@@ -1092,10 +1094,18 @@ impl Drop for DmaStreamWriterState {
     }
 }
 
+/// Cancelled writes never complete, so a close already waiting on them is
+/// told the stream failed and woken, and lets go of the file.
 impl Drop for DmaStreamWriter {
     fn drop(&mut self) {
         let mut state = self.state.borrow_mut();
         let mut pending = state.take_pending_handles();
+        let waiters = if pending.is_empty() {
+            Vec::new()
+        } else {
+            state.write_failed = true;
+            std::mem::take(&mut state.flush_waiters)
+        };
         for flush in pending.drain(..) {
             flush.cancel();
         }
@@ -1105,6 +1115,8 @@ impl Drop for DmaStreamWriter {
                 .sys
                 .async_truncate(file.as_raw_fd(), state.flushed_pos());
         }
+        drop(state);
+        waiters.into_iter().for_each(Waker::wake);
     }
 }
 
@@ -1272,7 +1284,8 @@ impl DmaStreamWriter {
                 return Err(closed_error().into());
             };
             file.fdatasync().await?;
-            self.state.borrow_mut().synced_pos = flushed_pos;
+            let mut state = self.state.borrow_mut();
+            state.synced_pos = state.synced_pos.max(flushed_pos);
         } else {
             assert_eq!(presync_pos, flushed_pos);
         }
@@ -2578,6 +2591,62 @@ mod test {
             );
             w.close().await.unwrap();
             assert_eq!(file_size(&filename), 4096 + 10);
+        }
+    );
+
+    file_stream_write_test!(a_repolled_flush_registers_once, path, _k, filename, file, {
+        let writer = DmaStreamWriterBuilder::new(file)
+            .with_buffer_size(4096)
+            .build();
+        let mut w = &writer;
+        w.write_all(&[7u8; 4096]).await.unwrap();
+        {
+            let mut first = Box::pin(writer.flush_aligned());
+            assert!(futures_lite::future::poll_once(&mut first).await.is_none());
+            let mut second = Box::pin(writer.flush_aligned());
+            let mut cx = Context::from_waker(noop_waker_ref());
+            for _ in 0..3 {
+                assert!(std::future::Future::poll(second.as_mut(), &mut cx).is_pending());
+            }
+            assert_eq!(writer.state.borrow().flush_waiters.len(), 1);
+        }
+        w.close().await.unwrap();
+        assert_eq!(file_size(&filename), 4096);
+    });
+
+    file_stream_write_test!(
+        a_dropped_writer_releases_a_waiting_close,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let writer = DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build();
+            let state = Rc::downgrade(&writer.state);
+            (&writer).write_all(&[7u8; 4096]).await.unwrap();
+            {
+                let mut flush = Box::pin(writer.flush_aligned());
+                assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+                let mut w = &writer;
+                let mut close = Box::pin(w.close());
+                assert!(futures_lite::future::poll_once(&mut close).await.is_none());
+                for _ in 0..4 {
+                    futures_lite::future::yield_now().await;
+                }
+                let state = writer.state.borrow();
+                assert_eq!(state.flushed_pos(), 0, "the write finished too early");
+                assert!(!state.flush_waiters.is_empty(), "close is not waiting");
+            }
+            drop(writer);
+            for _ in 0..4 {
+                futures_lite::future::yield_now().await;
+            }
+            assert!(
+                state.upgrade().is_none(),
+                "the close task still holds the stream"
+            );
         }
     );
 

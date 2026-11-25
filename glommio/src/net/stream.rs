@@ -129,7 +129,14 @@ impl Preallocated {
     pub(crate) const DEFAULT_BUFFER_SIZE: usize = 8192;
 
     /// Creates a fixed sized receive buffer
+    ///
+    /// # Panics
+    ///
+    /// If `size` is zero. A buffer with no room cannot hold what it reads:
+    /// a fill would read nothing and look like the end of the stream, and
+    /// with a multishot receive no arrival would ever fit.
     pub fn new(size: usize) -> Self {
+        assert!(size > 0, "a stream's receive buffer needs room");
         Self {
             buf: vec![0; size],
             tail: 0,

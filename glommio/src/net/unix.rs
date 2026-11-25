@@ -38,16 +38,17 @@ use std::{
 
 use crate::Result;
 
-/// Refuses a socket path holding a NUL anywhere but first, as a file path
-/// holding one is refused. The kernel ends such a path at its first NUL, so
-/// it would bind a different file. A leading NUL names a Linux abstract
-/// address instead, whose name is as long as the address says and may hold
-/// any byte.
-fn refuse_interior_nul(path: &Path) -> io::Result<()> {
+/// The address a Unix socket binds to, refusing a path that holds a NUL
+/// anywhere but first, as a file path holding one is refused. The kernel ends
+/// such a path at its first NUL, so it would bind a different file. A leading
+/// NUL names a Linux abstract address instead, whose name is as long as the
+/// address says and may hold any byte.
+fn bind_address(path: &Path) -> io::Result<socket2::SockAddr> {
     match path.as_os_str().as_bytes() {
-        [0, ..] => Ok(()),
-        _ => crate::sys::source::NativePath::try_from(path).map(drop),
+        [0, ..] => {}
+        _ => drop(crate::sys::source::NativePath::try_from(path)?),
     }
+    socket2::SockAddr::unix(path)
 }
 
 #[derive(Debug)]
@@ -111,6 +112,12 @@ impl UnixListener {
     /// with `SO_REUSEPORT` can, so to spread connections over several
     /// executors, accept them with [`shared_accept`] and send them on.
     ///
+    /// A path holding a NUL is refused with [`std::io::ErrorKind::InvalidInput`],
+    /// unless the NUL comes first: a path starting with a NUL binds a Linux
+    /// abstract address, and an empty path binds an abstract address the
+    /// kernel picks. glommio's `connect` and `send_to` take only file paths,
+    /// so they cannot reach an abstract address.
+    ///
     /// [`shared_accept`]: UnixListener::shared_accept
     ///
     /// # Examples
@@ -124,9 +131,8 @@ impl UnixListener {
     /// });
     /// ```
     pub fn bind<A: AsRef<Path>>(addr: A) -> Result<UnixListener> {
-        refuse_interior_nul(addr.as_ref())?;
+        let addr = bind_address(addr.as_ref())?;
         let sk = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        let addr = socket2::SockAddr::unix(addr.as_ref())?;
 
         // See `TcpListener::bind`: `yolo_accept` requires this.
         sk.set_nonblocking(true)?;
@@ -820,6 +826,12 @@ impl UnixDatagram {
 
     /// Creates a Unix Datagram socket bound to the specified address.
     ///
+    /// A path holding a NUL is refused with [`std::io::ErrorKind::InvalidInput`],
+    /// unless the NUL comes first: a path starting with a NUL binds a Linux
+    /// abstract address, and an empty path binds an abstract address the
+    /// kernel picks. glommio's `connect` and `send_to` take only file paths,
+    /// so they cannot reach an abstract address.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -832,9 +844,8 @@ impl UnixDatagram {
     /// });
     /// ```
     pub fn bind<A: AsRef<Path>>(addr: A) -> Result<UnixDatagram> {
-        refuse_interior_nul(addr.as_ref())?;
+        let addr = bind_address(addr.as_ref())?;
         let sk = Socket::new(Domain::UNIX, Type::DGRAM, None)?;
-        let addr = socket2::SockAddr::unix(addr.as_ref())?;
         sk.bind(&addr)?;
         Ok(Self {
             socket: GlommioDatagram::from(sk),

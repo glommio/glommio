@@ -138,6 +138,12 @@ impl Gate {
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+
+    /// The number of passes currently held.
+    #[cfg(test)]
+    pub(crate) fn passes(&self) -> usize {
+        self.inner.count.get()
+    }
 }
 
 type CurrentClosure = LocalReceiver<bool>;

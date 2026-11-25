@@ -1716,12 +1716,16 @@ impl SleepableRing {
     /// This function prepares a timer that fires unconditionally after a
     /// certain duration. The timer is added at the front of the queue such
     /// that it will be the first SQE submitted the next time we enter the
-    /// latency ring
+    /// latency ring. A duration a timespec cannot hold, such as
+    /// `Duration::MAX`, saturates to `TimeSpec64::MAX` and never fires.
     fn prepare_latency_preemption_timer(&mut self, d: Duration) -> Source {
+        let ts = match TimeSpec64::try_from(d) {
+            Ok(ts) | Err(ts) => ts,
+        };
         let source = Source::new(
             IoRequirements::default(),
             -1,
-            SourceType::Timeout(TimeSpec64::try_from(d).unwrap(), 0),
+            SourceType::Timeout(ts, 0),
             None,
             None,
         );
@@ -2694,12 +2698,14 @@ impl Reactor {
             _ => panic!("Unexpected source for copy_file_range operation"),
         };
 
+        let offset =
+            |off: u64| i64::try_from(off).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL));
         let op = pool_descriptor(fd_in).and_then(|fd_in| {
             Ok(BlockingThreadOp::CopyFileRange(
                 fd_in,
-                (off_in).try_into().unwrap(),
+                offset(off_in)?,
                 pool_descriptor(source.raw())?,
-                pos.try_into().unwrap(),
+                offset(pos)?,
                 len,
             ))
         });

@@ -164,7 +164,7 @@ pub enum PoolPlacement {
     /// #### Errors
     ///
     /// [`LocalExecutorPoolBuilder::on_all_shards`] will return `Result::Err` if
-    /// any of the provided [`CpuSet`] is empty.
+    /// the `Vec` is empty or any of the provided [`CpuSet`] is empty.
     Custom(Vec<CpuSet>),
 }
 
@@ -533,6 +533,7 @@ impl CpuSetGenerator {
                 Self::MaxPack(MaxPacker::from_cpu_set(cpus))
             }
             PoolPlacement::Custom(cpu_sets) => {
+                Self::check_nr_executors(1, cpu_sets.len())?;
                 for cpu_set in &cpu_sets {
                     Self::check_nr_cpus(1, cpu_set)?;
                     for cpu in cpu_set.iter() {

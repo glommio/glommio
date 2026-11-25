@@ -4975,6 +4975,33 @@ mod test {
     }
 
     #[test]
+    fn an_empty_custom_blocking_pool_is_a_shard_count_error() {
+        let ret = LocalExecutorBuilder::new(Placement::Unbound)
+            .blocking_thread_pool_placement(PoolPlacement::Custom(vec![]))
+            .make();
+        assert!(matches!(
+            ret,
+            Err(GlommioError::BuilderError(BuilderErrorKind::NrShards {
+                minimum: 1,
+                shards: 0
+            }))
+        ));
+    }
+
+    #[test]
+    fn an_empty_custom_executor_pool_is_a_shard_count_error() {
+        let ret = LocalExecutorPoolBuilder::new(PoolPlacement::Custom(vec![]))
+            .on_all_shards(|| async move {});
+        assert!(matches!(
+            ret,
+            Err(GlommioError::BuilderError(BuilderErrorKind::NrShards {
+                minimum: 1,
+                shards: 0
+            }))
+        ));
+    }
+
+    #[test]
     fn local_executor_unset() {
         LocalExecutor::default().run(async {});
 
@@ -5034,5 +5061,40 @@ mod test {
             Ok(7),
             "the second run never finished"
         );
+    }
+
+    #[test]
+    fn an_executor_with_a_preempt_timer_of_duration_max_runs_its_tasks() {
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::MAX)
+            .make()
+            .unwrap();
+        let out = ex.run(async {
+            sleep(Duration::from_millis(1)).await;
+            crate::spawn_local(async { 7 }).await
+        });
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn a_task_queue_with_latency_of_duration_max_runs_its_tasks() {
+        let ex = LocalExecutor::default();
+        let out = ex.run(async {
+            let tq = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::MAX),
+                "forever",
+            );
+            crate::spawn_local_into(
+                async {
+                    sleep(Duration::from_millis(1)).await;
+                    7
+                },
+                tq,
+            )
+            .unwrap()
+            .await
+        });
+        assert_eq!(out, 7);
     }
 }

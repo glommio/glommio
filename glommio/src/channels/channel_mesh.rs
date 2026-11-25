@@ -347,10 +347,14 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
             }
 
             let exec_id = crate::executor().id();
-            let index = state
+            let Err(index) = state
                 .peers
                 .binary_search_by(|n| n.executor_id.cmp(&exec_id))
-                .expect_err("Should not join a mesh more than once.");
+            else {
+                return Err(GlommioError::IoError(Error::other(
+                    "Should not join a mesh more than once.",
+                )));
+            };
 
             state.peers.insert(index, Peer::new(role));
 
@@ -545,8 +549,6 @@ impl<T: 'static + Send, A: MeshAdapter> MeshBuilder<T, A> {
 
 #[cfg(test)]
 mod tests {
-    use futures::future;
-
     use crate::{enclose, prelude::*};
 
     use super::*;
@@ -764,15 +766,44 @@ mod tests {
         }
     }
 
+    /// A second join from one executor fails on its own, without poisoning
+    /// the mesh for the peers that join it properly.
     #[test]
-    #[should_panic]
-    #[allow(unused_must_use)]
-    fn test_join_more_than_once() {
-        let mesh_builder = MeshBuilder::<u32, _>::full(2, 1);
-
-        LocalExecutor::default().run(enclose!((mesh_builder) async move {
-            future::join(mesh_builder.clone().join(), mesh_builder.join()).await;
-        }));
+    fn joining_twice_is_an_error_and_the_mesh_still_fills() {
+        let mesh = MeshBuilder::<u32, _>::full(2, 1);
+        let (refused_tx, refused_rx) = std::sync::mpsc::channel();
+        let a = LocalExecutorBuilder::default()
+            .spawn(enclose! { (mesh) move || async move {
+                let first = mesh.clone().join();
+                futures_lite::pin!(first);
+                assert!(futures_lite::future::poll_once(&mut first).await.is_none());
+                let refused = scopeguard::guard(refused_tx, |tx| {
+                    let _ = tx.send(());
+                });
+                assert!(
+                    mesh.join().await.is_err(),
+                    "a second join from one executor was accepted"
+                );
+                drop(refused);
+                crate::timer::timeout(std::time::Duration::from_secs(2), async move {
+                    first.await.map(drop)
+                })
+                .await
+                .expect("the first join did not complete");
+            }})
+            .unwrap();
+        let b = LocalExecutorBuilder::default()
+            .spawn(move || async move {
+                refused_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                join_within(mesh)
+                    .await
+                    .expect("the other peer could not join");
+            })
+            .unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
     }
 
     #[test]

@@ -292,11 +292,24 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
         }
     }
 
+    /// The upper bound counts the user reads still to come out, those held
+    /// for merging included. Each merged read carries at least one, so it
+    /// bounds the merged reads too, and [`ReadManyResult`], which yields one
+    /// item per user read, relies on it counting them.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self.iter.size_hint() {
-            (low, Some(hi)) => (low.min(1), Some(hi)),
-            (low, None) => (low.min(1), None),
-        }
+        let last = self
+            .last
+            .as_ref()
+            .map_or(0, |last| last.coalesced_user_iovecs.len());
+        let Some(merger) = &self.merger else {
+            return (usize::from(last > 0), Some(last));
+        };
+        let held = last + merger.merged.len();
+        let (low, high) = self.iter.size_hint();
+        (
+            usize::from(held > 0 || low > 0),
+            high.and_then(|high| high.checked_add(held)),
+        )
     }
 }
 
@@ -327,7 +340,7 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBu
     }
 
     pub(crate) fn set_concurrency_limit(&mut self, limit: usize) {
-        assert!(limit > 0);
+        assert!(limit > 0, "concurrency must be at least 1");
         assert!(
             !self.terminated && self.inflight.is_empty(),
             "should be called before the first call to poll()"
@@ -337,7 +350,6 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBu
     }
 
     pub(crate) fn set_memory_limit(&mut self, limit: Option<usize>) {
-        assert!(limit.unwrap_or(usize::MAX) > 0);
         assert!(
             !self.terminated && self.inflight.is_empty(),
             "should be called before the first call to poll()"
@@ -360,9 +372,10 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
     /// any, and replace it with a new one from the underlying stream.
     ///
     /// When we have a source with a result in the buffer, we take it out and
-    /// replace it with a new one from the stream, if any, to keep the buffer
-    /// full. When we have a source in the buffer but it's not ready yet, we
-    /// register the buffer and return.
+    /// replace it with a new one from the stream, if any and if the buffer
+    /// is not full without it, so the memory limit holds after small reads
+    /// give way to large ones. When we have a source in the buffer but it's
+    /// not ready yet, we register the buffer and return.
     ///
     /// When the internal buffer is full, we consume it instead of creating
     /// new ones. Otherwise fill the internal buffer as much as possible, and
@@ -386,10 +399,10 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
         let poll_buffer = |this: &mut Self, cx: &mut Context<'_>| {
             if this.inflight.back_mut().unwrap().0.result().is_some() {
                 let ret = this.inflight.pop_back().unwrap();
-                if !this.terminated {
+                this.inflight_memory -= ret.1.size();
+                if !this.terminated && !this.is_full() {
                     let _ = poll_inner(this, cx);
                 }
-                this.inflight_memory -= ret.1.size();
                 Poll::Ready(Some(ret))
             } else {
                 this.inflight
@@ -468,8 +481,12 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
     /// However, higher values will increase memory usage and possibly starve
     /// by-standing IO-emitting tasks.
     ///
-    /// This function should be called before the stream is first polled and
-    /// will panic otherwise.
+    /// This function should be called before the stream is first polled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `concurrency` is zero, since no read could ever be
+    /// submitted, or if the stream has already been polled.
     #[must_use]
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.inner.set_concurrency_limit(concurrency);
@@ -489,9 +506,14 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
     ///
     /// Note that this is a soft limit. No matter how small this limit is set
     /// to, a single IO request will always be allowed to run. This can happen
-    /// if you configure the IO merging logic very aggressively.
+    /// if you configure the IO merging logic very aggressively. A limit of
+    /// `Some(0)` therefore runs one IO request at a time.
     ///
     /// Defaults to no limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stream has already been polled.
     #[must_use]
     pub fn with_memory_limit(mut self, limit: Option<usize>) -> Self {
         self.inner.set_memory_limit(limit);
@@ -504,15 +526,19 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
 {
     type Item = super::Result<(V, ReadResult)>;
 
+    /// Hands out the user reads carved from the current system read, and lets
+    /// go of it with the last one, so its buffer lives only as long as the
+    /// results that point into it.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some((source, args, read)) = &mut self.current {
             if let Some(io) = args.user_reads.pop_front() {
                 let offset = (io.pos() - args.system_read.pos()) as usize;
                 let len = read.saturating_sub(offset).min(io.size());
-                return Poll::Ready(Some(Ok((
-                    io,
-                    ReadResult::from_sliced_buffer(source.clone(), offset, len),
-                ))));
+                let result = ReadResult::from_sliced_buffer(source.clone(), offset, len);
+                if args.user_reads.is_empty() {
+                    self.current = None;
+                }
+                return Poll::Ready(Some(Ok((io, result))));
             }
         }
 
@@ -527,8 +553,20 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
         }
     }
 
+    /// A failed system read yields one error for all of its user reads, so
+    /// the lower bound counts system reads and the upper bound user reads.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        let current = self
+            .current
+            .as_ref()
+            .map_or(0, |(_, args, _)| args.user_reads.len());
+        let inflight = &self.inner.inflight;
+        let inflight_reads: usize = inflight.iter().map(|(_, args)| args.user_reads.len()).sum();
+        let (low, high) = self.inner.iovs.size_hint();
+        (
+            low.saturating_add(current + inflight.len()),
+            high.and_then(|high| high.checked_add(current + inflight_reads)),
+        )
     }
 }
 
@@ -770,6 +808,167 @@ mod tests {
                     ((0, 256), (0, 256)),
                 ]
             );
+        });
+    }
+
+    /// A temporary file of `bytes` bytes, a multiple of the `O_DIRECT`
+    /// alignment.
+    async fn a_file_of(bytes: usize) -> Rc<DmaFile> {
+        let file = crate::io::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .tmpfile(true)
+            .dma_open(std::env::temp_dir())
+            .await
+            .unwrap();
+        let mut buf = file.alloc_dma_buffer(bytes);
+        buf.as_bytes_mut().fill(7);
+        file.write_at(buf, 0).await.unwrap();
+        Rc::new(file)
+    }
+
+    /// A read returned to the caller is replaced only while the reads still
+    /// in flight are under the memory limit, so small reads giving way to
+    /// large ones do not carry the stream past it.
+    #[test]
+    fn replacing_returned_reads_keeps_to_the_memory_limit() {
+        test_executor!(async move {
+            const SMALL: usize = 4096;
+            const LARGE: usize = 65536;
+            const CAP: usize = 65536;
+            let file = a_file_of(32 * SMALL + 32 * LARGE).await;
+            let small = (0..32u64).map(|i| (i * SMALL as u64, SMALL));
+            let large = (0..32u64).map(|i| (32 * SMALL as u64 + i * LARGE as u64, LARGE));
+            let mut reads = file
+                .read_many(
+                    stream::iter(small.chain(large)),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_memory_limit(Some(CAP));
+            let mut most = 0;
+            let mut yielded = 0;
+            while let Some(read) = reads.next().await {
+                read.unwrap();
+                yielded += 1;
+                most = most.max(reads.inner.inflight_memory);
+            }
+            assert_eq!(yielded, 64);
+            assert!(
+                most <= CAP + LARGE,
+                "{most} bytes in flight against a limit of {CAP}"
+            );
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// Drains `reads`, checking before every item that its bounds cover the
+    /// `total` items it must yield.
+    async fn assert_size_hint_holds<S: Stream + Unpin>(mut reads: S, total: usize) {
+        for remaining in (0..=total).rev() {
+            let (low, high) = reads.size_hint();
+            assert!(
+                low <= remaining && high.is_none_or(|high| high >= remaining),
+                "size_hint ({low}, {high:?}) with {remaining} left"
+            );
+            assert_eq!(reads.next().await.is_some(), remaining > 0);
+        }
+    }
+
+    /// Reads merged into one system read still yield one item each, and the
+    /// bounds must cover all of them: those of the read in hand, and those
+    /// coalescing still holds when the concurrency limit stops it early.
+    #[test]
+    fn size_hint_bounds_the_reads_left_to_yield() {
+        test_executor!(async move {
+            let file = a_file_of(65536).await;
+            let merged = file.read_many(
+                stream::iter((0..16u64).map(|i| (i * 512, 512usize))),
+                MergedBufferLimit::DeviceMaxSingleRequest,
+                ReadAmplificationLimit::NoAmplification,
+            );
+            assert_size_hint_holds(merged, 16).await;
+            let held = file
+                .read_many(
+                    stream::iter((0..16u64).map(|i| (i * 4096, 512usize))),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_concurrency(1);
+            assert_size_hint_holds(held, 16).await;
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// Once the last read carved out of a system read is handed out, the
+    /// stream lets go of its buffer: a later read of the same range finds
+    /// nothing in flight to reuse.
+    #[test]
+    fn a_spent_system_read_is_released_by_the_stream() {
+        test_executor!(async move {
+            let file = a_file_of(4096).await;
+            file.attach_scheduler();
+            let mut reads = file.read_many(
+                stream::iter((0..4u64).map(|i| (i * 512, 512usize))),
+                MergedBufferLimit::DeviceMaxSingleRequest,
+                ReadAmplificationLimit::NoAmplification,
+            );
+            for _ in 0..4 {
+                drop(reads.next().await.unwrap().unwrap());
+            }
+            let deduped = || {
+                crate::executor()
+                    .io_stats()
+                    .all_rings()
+                    .file_deduped_reads()
+                    .0
+            };
+            let before = deduped();
+            file.read_at(0, 512).await.unwrap();
+            assert_eq!(deduped(), before, "the stream still holds its last read");
+            drop(reads);
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// The memory limit documents that a single request always runs, so a
+    /// limit of zero reads one at a time.
+    #[test]
+    fn a_zero_memory_limit_reads_one_at_a_time() {
+        test_executor!(async move {
+            let file = a_file_of(8192).await;
+            let mut reads = file
+                .read_many(
+                    stream::iter((0..4u64).map(|i| (i * 2048, 512usize))),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_memory_limit(Some(0));
+            let mut yielded = 0;
+            while let Some(read) = reads.next().await {
+                assert_eq!(read.unwrap().1.len(), 512);
+                assert!(reads.inner.inflight.len() <= 1);
+                yielded += 1;
+            }
+            assert_eq!(yielded, 4);
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// No read could ever be submitted under a concurrency of zero, so it is
+    /// refused up front.
+    #[test]
+    #[should_panic(expected = "concurrency must be at least 1")]
+    fn a_concurrency_of_zero_is_refused() {
+        test_executor!(async move {
+            let file = a_file_of(4096).await;
+            let _ = file
+                .read_many(
+                    stream::iter([(0u64, 512usize)]),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_concurrency(0);
         });
     }
 

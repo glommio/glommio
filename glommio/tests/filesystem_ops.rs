@@ -129,12 +129,12 @@ fn truncate_shortens_a_file() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A path holding an interior NUL cannot name a file, and answers `EFAULT` on
-/// whichever path the operation takes.
+/// A path holding an interior NUL cannot name a file, and every operation
+/// refuses it the same way, as `InvalidInput`, whichever path it takes.
 ///
-/// It is worth pinning down because these operations now build the native form
-/// of the path up front rather than inside the blocking thread, and the two
-/// used to disagree.
+/// It is worth pinning down because these operations build the native form of
+/// the path up front rather than inside the blocking thread, and the two used
+/// to disagree: one answered `EFAULT`, and opening a file panicked.
 #[test]
 fn an_interior_nul_is_refused_the_same_way_on_both_paths() {
     use std::path::Path;
@@ -149,12 +149,13 @@ fn an_interior_nul_is_refused_the_same_way_on_both_paths() {
                     .await
                     .map(|_| ()),
                 glommio::io::Directory::create(path).await.map(|_| ()),
+                glommio::io::DmaFile::open(path).await.map(|_| ()),
             ] {
                 let err = result.expect_err("a path with an interior NUL names nothing");
                 assert_eq!(
-                    std::io::Error::from(err).raw_os_error(),
-                    Some(libc::EFAULT),
-                    "the answer should be the same as it was before the path was built up front"
+                    std::io::Error::from(err).kind(),
+                    std::io::ErrorKind::InvalidInput,
+                    "every operation should refuse the path the same way"
                 );
             }
         })

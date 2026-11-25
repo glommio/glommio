@@ -968,6 +968,45 @@ pub(crate) mod test_utils {
         TestDirectory { path: dir, kind }
     }
 
+    type PolledOnWake = Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
+
+    std::thread_local! {
+        static POLLED_ON_WAKE: std::cell::RefCell<PolledOnWake> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Wakes by polling [`poll_on_wake`]'s future right there, inside
+    /// `wake()`, as some foreign executors do.
+    struct PollOnWake;
+
+    impl std::task::Wake for PollOnWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            let Some(mut fut) = POLLED_ON_WAKE.with(|slot| slot.borrow_mut().take()) else {
+                return;
+            };
+            let waker = std::task::Waker::from(self);
+            if fut
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_pending()
+            {
+                POLLED_ON_WAKE.with(|slot| *slot.borrow_mut() = Some(fut));
+            }
+        }
+    }
+
+    /// Polls `fut` once now and again inside every `wake()` of its waker,
+    /// until it completes. The future is held outside its slot while it is
+    /// polled, so a poll that panics drops it during the unwind, as a
+    /// future on a stack would be. One such future per thread.
+    pub(crate) fn poll_on_wake(fut: impl std::future::Future<Output = ()> + 'static) {
+        POLLED_ON_WAKE.with(|slot| {
+            assert!(slot.borrow().is_none(), "one future per thread");
+            *slot.borrow_mut() = Some(Box::pin(fut));
+        });
+        std::task::Wake::wake(std::sync::Arc::new(PollOnWake));
+    }
+
     // `glommio::test` is re-exported at the crate root, and `use super::*`
     // brings it into scope here, so the attribute has to say which `test` it
     // means. Callers outside the crate never see this: they get the macro.

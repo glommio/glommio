@@ -167,7 +167,13 @@ impl ExecutorContext {
 
     /// The removed queue is dropped after the queues are released: a dynamic
     /// shares manager it owns may run destructors that reach the executor.
+    ///
+    /// The default queue is refused: `spawn` and `run` place work in it, and a
+    /// task woken in a missing queue is cancelled.
     pub(super) fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
+        if handle == TaskQueueHandle::default() {
+            return Err(GlommioError::queue_still_active(handle.index));
+        }
         let removed = {
             let mut queues = self.queues.borrow_mut();
             if queues

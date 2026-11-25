@@ -7,7 +7,7 @@ use super::stream::GlommioStream;
 use crate::{
     net::{
         stream::{Buffered, NonBuffered, Preallocated, RxBuf},
-        yolo_accept,
+        ImmediateAccepts,
     },
     reactor::Reactor,
     sys::Source,
@@ -85,6 +85,7 @@ pub struct TcpListener {
     reactor: Weak<Reactor>,
     listener: net::TcpListener,
     current_source: RefCell<Option<Source>>,
+    immediate: ImmediateAccepts,
 }
 
 /// Options for binding a [`TcpListener`], for when the defaults of
@@ -204,6 +205,7 @@ impl TcpListenerBuilder {
             reactor: Rc::downgrade(&crate::executor().reactor()),
             listener,
             current_source: Default::default(),
+            immediate: Default::default(),
         })
     }
 }
@@ -221,6 +223,7 @@ impl FromRawFd for TcpListener {
             reactor: Rc::downgrade(&crate::executor().reactor()),
             listener,
             current_source: Default::default(),
+            immediate: Default::default(),
         }
     }
 }
@@ -311,7 +314,7 @@ impl TcpListener {
             None => {
                 let reactor = self.reactor.upgrade().unwrap();
                 let fd = self.listener.as_fd();
-                match yolo_accept(fd) {
+                match self.immediate.accept(&reactor, fd) {
                     Some(r) => match r {
                         Ok(fd) => Poll::Ready(Ok(AcceptedTcpStream { fd })),
                         Err(err) => Poll::Ready(Err(GlommioError::IoError(err))),

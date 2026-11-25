@@ -687,7 +687,13 @@ mod tests {
     use super::*;
     use crate::{timer::Timer, LocalExecutorBuilder};
     use nix::sys::socket::{MsgFlags, SockaddrIn};
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
 
     macro_rules! connected_pair {
         () => {{
@@ -749,14 +755,21 @@ mod tests {
     /// We can't rely on how the load balancing will happen, so we just send a
     /// bunch. There seems to be affinity, so every time we send we create a
     /// new source address.
+    ///
+    /// The sending waits until both executors have bound. An executor that
+    /// binds after the last datagram has gone waits forever for its own, and
+    /// a loaded machine can take longer than any fixed pause to start one.
     fn multi_executor_bind_works() {
         test_executor!(async move {
             let addr_picker = UdpSocket::bind("127.0.0.1:0").unwrap();
             let addr = addr_picker.local_addr().unwrap();
+            let bound = Arc::new(AtomicUsize::new(0));
 
+            let ex1_bound = bound.clone();
             let ex1 = LocalExecutorBuilder::default()
                 .spawn(move || async move {
                     let socket = UdpSocket::bind(addr).unwrap();
+                    ex1_bound.fetch_add(1, Ordering::Release);
                     let mut buf = [0u8; 1];
                     println!("will receive");
                     let (sz, _) = socket.recv_from(&mut buf).await.unwrap();
@@ -766,9 +779,11 @@ mod tests {
                 })
                 .unwrap();
 
+            let ex2_bound = bound.clone();
             let ex2 = LocalExecutorBuilder::default()
                 .spawn(move || async move {
                     let socket = UdpSocket::bind(addr).unwrap();
+                    ex2_bound.fetch_add(1, Ordering::Release);
                     let mut buf = [0u8; 1];
                     let (sz, _) = socket.recv_from(&mut buf).await.unwrap();
                     assert_eq!(sz, 1);
@@ -776,7 +791,11 @@ mod tests {
                 })
                 .unwrap();
 
-            Timer::new(Duration::from_millis(100)).await;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while bound.load(Ordering::Acquire) < 2 {
+                assert!(Instant::now() < deadline, "an executor never bound");
+                Timer::new(Duration::from_millis(1)).await;
+            }
 
             for _ in 0..1000 {
                 let client = UdpSocket::bind("127.0.0.1:0").unwrap();

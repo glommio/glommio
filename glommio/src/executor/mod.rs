@@ -4114,6 +4114,14 @@ mod test {
     /// should have received very low ratio. On the second half we should
     /// have accumulated much more. Real numbers are likely much higher than
     /// the targets, but those targets are safe.
+    ///
+    /// The second window opens when `tq2` first runs after its shares go up,
+    /// not at the one second mark. Runtime is wall-clock time, so a
+    /// preemption by the operating system that lands while `tq2` runs at one
+    /// share is charged to it a thousand times over, and `tq1` runs alone
+    /// until that is paid back: a 3ms preemption costs `tq2` three seconds.
+    /// A window opened on the clock would measure that debt rather than the
+    /// new shares.
     fn test_dynamic_shares() {
         let local_ex = LocalExecutor::default();
 
@@ -4133,15 +4141,21 @@ mod test {
             let tq1_count = Rc::new(RefCell::new(vec![0, 0]));
             let tq2_count = Rc::new(RefCell::new(vec![0, 0]));
             let now = Instant::now();
+            let window = Duration::from_secs(1);
+            let raised: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
 
             let t1 = crate::spawn_local_into(
-                enclose! { (tq1_count, now) async move {
+                enclose! { (tq1_count, now, raised) async move {
                     loop {
-                        let secs = now.elapsed().as_secs();
-                        if secs >= 2 {
-                            break;
+                        match raised.get() {
+                            Some(at) if at.elapsed() >= window => break,
+                            Some(_) => (*tq1_count.borrow_mut())[1] += 1,
+                            None if now.elapsed() < window => (*tq1_count.borrow_mut())[0] += 1,
+                            None => assert!(
+                                now.elapsed() < Duration::from_secs(60),
+                                "tq2 never ran again after its shares went up"
+                            ),
                         }
-                        (*tq1_count.borrow_mut())[secs as usize] += 1;
                         crate::executor().yield_task_queue_now().await;
                     }
                 }},
@@ -4150,15 +4164,18 @@ mod test {
             .unwrap();
 
             let t2 = crate::spawn_local_into(
-                enclose! { (tq2_count, now, bm) async move {
+                enclose! { (tq2_count, now, bm, raised) async move {
                     loop {
                         let elapsed = now.elapsed();
-                        let secs = elapsed.as_secs();
-                        if secs >= 2 {
-                            break;
-                        }
                         bm.tick(elapsed.as_millis() as u64);
-                        (*tq2_count.borrow_mut())[secs as usize] += 1;
+                        if elapsed >= window && raised.get().is_none() {
+                            raised.set(Some(Instant::now()));
+                        }
+                        match raised.get() {
+                            Some(at) if at.elapsed() >= window => break,
+                            Some(_) => (*tq2_count.borrow_mut())[1] += 1,
+                            None => (*tq2_count.borrow_mut())[0] += 1,
+                        }
                         crate::executor().yield_task_queue_now().await;
                     }
                 }},
@@ -4173,9 +4190,9 @@ mod test {
                 .zip(tq2_count.borrow().iter())
                 .map(|(x, y)| *y as f64 / *x as f64)
                 .collect();
-            assert!(ratios[1] > ratios[0]);
-            assert!(ratios[0] < 0.25);
-            assert!(ratios[1] > 0.50);
+            assert!(ratios[1] > ratios[0], "ratios {ratios:?}");
+            assert!(ratios[0] < 0.25, "ratios {ratios:?}");
+            assert!(ratios[1] > 0.50, "ratios {ratios:?}");
         });
     }
 

@@ -538,8 +538,12 @@ mod tests {
 #[cfg(test)]
 mod write_once {
     use super::*;
-    use crate::{timer::sleep, LocalExecutor};
-    use std::{rc::Rc, time::Duration};
+    use crate::LocalExecutor;
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
 
     /// A `set` that wins the race is what every later caller sees.
     ///
@@ -581,21 +585,31 @@ mod write_once {
     fn set_is_refused_while_an_initialiser_holds_the_permit() {
         LocalExecutor::default().run(async {
             let cell: Rc<OnceCell<u32>> = Rc::new(OnceCell::new());
+            let entered = Rc::new(Cell::new(false));
+            let (release, released) = futures::channel::oneshot::channel::<()>();
 
             let initialiser = crate::spawn_local({
                 let cell = cell.clone();
+                let entered = entered.clone();
                 async move {
                     *cell
-                        .get_or_init(|| async {
-                            sleep(Duration::from_millis(20)).await;
+                        .get_or_init(|| async move {
+                            entered.set(true);
+                            released.await.unwrap();
                             2
                         })
                         .await
                 }
             });
 
-            // Let the initialiser take the permit and park inside `init`.
-            sleep(Duration::from_millis(5)).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !entered.get() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the initialiser never entered `init`"
+                );
+                crate::executor().yield_now().await;
+            }
 
             assert_eq!(
                 cell.set(1),
@@ -604,6 +618,7 @@ mod write_once {
             );
             assert_eq!(cell.get(), None, "and nothing was published");
 
+            release.send(()).unwrap();
             assert_eq!(initialiser.await, 2, "the initialiser's own value stands");
             assert_eq!(cell.get(), Some(&2));
 
@@ -710,8 +725,12 @@ mod parity_tests {
 #[cfg(test)]
 mod std_trait_tests {
     use super::*;
-    use crate::{timer::sleep, LocalExecutor};
-    use std::{rc::Rc, time::Duration};
+    use crate::LocalExecutor;
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
 
     #[test]
     fn debug_shows_the_value() {
@@ -748,13 +767,17 @@ mod std_trait_tests {
     fn a_clone_taken_mid_initialisation_is_empty_and_independent() {
         LocalExecutor::default().run(async {
             let cell: Rc<OnceCell<u32>> = Rc::new(OnceCell::new());
+            let entered = Rc::new(Cell::new(false));
+            let (release, released) = futures::channel::oneshot::channel::<()>();
 
             let initialising = crate::spawn_local({
                 let cell = cell.clone();
+                let entered = entered.clone();
                 async move {
                     *cell
-                        .get_or_init(|| async {
-                            sleep(Duration::from_millis(20)).await;
+                        .get_or_init(|| async move {
+                            entered.set(true);
+                            released.await.unwrap();
                             1u32
                         })
                         .await
@@ -764,7 +787,14 @@ mod std_trait_tests {
             let cloner = crate::spawn_local({
                 let cell = cell.clone();
                 async move {
-                    sleep(Duration::from_millis(5)).await;
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !entered.get() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the initialiser never entered `init`"
+                        );
+                        crate::executor().yield_now().await;
+                    }
                     // Explicit: `cell.clone()` would clone the `Rc`, not the cell.
                     let copy = OnceCell::clone(&cell);
                     assert_eq!(
@@ -772,6 +802,7 @@ mod std_trait_tests {
                         None,
                         "nothing published yet, so the clone is empty"
                     );
+                    release.send(()).unwrap();
                     // Its own semaphore, so this does not queue behind the original.
                     *copy.get_or_init(|| async { 2u32 }).await
                 }

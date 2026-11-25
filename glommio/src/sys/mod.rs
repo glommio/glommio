@@ -699,9 +699,14 @@ impl Wakers {
     }
 
     /// Takes the waiters out, to be woken with [`wake_all`] once the source
-    /// is no longer borrowed.
-    pub(super) fn take_waiters(&mut self) -> SmallVec<[Waker; 1]> {
-        std::mem::take(&mut self.waiters)
+    /// is no longer borrowed. A lone waiter, the common case, is popped
+    /// rather than the list moved.
+    pub(super) fn take_waiters(&mut self) -> TakenWaiters {
+        match self.waiters.len() {
+            0 => TakenWaiters::None,
+            1 => TakenWaiters::One(self.waiters.pop().unwrap()),
+            _ => TakenWaiters::Many(std::mem::take(&mut self.waiters)),
+        }
     }
 
     fn timestamps(&mut self) -> Option<Latencies> {
@@ -717,17 +722,32 @@ impl Wakers {
     }
 }
 
+/// The waiters [`Wakers::take_waiters`] took out of a source.
+pub(super) enum TakenWaiters {
+    None,
+    One(Waker),
+    Many(SmallVec<[Waker; 1]>),
+}
+
 /// Wakes waiters taken with [`Wakers::take_waiters`], and says whether there
 /// were any. Called with nothing borrowed, since a waker may poll its future
 /// on the spot and that future looks at the source. Such a future can read
 /// its result there, but not submit new I/O: no task queue is executing
 /// during the reactor's pass, and a new source needs one.
-pub(super) fn wake_all(waiters: SmallVec<[Waker; 1]>) -> bool {
-    let woke = !waiters.is_empty();
-    for waker in waiters {
-        wake!(waker);
+pub(super) fn wake_all(waiters: TakenWaiters) -> bool {
+    match waiters {
+        TakenWaiters::None => false,
+        TakenWaiters::One(waker) => {
+            wake!(waker);
+            true
+        }
+        TakenWaiters::Many(waiters) => {
+            for waker in waiters {
+                wake!(waker);
+            }
+            true
+        }
     }
-    woke
 }
 
 /// Shuts down the requested side of a socket.

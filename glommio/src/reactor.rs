@@ -8,12 +8,10 @@
 use std::{
     cell::RefCell,
     collections::{btree_map::Entry, BTreeMap},
-    ffi::CString,
     fmt,
     future::Future,
     io, mem,
-    os::unix::{ffi::OsStrExt, io::RawFd},
-    path::Path,
+    os::unix::io::RawFd,
     rc::Rc,
     sync::Arc,
     task::Waker,
@@ -848,12 +846,10 @@ impl Reactor {
     pub(crate) fn open_at(
         &self,
         dir: RawFd,
-        path: &Path,
+        path: NativePath,
         flags: libc::c_int,
         mode: libc::mode_t,
     ) -> Source {
-        let path = CString::new(path.as_os_str().as_bytes()).expect("path contained null!");
-
         let source = self.new_source(
             dir,
             SourceType::Open(path),

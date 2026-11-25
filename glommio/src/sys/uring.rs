@@ -2889,7 +2889,7 @@ impl Reactor {
 
     pub(crate) fn open_at(&self, source: &Source, flags: libc::c_int, mode: libc::mode_t) {
         let pathptr = match &*source.source_type() {
-            SourceType::Open(cstring) => cstring.as_c_str().as_ptr(),
+            SourceType::Open(path) => path.as_ptr(),
             _ => panic!("Wrong source type!"),
         };
         let op = UringOpDescriptor::Open(pathptr as _, flags, mode as _);

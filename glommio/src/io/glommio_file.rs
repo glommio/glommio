@@ -233,12 +233,14 @@ impl GlommioFile {
         let (source, recorded) = match dir {
             None => {
                 let path = absolute(path.to_owned())?;
-                (reactor.open_at(-1, &path, flags, mode), Some(path))
+                let native = sys::source::NativePath::try_from(&*path)?;
+                (reactor.open_at(-1, native, flags, mode), Some(path))
             }
             Some(dir) => {
                 let recorded = dir.path().map(|dir| absolute(dir.join(path))).transpose()?;
+                let native = sys::source::NativePath::try_from(path)?;
                 (
-                    reactor.open_at(dir.as_raw_fd(), path, flags, mode),
+                    reactor.open_at(dir.as_raw_fd(), native, flags, mode),
                     recorded,
                 )
             }
@@ -873,6 +875,49 @@ pub(crate) mod test {
             }
             sleep(Duration::from_millis(20)).await;
             assert_eq!(open_fds_on(&path), 0, "the cancelled open leaked the fd");
+        });
+    }
+
+    /// The `io::ErrorKind` a caller sees after `?` turns a failed operation's
+    /// error into an `io::Error`, or `None` if it succeeded.
+    pub(crate) fn kind_seen_through_question_mark<R, T>(
+        result: std::result::Result<R, crate::GlommioError<T>>,
+    ) -> Option<std::io::ErrorKind> {
+        result.err().map(|err| std::io::Error::from(err).kind())
+    }
+
+    /// A path holding an interior NUL cannot name a file. Opening, renaming
+    /// or removing one fails with `InvalidInput`, as std does, instead of
+    /// panicking, and the kind survives `?` into an `io::Error`.
+    #[test]
+    fn opening_a_path_with_a_nul_fails_instead_of_panicking() {
+        use std::io::ErrorKind::InvalidInput;
+        test_executor!(async move {
+            let path = Path::new("/tmp/glommio\0nul");
+            let raw = GlommioFile::open_at(None, path, libc::O_RDONLY, 0).await;
+            assert_eq!(raw.err().map(|e| e.kind()), Some(InvalidInput));
+            let dma = crate::io::DmaFile::open(path).await;
+            assert_eq!(kind_seen_through_question_mark(dma), Some(InvalidInput));
+            let created = crate::io::DmaFile::create(path).await;
+            assert_eq!(kind_seen_through_question_mark(created), Some(InvalidInput));
+            let buffered = crate::io::BufferedFile::open(path).await;
+            assert_eq!(
+                kind_seen_through_question_mark(buffered),
+                Some(InvalidInput)
+            );
+            let with_options = crate::io::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .buffered_open(path)
+                .await;
+            assert_eq!(
+                kind_seen_through_question_mark(with_options),
+                Some(InvalidInput)
+            );
+            let renamed = crate::io::rename(path, "/tmp/glommio-nul-target").await;
+            assert_eq!(kind_seen_through_question_mark(renamed), Some(InvalidInput));
+            let removed = crate::io::remove(path).await;
+            assert_eq!(kind_seen_through_question_mark(removed), Some(InvalidInput));
         });
     }
 

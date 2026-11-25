@@ -211,7 +211,7 @@ impl DmaFile {
     ) -> io::Result<DmaFile> {
         let file = GlommioFile::open_at(dir, path, flags, mode).await?;
         let (major, minor) = (file.dev_major as usize, file.dev_minor as usize);
-        let buf = statfs(path).unwrap();
+        let buf = fstatfs(&file)?;
         let fstype = buf.filesystem_type();
         let max_sectors_size = sysfs::BlockDevice::max_sectors_size(major, minor);
         let max_segment_size = sysfs::BlockDevice::max_segment_size(major, minor);
@@ -1233,6 +1233,49 @@ pub(crate) mod test {
             .expect_err("opened nonexistent file");
         std::assert!(!path.join("testfile").exists());
     });
+
+    /// Whether this process holds a descriptor on `target`.
+    fn holds_a_descriptor_on(target: &Path) -> bool {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|link| link == target))
+    }
+
+    dma_file_test!(
+        an_open_succeeds_when_the_path_is_removed_under_it,
+        path,
+        _k,
+        {
+            let target = path.join("testfile");
+            DmaFile::create(&target)
+                .await
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+            let target = std::fs::canonicalize(&target).unwrap();
+
+            let removed = Rc::new(std::cell::Cell::new(false));
+            let remover = crate::spawn_local(enclose! { (target, removed) async move {
+                while !holds_a_descriptor_on(&target) {
+                    futures_lite::future::yield_now().await;
+                }
+                std::fs::remove_file(&target).unwrap();
+                removed.set(true);
+            }});
+
+            let file = DmaFile::open(&target)
+                .await
+                .expect("an open whose path was removed after the open failed");
+            assert!(
+                removed.get(),
+                "the path was not removed while the open was in flight"
+            );
+            remover.await;
+            file.close().await.unwrap();
+        }
+    );
 
     dma_file_test!(file_rename, path, _k, {
         let new_file = DmaFile::create(path.join("testfile"))

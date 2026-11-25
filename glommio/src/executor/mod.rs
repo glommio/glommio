@@ -1657,6 +1657,14 @@ impl LocalExecutor {
     /// Removes a task queue.
     ///
     /// The task queue cannot be removed if there are still pending tasks.
+    ///
+    /// The default queue, [`TaskQueueHandle::default()`], cannot be removed
+    /// at all: [`spawn`] and [`run`] place work in it. Removing it returns a
+    /// [`QueueErrorKind::StillActive`] error.
+    ///
+    /// [`spawn`]: LocalExecutor::spawn
+    /// [`run`]: LocalExecutor::run
+    /// [`QueueErrorKind::StillActive`]: crate::error::QueueErrorKind::StillActive
     pub fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
         self.context.remove_task_queue(handle)
     }
@@ -3439,9 +3447,10 @@ mod test {
 
     use crate::{
         enclose,
+        error::{ExecutorErrorKind, QueueErrorKind},
         io::{DmaFile, OpenOptions, OwnedDmaFile},
         timer::{self, sleep, Timer},
-        SharesManager,
+        GlommioError, SharesManager,
     };
 
     use super::*;
@@ -5214,5 +5223,57 @@ mod test {
             .await
         });
         assert_eq!(out, 7);
+    }
+
+    /// `spawn` and `run` both place work in the default queue, so removing it
+    /// would leave them nowhere to go.
+    #[test]
+    fn the_default_queue_cannot_be_removed_before_run() {
+        let ex = LocalExecutor::default();
+        let removed = ex.remove_task_queue(TaskQueueHandle::default());
+        assert!(
+            matches!(
+                removed,
+                Err(GlommioError::ExecutorError(ExecutorErrorKind::QueueError {
+                    index: 0,
+                    kind: QueueErrorKind::StillActive,
+                }))
+            ),
+            "removing the default queue returned {removed:?}"
+        );
+        let task = ex.spawn(async { 3 });
+        assert_eq!(ex.run(async { task.await * 2 }), 6);
+    }
+
+    /// The main future lives in the default queue. A task in another queue
+    /// removing it while the main future waits must not cancel the main future
+    /// when it wakes.
+    #[test]
+    fn the_default_queue_cannot_be_removed_while_the_main_future_waits() {
+        let ex = LocalExecutor::default();
+        let out = ex.run(async {
+            let tq = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "remover",
+            );
+            let remover = crate::spawn_local_into(
+                async { crate::executor().remove_task_queue(TaskQueueHandle::default()) },
+                tq,
+            )
+            .unwrap();
+            sleep(Duration::from_millis(1)).await;
+            remover.await
+        });
+        assert!(
+            matches!(
+                out,
+                Err(GlommioError::ExecutorError(ExecutorErrorKind::QueueError {
+                    index: 0,
+                    kind: QueueErrorKind::StillActive,
+                }))
+            ),
+            "removing the default queue returned {out:?}"
+        );
     }
 }

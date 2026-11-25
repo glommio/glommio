@@ -536,16 +536,6 @@ fn abandoned_future_destructor_can_spawn_io() {
 /// Shutdown destructors must be able to spawn tasks that submit I/O.
 #[test]
 fn shutdown_destructor_can_spawn_io() {
-    shutdown_destructor_io(false);
-}
-
-/// Shutdown still needs a usable queue when the default queue was removed.
-#[test]
-fn shutdown_destructor_can_spawn_io_without_default_queue() {
-    shutdown_destructor_io(true);
-}
-
-fn shutdown_destructor_io(remove_default_queue: bool) {
     /// Records submission failures without unwinding through task destruction.
     struct SpawnIoOnDrop(Rc<Cell<Option<bool>>>);
 
@@ -578,11 +568,6 @@ fn shutdown_destructor_io(remove_default_queue: bool) {
         })
         .detach();
     let allocation = AllocationProbe::track_handle(&handle);
-    if remove_default_queue {
-        owner
-            .remove_task_queue(crate::TaskQueueHandle::default())
-            .expect("idle default queue could not be removed");
-    }
     drop(owner);
     drop(handle);
 

@@ -7,6 +7,7 @@ use super::datagram::GlommioDatagram;
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
+    cell::Cell,
     io,
     net::{self, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     os::{
@@ -22,12 +23,23 @@ use crate::Result;
 /// An Udp Socket.
 pub struct UdpSocket {
     socket: GlommioDatagram<net::UdpSocket>,
+    /// Set once the socket is known to be connected, so `recv` and `peek`
+    /// stop asking the kernel. Never set back: glommio cannot disconnect a
+    /// socket, `connect` only takes an IP address, and a failed `connect`
+    /// leaves the previous peer in place. A `connect` to port 0 is not taken
+    /// as connected, since the kernel still reports no peer for it. An
+    /// unconnected answer is not kept,
+    /// since the socket may be connected later through its descriptor. A
+    /// disconnect made through the descriptor (`connect` with `AF_UNSPEC`)
+    /// is not seen: `recv` then takes datagrams from any sender.
+    connected: Cell<bool>,
 }
 
 impl From<socket2::Socket> for UdpSocket {
     fn from(socket: socket2::Socket) -> UdpSocket {
         Self {
             socket: GlommioDatagram::<net::UdpSocket>::from(socket),
+            connected: Cell::new(false),
         }
     }
 }
@@ -120,9 +132,7 @@ impl UdpSocket {
         };
         let sk = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         bind_shared(&sk, &socket2::SockAddr::from(addr))?;
-        Ok(Self {
-            socket: GlommioDatagram::from(sk),
-        })
+        Ok(Self::from(sk))
     }
 
     /// Connects this UDP socket to a remote address, allowing the [`send`] and
@@ -166,7 +176,10 @@ impl UdpSocket {
             let reactor = self.socket.reactor.upgrade().unwrap();
             let source = reactor.connect(self.socket.as_raw_fd(), SockaddrStorage::from(addr));
             match source.collect_rw().await {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    self.connected.set(addr.port() != 0);
+                    return Ok(());
+                }
                 Err(x) => {
                     err = x;
                 }
@@ -541,9 +554,14 @@ impl UdpSocket {
     /// })
     /// ```
     ///
+    /// Whether the socket is connected is remembered once it has been seen
+    /// to be, so a disconnect made directly on the raw descriptor (a `connect`
+    /// to `AF_UNSPEC`) is not noticed: receiving then takes datagrams from
+    /// any sender instead of failing.
+    ///
     /// [`connect`]: UdpSocket::connect
     pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
-        let _ = self.peer_addr()?;
+        self.ensure_connected()?;
         self.socket.peek(buf).await.map_err(Into::into)
     }
 
@@ -560,9 +578,21 @@ impl UdpSocket {
         Ok((sz, addr))
     }
 
+    /// Fails with the error `getpeername` gives unless the socket is
+    /// connected, asking the kernel only until it first says so.
+    fn ensure_connected(&self) -> Result<()> {
+        if !self.connected.get() {
+            self.peer_addr()?;
+            self.connected.set(true);
+        }
+        Ok(())
+    }
+
     /// Returns the socket address of the remote peer this socket was connected
     /// to.
     pub fn peer_addr(&self) -> Result<SocketAddr> {
+        #[cfg(test)]
+        crate::sys::test_support::note_peer_lookup();
         self.socket.socket.peer_addr().map_err(Into::into)
     }
 
@@ -605,9 +635,14 @@ impl UdpSocket {
     /// })
     /// ```
     ///
+    /// Whether the socket is connected is remembered once it has been seen
+    /// to be, so a disconnect made directly on the raw descriptor (a `connect`
+    /// to `AF_UNSPEC`) is not noticed: receiving then takes datagrams from
+    /// any sender instead of failing.
+    ///
     /// [`connect`]: UdpSocket::connect
     pub async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        let _ = self.peer_addr()?;
+        self.ensure_connected()?;
         self.socket.recv(buf).await.map_err(Into::into)
     }
 
@@ -1181,6 +1216,99 @@ mod tests {
             let mut buf = vec![0; 1 << 32];
             assert_eq!(receiver.peek(&mut buf).await.unwrap(), 5);
             assert_eq!(&buf[..5], b"hello");
+        });
+    }
+
+    /// Guards against every `recv` and `peek` on a socket connected through
+    /// `connect` asking the kernel for its peer again.
+    #[test]
+    fn recv_and_peek_on_a_connected_socket_do_not_look_up_the_peer() {
+        test_executor!(async move {
+            let (receiver, sender) = connected_pair!();
+            let before = crate::sys::test_support::peer_lookups();
+            for _ in 0..4 {
+                sender.send(b"ping").await.unwrap();
+                let mut buf = [0u8; 8];
+                assert_eq!(receiver.peek(&mut buf).await.unwrap(), 4);
+                assert_eq!(receiver.recv(&mut buf).await.unwrap(), 4);
+            }
+            assert_eq!(crate::sys::test_support::peer_lookups() - before, 0);
+        });
+    }
+
+    /// A socket connected before glommio saw it is found connected by its
+    /// first receive, and not asked again.
+    #[test]
+    fn a_socket_connected_outside_glommio_looks_up_its_peer_once() {
+        test_executor!(async move {
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let std_receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            std_receiver.connect(sender.local_addr().unwrap()).unwrap();
+            let receiver = UdpSocket::from(Socket::from(std_receiver));
+            let before = crate::sys::test_support::peer_lookups();
+            for _ in 0..4 {
+                sender
+                    .send_to(b"ping", receiver.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 8];
+                assert_eq!(receiver.peek(&mut buf).await.unwrap(), 4);
+                assert_eq!(receiver.recv(&mut buf).await.unwrap(), 4);
+            }
+            assert_eq!(crate::sys::test_support::peer_lookups() - before, 1);
+        });
+    }
+
+    /// A `connect` to port 0 succeeds but leaves no peer, so `recv` keeps
+    /// failing with `ENOTCONN` as `getpeername` does.
+    #[test]
+    fn a_socket_connected_to_port_zero_still_refuses_recv() {
+        test_executor!(async move {
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver.connect("127.0.0.1:0").await.unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut buf = [0u8; 8];
+            let err = receiver.recv(&mut buf).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN));
+            let err = receiver.peek(&mut buf).await.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOTCONN));
+        });
+    }
+
+    /// An unconnected socket refuses `recv` and `peek` with `ENOTCONN` every
+    /// time, and a refusal is not remembered: once the socket is connected,
+    /// here behind glommio's back, `recv` works.
+    #[test]
+    fn an_unconnected_socket_keeps_refusing_until_it_is_connected() {
+        test_executor!(async move {
+            let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let not_connected = |res: Result<usize>| {
+                matches!(
+                    res,
+                    Err(crate::GlommioError::IoError(ref e))
+                        if e.raw_os_error() == Some(libc::ENOTCONN)
+                )
+            };
+            let mut buf = [0u8; 8];
+            for _ in 0..2 {
+                assert!(not_connected(receiver.recv(&mut buf).await));
+                assert!(not_connected(receiver.peek(&mut buf).await));
+            }
+            let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let SocketAddr::V4(peer) = sender.local_addr().unwrap() else {
+                unreachable!("bound to an IPv4 address")
+            };
+            nix::sys::socket::connect(receiver.as_raw_fd(), &SockaddrIn::from(peer)).unwrap();
+            sender
+                .send_to(b"ping", receiver.local_addr().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(receiver.recv(&mut buf).await.unwrap(), 4);
         });
     }
 

@@ -1,5 +1,6 @@
 //! Test-only hooks: synchronization for foreign wake submission, injected
-//! ring submission failures, and a record of file syncs and truncates.
+//! ring submission failures, a record of file syncs and truncates, and a
+//! count of socket peer lookups.
 
 use std::{
     cell::{Cell, RefCell},
@@ -19,6 +20,17 @@ thread_local! {
     static SUBMIT_FAILURE: Cell<Option<(&'static str, i32)>> = const { Cell::new(None) };
     static RING_SETUP_FAILURE: Cell<Option<i32>> = const { Cell::new(None) };
     static FILE_OPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    static PEER_LOOKUPS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Counts a `getpeername` this thread issued for a socket.
+pub(crate) fn note_peer_lookup() {
+    PEER_LOOKUPS.with(|n| n.set(n.get() + 1));
+}
+
+/// How many `getpeername` calls this thread has issued for sockets so far.
+pub(crate) fn peer_lookups() -> usize {
+    PEER_LOOKUPS.with(Cell::get)
 }
 
 /// Records, in order, the syncs and truncates this thread issues, until

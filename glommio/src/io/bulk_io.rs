@@ -340,7 +340,7 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBu
     }
 
     pub(crate) fn set_concurrency_limit(&mut self, limit: usize) {
-        assert!(limit > 0);
+        assert!(limit > 0, "concurrency must be at least 1");
         assert!(
             !self.terminated && self.inflight.is_empty(),
             "should be called before the first call to poll()"
@@ -350,7 +350,6 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> OrderedBu
     }
 
     pub(crate) fn set_memory_limit(&mut self, limit: Option<usize>) {
-        assert!(limit.unwrap_or(usize::MAX) > 0);
         assert!(
             !self.terminated && self.inflight.is_empty(),
             "should be called before the first call to poll()"
@@ -482,8 +481,12 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
     /// However, higher values will increase memory usage and possibly starve
     /// by-standing IO-emitting tasks.
     ///
-    /// This function should be called before the stream is first polled and
-    /// will panic otherwise.
+    /// This function should be called before the stream is first polled.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `concurrency` is zero, since no read could ever be
+    /// submitted, or if the stream has already been polled.
     #[must_use]
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.inner.set_concurrency_limit(concurrency);
@@ -503,9 +506,14 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
     ///
     /// Note that this is a soft limit. No matter how small this limit is set
     /// to, a single IO request will always be allowed to run. This can happen
-    /// if you configure the IO merging logic very aggressively.
+    /// if you configure the IO merging logic very aggressively. A limit of
+    /// `Some(0)` therefore runs one IO request at a time.
     ///
     /// Defaults to no limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stream has already been polled.
     #[must_use]
     pub fn with_memory_limit(mut self, limit: Option<usize>) -> Self {
         self.inner.set_memory_limit(limit);
@@ -920,6 +928,47 @@ mod tests {
             assert_eq!(deduped(), before, "the stream still holds its last read");
             drop(reads);
             file.close_rc().await.unwrap();
+        });
+    }
+
+    /// The memory limit documents that a single request always runs, so a
+    /// limit of zero reads one at a time.
+    #[test]
+    fn a_zero_memory_limit_reads_one_at_a_time() {
+        test_executor!(async move {
+            let file = a_file_of(8192).await;
+            let mut reads = file
+                .read_many(
+                    stream::iter((0..4u64).map(|i| (i * 2048, 512usize))),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_memory_limit(Some(0));
+            let mut yielded = 0;
+            while let Some(read) = reads.next().await {
+                assert_eq!(read.unwrap().1.len(), 512);
+                assert!(reads.inner.inflight.len() <= 1);
+                yielded += 1;
+            }
+            assert_eq!(yielded, 4);
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// No read could ever be submitted under a concurrency of zero, so it is
+    /// refused up front.
+    #[test]
+    #[should_panic(expected = "concurrency must be at least 1")]
+    fn a_concurrency_of_zero_is_refused() {
+        test_executor!(async move {
+            let file = a_file_of(4096).await;
+            let _ = file
+                .read_many(
+                    stream::iter([(0u64, 512usize)]),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_concurrency(0);
         });
     }
 

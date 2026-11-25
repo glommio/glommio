@@ -1,7 +1,7 @@
 use crate::sys::source::NativePath;
 use crate::{
     executor::bind_to_cpu_set,
-    sys::{InnerSource, SleepNotifier},
+    sys::{wake_all, InnerSource, SleepNotifier},
     PoolPlacement,
 };
 use ahash::AHashMap;
@@ -298,22 +298,28 @@ impl BlockingThreadPool {
     /// A response can arrive for a source that is gone: dropping a send that
     /// was still pending does not withdraw a request the pool has already
     /// taken, but [`Unsent`] withdraws the source.
+    ///
+    /// Neither the table nor the source is borrowed while its waiters are
+    /// woken, so a waker that polls its future on the spot can read the
+    /// result and send the next request.
     pub(super) fn flush(&self) -> usize {
         let mut woke = 0;
-        let mut waiters = self.sources.borrow_mut();
         for x in self.rx.try_iter() {
             let id = x.id;
             let res = x.res;
 
-            let Some(src) = waiters.remove(&id) else {
+            let Some(src) = self.sources.borrow_mut().remove(&id) else {
                 continue;
             };
-            let mut inner_source = src.borrow_mut();
-            inner_source.wakers.result.replace(
-                res.try_into()
-                    .expect("not a valid blocking operation's result"),
-            );
-            inner_source.wakers.wake_waiters();
+            let waiters = {
+                let mut inner_source = src.borrow_mut();
+                inner_source.wakers.result.replace(
+                    res.try_into()
+                        .expect("not a valid blocking operation's result"),
+                );
+                inner_source.wakers.take_waiters()
+            };
+            wake_all(waiters);
 
             woke += 1;
         }
@@ -328,6 +334,7 @@ mod tests {
         sys::{self, Source, SourceType},
         IoRequirements,
     };
+    use rusty_fork::rusty_fork_test;
     use std::time::{Duration, Instant};
 
     fn pool() -> BlockingThreadPool {
@@ -389,5 +396,42 @@ mod tests {
 
         wait_for_response(&pool);
         assert_eq!(0, pool.flush());
+    }
+
+    rusty_fork_test! {
+        /// A waker that polls its future on the spot when the response
+        /// arrives reads the result and sends the next request, so neither
+        /// the source nor the pool's table may be borrowed while it wakes.
+        /// Forked, since a waker woken under the source's borrow aborted
+        /// the process.
+        #[test]
+        fn a_waiter_polled_inside_its_wake_reads_the_result_and_sends_again() {
+            let pool = Rc::new(pool());
+            let first = source();
+            futures_lite::future::block_on(
+                pool.push(BlockingThreadOp::Fn(Box::new(|| {})), first.inner.clone()),
+            );
+            let done = Rc::new(Cell::new(false));
+            crate::test_utils::poll_on_wake(crate::enclose! { (pool, done) async move {
+                std::future::poll_fn(|cx| match first.result() {
+                    Some(_) => std::task::Poll::Ready(()),
+                    None => {
+                        first.add_waiter_single(cx.waker());
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                drop(first);
+                let second = source();
+                pool.push(BlockingThreadOp::Fn(Box::new(|| {})), second.inner.clone())
+                    .await;
+                done.set(true);
+            }});
+            assert!(!done.get());
+
+            wait_for_response(&pool);
+            assert!(pool.flush() >= 1);
+            assert!(done.get(), "the woken waiter did not get to send again");
+        }
     }
 }

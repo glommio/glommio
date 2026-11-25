@@ -968,12 +968,12 @@ where
         let id = from_user_data(value.user_data());
 
         if cqueue::more(value.flags()) {
-            let woke = source_map.borrow_mut().peek_source_mut(id, |mut inner| {
+            let waiters = source_map.borrow_mut().peek_source_mut(id, |mut inner| {
                 queue_multishot_arrival(&mut inner, &value);
-                inner.wakers.wake_waiters()
+                inner.wakers.take_waiters()
             });
             return Some(Processed {
-                woke,
+                woke: super::wake_all(waiters),
                 retired: false,
             });
         }
@@ -1010,9 +1010,12 @@ where
                 transmute_error(result)
             };
             let res = Some(post_process(src.borrow_mut(), result));
-            let mut inner_source = src.borrow_mut();
-            inner_source.wakers.result = res;
-            woke = inner_source.wakers.wake_waiters();
+            let waiters = {
+                let mut inner_source = src.borrow_mut();
+                inner_source.wakers.result = res;
+                inner_source.wakers.take_waiters()
+            };
+            woke = super::wake_all(waiters);
         }
         return Some(Processed {
             woke,
@@ -4857,6 +4860,78 @@ mod tests {
                 }
                 other => panic!("expected the ENOMEM, got {other:?}"),
             }
+        }
+    }
+
+    rusty_fork_test! {
+        /// A waker that polls its receive on the spot, inside the reactor's
+        /// pass, reads the datagram that completed it. Forked, since a waker
+        /// woken under the source's borrow aborted the process.
+        #[test]
+        fn a_recv_polled_inside_its_wake_reads_the_datagram() {
+            let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+                .make()
+                .unwrap();
+            ex.run(async {
+                let receiver = Rc::new(crate::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+                let sender = crate::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                let got = Rc::new(std::cell::Cell::new(None));
+                crate::test_utils::poll_on_wake(crate::enclose! { (receiver, got) async move {
+                    let mut buf = [0u8; 8];
+                    got.set(Some(receiver.recv_from(&mut buf).await.unwrap().0));
+                }});
+                assert_eq!(got.get(), None);
+
+                sender
+                    .send_to(b"ping", receiver.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let start = Instant::now();
+                while got.get().is_none() {
+                    assert!(start.elapsed() < Duration::from_secs(10), "never received");
+                    crate::timer::sleep(Duration::from_millis(1)).await;
+                }
+                assert_eq!(got.get(), Some(4));
+            });
+        }
+
+        /// The same for a multishot receive, woken by an arrival that leaves
+        /// the request armed. The future drops the armed source when it
+        /// has what it wanted, from inside the wake.
+        #[test]
+        fn a_multishot_receive_polled_inside_its_wake_reads_the_arrival() {
+            let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+                .recv_buffers(crate::RecvBuffers::exact(8, 64))
+                .make()
+                .unwrap();
+            ex.run(async {
+                let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+                use std::os::fd::AsRawFd as _;
+                let reactor = crate::executor().reactor();
+                let source = reactor.recv_multi(reader.as_raw_fd(), usize::MAX).unwrap();
+                settle(&reactor);
+                let seen = Rc::new(std::cell::Cell::new(false));
+                crate::test_utils::poll_on_wake(crate::enclose! { (seen) async move {
+                    std::future::poll_fn(|cx| {
+                        let (ready, armed) = arrivals(&source);
+                        if ready.concat() == b"one" {
+                            assert!(armed, "woken by the arrival, not by the end");
+                            std::task::Poll::Ready(())
+                        } else {
+                            source.add_waiter_single(cx.waker());
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    seen.set(true);
+                }});
+                assert!(!seen.get());
+
+                std::io::Write::write_all(&mut writer, b"one").unwrap();
+                settle(&reactor);
+                assert!(seen.get(), "the arrival was never read");
+                settle(&reactor);
+            });
         }
     }
 }

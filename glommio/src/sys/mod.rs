@@ -698,15 +698,10 @@ impl Wakers {
         }
     }
 
-    pub(super) fn wake_waiters(&mut self) -> bool {
-        if self.waiters.is_empty() {
-            false
-        } else {
-            self.waiters.drain(..).for_each(|x| {
-                wake!(x);
-            });
-            true
-        }
+    /// Takes the waiters out, to be woken with [`wake_all`] once the source
+    /// is no longer borrowed.
+    pub(super) fn take_waiters(&mut self) -> SmallVec<[Waker; 1]> {
+        std::mem::take(&mut self.waiters)
     }
 
     fn timestamps(&mut self) -> Option<Latencies> {
@@ -720,6 +715,17 @@ impl Wakers {
             })
         }
     }
+}
+
+/// Wakes waiters taken with [`Wakers::take_waiters`], and says whether there
+/// were any. Called with nothing borrowed, since a waker may poll its future
+/// on the spot and that future looks at the source.
+pub(super) fn wake_all(waiters: SmallVec<[Waker; 1]>) -> bool {
+    let woke = !waiters.is_empty();
+    for waker in waiters {
+        wake!(waker);
+    }
+    woke
 }
 
 /// Shuts down the requested side of a socket.

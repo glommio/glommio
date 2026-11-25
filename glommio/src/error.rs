@@ -154,7 +154,7 @@ impl fmt::Display for BuilderErrorKind {
             } => write!(f, "found {available} of {required} required CPUs"),
             Self::NrShards { minimum, shards } => write!(
                 f,
-                "requested {minimum} shards but a minimum of {shards} is required"
+                "requested {shards} shards but a minimum of {minimum} is required"
             ),
             Self::ThreadPanic(_) => write!(f, "thread panicked"),
         }
@@ -669,6 +669,18 @@ mod test {
             "specific error message here".to_string(),
         )));
         panic_any(err.unwrap_err().to_string());
+    }
+
+    #[test]
+    fn nr_shards_names_the_requested_count_and_the_minimum() {
+        let err = BuilderErrorKind::NrShards {
+            minimum: 1,
+            shards: 0,
+        };
+        assert_eq!(
+            err.to_string(),
+            "requested 0 shards but a minimum of 1 is required"
+        );
     }
 
     #[test]

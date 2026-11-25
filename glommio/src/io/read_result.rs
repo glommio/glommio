@@ -81,17 +81,17 @@ impl ReadResult {
     /// Creates a slice of this ReadResult with the given offset and length.
     ///
     /// Returns `None` if either offset or offset + len would not fit in the
-    /// original buffer.
-    ///
-    /// The `len == 0` branch is needed to make sure that calls to `slice`
-    /// with `len = 0` are handled. If they aren't valid, then `len` should be
-    /// changed to `NonZeroUsize`.
+    /// original buffer. As with a slice, an empty one fits at any offset up to
+    /// and including the end.
     pub fn slice(this: &Self, extra_offset: usize, len: usize) -> Option<Self> {
-        Some(Self(if let Some(len) = NonZeroUsize::new(len) {
-            Some(ReadResultInner::slice(this.0.as_ref()?, extra_offset, len)?)
-        } else {
-            None
-        }))
+        match NonZeroUsize::new(len) {
+            Some(len) => Some(Self(Some(ReadResultInner::slice(
+                this.0.as_ref()?,
+                extra_offset,
+                len,
+            )?))),
+            None => (extra_offset <= this.len()).then(Self::empty_buffer),
+        }
     }
 
     /// Creates a slice of this ReadResult with the given offset and length.
@@ -166,6 +166,39 @@ impl ReadResultInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{io::OpenOptions, test_utils::make_tmp_test_directory, LocalExecutor};
+
+    #[test]
+    fn an_empty_slice_of_an_empty_result_fits_only_at_offset_zero() {
+        let empty = ReadResult::default();
+        assert!(ReadResult::slice(&empty, 0, 0).is_some());
+        assert!(ReadResult::slice(&empty, 5, 0).is_none());
+    }
+
+    #[test]
+    fn an_empty_slice_fits_up_to_the_end_and_not_past_it() {
+        let dir = make_tmp_test_directory("an_empty_slice_fits_up_to_the_end");
+        let path = dir.path.join("file");
+        LocalExecutor::default().run(async move {
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .dma_open(&path)
+                .await
+                .unwrap();
+            let mut buf = file.alloc_dma_buffer(4096);
+            buf.as_bytes_mut().fill(1);
+            file.write_at(buf, 0).await.unwrap();
+            let read = file.read_at(0, 4096).await.unwrap();
+            assert_eq!(read.len(), 4096);
+
+            assert_eq!(ReadResult::slice(&read, 4096, 0).map(|s| s.len()), Some(0));
+            assert!(ReadResult::slice(&read, 4097, 0).is_none());
+            assert!(ReadResult::slice(&read, 1 << 30, 0).is_none());
+            file.close().await.unwrap();
+        });
+    }
 
     #[test]
     fn read_results_compare_by_their_bytes_not_their_buffers() {

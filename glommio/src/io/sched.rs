@@ -114,6 +114,8 @@ impl Drop for FileScheduler {
 }
 
 impl FileScheduler {
+    /// Finds a scheduled read covering `data_range` to share. A read that has
+    /// already failed is passed over, so the caller issues its own and retries.
     pub(crate) fn consume_scheduled(
         &self,
         data_range: Range<u64>,
@@ -125,7 +127,7 @@ impl FileScheduler {
         let covering = loop {
             match cursor.get() {
                 Some(x) if x.data_range.start >= earliest => {
-                    if x.data_range.end >= data_range.end {
+                    if x.data_range.end >= data_range.end && !x.source.has_failed() {
                         break cursor.clone_pointer();
                     }
                     cursor.move_prev();
@@ -405,6 +407,29 @@ pub(crate) mod test {
         let reused = file.consume_scheduled(5120..12288, None).unwrap();
         assert!(Rc::ptr_eq(&reused.inner, &wide.inner));
         assert_eq!(reused.offseted_range, 5120..12288);
+    }
+
+    /// A read that failed is not handed to the next reader of its range, which
+    /// would otherwise get the same error without a retry, and a later read
+    /// covering the range is still found behind it.
+    #[test]
+    fn a_failed_read_is_not_reused() {
+        let sched = Rc::new(IoScheduler::new());
+        let file = sched.get_file_scheduler((0, 1));
+        let failed = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            0..4096,
+        );
+        failed.inner.source.inner.borrow_mut().wakers.result =
+            Some(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        assert!(file.consume_scheduled(0..4096, None).is_none());
+
+        let retried = file.schedule(
+            Source::new(Default::default(), 0, SourceType::Invalid, None, None),
+            0..4096,
+        );
+        let reused = file.consume_scheduled(1024..2048, None).unwrap();
+        assert!(Rc::ptr_eq(&reused.inner, &retried.inner));
     }
 
     /// Tests dropping a `ScheduledSource` with a `ScheduledFile` but no io

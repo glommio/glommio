@@ -373,7 +373,7 @@ impl UnixStream {
         let reactor = crate::executor().reactor();
 
         let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::other)?;
+        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::from)?;
         let source = reactor.connect(socket.as_raw_fd(), addr);
         source.collect_rw().await?;
 
@@ -841,7 +841,7 @@ impl UnixDatagram {
     /// [`send`]: UnixDatagram::send
     /// [`recv`]: UnixDatagram::recv
     pub async fn connect<A: AsRef<Path>>(&self, addr: A) -> Result<()> {
-        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::other)?;
+        let addr = UnixAddr::new(addr.as_ref()).map_err(io::Error::from)?;
 
         let reactor = self.socket.reactor.upgrade().unwrap();
         let source = reactor.connect(self.socket.as_raw_fd(), addr);
@@ -880,15 +880,16 @@ impl UnixDatagram {
         self.socket.rx_buf_size
     }
 
-    /// Receives single datagram on the socket from the remote address to which
-    /// it is connected, without removing the message from input queue. On
-    /// success, returns the number of bytes peeked.
+    /// Receives single datagram on the socket, without removing the message
+    /// from input queue. On success, returns the number of bytes peeked.
     ///
     /// The function must be called with valid byte array buf of sufficient size
     /// to hold the message bytes. If a message is too long to fit in the
     /// supplied buffer, excess bytes may be discarded.
     ///
-    /// To use this function, [`connect`] must have been called
+    /// As with [`recv`](UnixDatagram::recv), the socket need not be connected:
+    /// once [`connect`] has been called only datagrams from that peer arrive,
+    /// and before that the next datagram from any sender is peeked.
     ///
     /// # Examples
     ///
@@ -909,7 +910,6 @@ impl UnixDatagram {
     ///
     /// [`connect`]: UnixDatagram::connect
     pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
-        let _ = self.peer_addr()?;
         self.socket.peek(buf).await.map_err(Into::into)
     }
 
@@ -990,16 +990,16 @@ impl UnixDatagram {
         self.socket.socket.local_addr().map_err(Into::into)
     }
 
-    /// Receives a single datagram message on the socket from the remote address
-    /// to which it is connected.
+    /// Receives a single datagram message on the socket.
     ///
     /// On success, returns the number of bytes read.  The function must be
     /// called with valid byte array buf of sufficient size to hold the
     /// message bytes. If a message is too long to fit in the supplied
     /// buffer, excess bytes may be discarded.
     ///
-    ///
-    /// To use this function, [`connect`] must have been called
+    /// The socket need not be connected: once [`connect`] has been called only
+    /// datagrams from that peer arrive, and before that the next datagram from
+    /// any sender is received.
     ///
     /// # Examples
     ///
@@ -1064,7 +1064,7 @@ impl UnixDatagram {
     /// })
     /// ```
     pub async fn send_to<A: AsRef<Path>>(&self, buf: &[u8], addr: A) -> Result<usize> {
-        let addr = nix::sys::socket::UnixAddr::new(addr.as_ref()).map_err(io::Error::other)?;
+        let addr = nix::sys::socket::UnixAddr::new(addr.as_ref()).map_err(io::Error::from)?;
         self.socket.send_to(buf, addr).await.map_err(Into::into)
     }
 
@@ -1330,6 +1330,45 @@ mod tests {
         assert_eq!(sz, 4);
         assert!(addr.path().is_none());
     });
+
+    unix_socket_test!(a_path_too_long_for_an_address_reports_enametoolong, dir, {
+        let path = dir.join("x".repeat(200));
+        let errno = |err: crate::GlommioError<()>| io::Error::from(err).raw_os_error();
+
+        let err = UnixStream::connect(&path).await.unwrap_err();
+        assert_eq!(errno(err), Some(libc::ENAMETOOLONG), "UnixStream::connect");
+
+        let socket = UnixDatagram::unbound().unwrap();
+        let err = socket.connect(&path).await.unwrap_err();
+        assert_eq!(
+            errno(err),
+            Some(libc::ENAMETOOLONG),
+            "UnixDatagram::connect"
+        );
+
+        let err = socket.send_to(b"x", &path).await.unwrap_err();
+        assert_eq!(
+            errno(err),
+            Some(libc::ENAMETOOLONG),
+            "UnixDatagram::send_to"
+        );
+    });
+
+    unix_socket_test!(
+        peek_on_a_bound_unconnected_datagram_socket_sees_the_next_message,
+        dir,
+        {
+            let path = dir.join("dgram");
+            let receiver = UnixDatagram::bind(&path).unwrap();
+            let sender = UnixDatagram::unbound().unwrap();
+            sender.connect(&path).await.unwrap();
+            sender.send(&[1; 1]).await.unwrap();
+
+            let mut buf = vec![0; 32];
+            assert_eq!(receiver.peek(&mut buf).await.unwrap(), 1);
+            assert_eq!(receiver.recv(&mut buf).await.unwrap(), 1);
+        }
+    );
 
     unix_socket_test!(datagram_connect_unbounded, dir, {
         let mut file = dir.clone();

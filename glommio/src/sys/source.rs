@@ -385,6 +385,12 @@ impl Source {
         })
     }
 
+    /// Whether this I/O source has completed with an error. Unlike
+    /// [`result`](Self::result), it records no latency.
+    pub(crate) fn has_failed(&self) -> bool {
+        matches!(self.inner.borrow().wakers.result, Some(Err(_)))
+    }
+
     /// Returns the result of this I/O source, if it has completed.
     ///
     /// If a scheduler latency collection function is present, invoke it once.

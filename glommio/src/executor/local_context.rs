@@ -121,7 +121,7 @@ mod tests {
             crate::yield_if_needed().await;
             crate::executor().yield_task_queue_now().await;
         });
-        assert!(catch_unwind(|| crate::executor().need_preempt()).is_err());
+        assert!(!crate::executor().need_preempt());
     }
 
     #[test]

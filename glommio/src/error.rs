@@ -538,7 +538,7 @@ impl<T> From<GlommioError<T>> for io::Error {
             | GlommioError::BuilderError(BuilderErrorKind::InsufficientCpus { .. })
             | GlommioError::BuilderError(BuilderErrorKind::NrShards { .. })
             | GlommioError::BuilderError(BuilderErrorKind::ThreadPanic(_)) => {
-                io::Error::other(format!("Executor builder error: {err}"))
+                io::Error::other(err.to_string())
             }
             GlommioError::EnhancedIoError { ref source, .. } => {
                 io::Error::new(source.kind(), err.to_string())
@@ -786,8 +786,7 @@ mod test {
     /// Pins the kind, errno and message of every variant but
     /// `EnhancedIoError` (pinned on its own below) as converted into an
     /// [`io::Error`], so a change to how the conversion is built cannot
-    /// change what callers see. The doubled "Executor builder error" prefix
-    /// is what the conversion has always produced.
+    /// change what callers see.
     #[test]
     fn converting_to_an_io_error_keeps_each_variants_kind_errno_and_message() {
         use io::ErrorKind::*;
@@ -832,7 +831,7 @@ mod test {
                 GlommioError::BuilderError(BuilderErrorKind::NonExistentCpus { cpu: 9 }),
                 Other,
                 None,
-                "Executor builder error: Executor builder error: CPU 9 doesn't exist on the host",
+                "Executor builder error: CPU 9 doesn't exist on the host",
             ),
             (
                 GlommioError::BuilderError(BuilderErrorKind::InsufficientCpus {
@@ -841,7 +840,7 @@ mod test {
                 }),
                 Other,
                 None,
-                "Executor builder error: Executor builder error: found 2 of 4 required CPUs",
+                "Executor builder error: found 2 of 4 required CPUs",
             ),
             (
                 GlommioError::BuilderError(BuilderErrorKind::NrShards {
@@ -850,14 +849,13 @@ mod test {
                 }),
                 Other,
                 None,
-                "Executor builder error: Executor builder error: requested 0 shards but a \
-                 minimum of 1 is required",
+                "Executor builder error: requested 0 shards but a minimum of 1 is required",
             ),
             (
                 GlommioError::BuilderError(BuilderErrorKind::ThreadPanic(Box::new("boom"))),
                 Other,
                 None,
-                "Executor builder error: Executor builder error: thread panicked",
+                "Executor builder error: thread panicked",
             ),
             (
                 GlommioError::Closed(ResourceType::Semaphore {

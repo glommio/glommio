@@ -24,15 +24,43 @@ use crate::Result;
 /// A receive buffer on loan to the kernel.
 ///
 /// It lives in the `Source` until the completion arrives, so the read can
-/// outlive the future that started it.
+/// outlive the future that started it. An [`RxBuf`] opts in to completion
+/// reads by handing its memory over in one of these from
+/// [`take_kernel_buffer`](RxBuf::take_kernel_buffer), and gets it back in
+/// [`restore_kernel_buffer`](RxBuf::restore_kernel_buffer).
 #[derive(Debug)]
 pub struct OwnedRxBuf {
     memory: Vec<u8>,
 }
 
 impl OwnedRxBuf {
-    pub(crate) fn new(memory: Vec<u8>) -> Self {
+    /// Wraps memory to lend to the kernel.
+    ///
+    /// The kernel writes into `memory[..memory.len()]`, so the vector's
+    /// length is what it may fill, not its capacity: `vec![0; 8192]` lends
+    /// 8 KiB, `Vec::with_capacity(8192)` lends nothing.
+    ///
+    /// # Panics
+    ///
+    /// If `memory` is empty. A read into no room completes with 0 bytes,
+    /// which is what the end of the stream looks like, so lending it would
+    /// silently close a healthy connection.
+    pub fn new(memory: Vec<u8>) -> Self {
+        assert!(
+            !memory.is_empty(),
+            "an OwnedRxBuf needs a non-zero length: the kernel fills memory[..len], \
+             and a read into no room looks like the end of the stream. \
+             Use vec![0; size] rather than Vec::with_capacity(size)"
+        );
         OwnedRxBuf { memory }
+    }
+
+    /// Takes the memory back, with whatever the kernel wrote at its start.
+    ///
+    /// How much it wrote arrives separately, through
+    /// [`RxBuf::handle_result`].
+    pub fn into_vec(self) -> Vec<u8> {
+        self.memory
     }
 
     pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
@@ -49,14 +77,53 @@ impl OwnedRxBuf {
 }
 
 /// Root trait for socket stream receive buffer
+///
+/// A stream reads from the socket into [`unfilled`](Self::unfilled), reports
+/// how much arrived through [`handle_result`](Self::handle_result), and
+/// serves the caller from what is buffered. Implement it, together with
+/// [`Buffered`], to give [`TcpStream::buffered_with`] or
+/// [`UnixStream::buffered_with`] a buffer of your own.
+///
+/// [`TcpStream::buffered_with`]: crate::net::TcpStream::buffered_with
+/// [`UnixStream::buffered_with`]: crate::net::UnixStream::buffered_with
 pub trait RxBuf {
+    /// Moves up to `buf.len()` buffered bytes into `buf` and forgets them,
+    /// returning how many.
     fn read(&mut self, buf: &mut [u8]) -> usize;
+
+    /// Copies up to `buf.len()` buffered bytes into `buf`, leaving them
+    /// buffered, and returns how many.
     fn peek(&self, buf: &mut [u8]) -> usize;
+
+    /// Whether nothing is buffered and unread.
+    ///
+    /// The stream reads from the socket only when this is true, so it must
+    /// not count space handed out by [`unfilled`](Self::unfilled) until
+    /// [`handle_result`](Self::handle_result) says it was filled.
     fn is_empty(&self) -> bool;
+
+    /// Everything buffered and unread, without consuming it.
     fn as_bytes(&self) -> &[u8];
+
+    /// Forgets up to the first `amt` buffered bytes.
     fn consume(&mut self, amt: usize);
+
+    /// How much this buffer can hold. A read at least this large bypasses the
+    /// buffer and goes straight to the socket.
     fn buffer_size(&self) -> usize;
+
+    /// Records that the socket delivered `result` bytes at the start of the
+    /// space last returned by [`unfilled`](Self::unfilled), or at the start
+    /// of the buffer just given back to
+    /// [`restore_kernel_buffer`](Self::restore_kernel_buffer).
     fn handle_result(&mut self, result: usize);
+
+    /// The free space the next read from the socket lands in.
+    ///
+    /// Called before the read, which may then deliver nothing, so the space
+    /// holds no data until [`handle_result`](Self::handle_result) says so. An
+    /// empty slice reads nothing, which the stream takes for the end of the
+    /// stream.
     fn unfilled(&mut self) -> &mut [u8];
 
     /// Lends the whole buffer to the kernel for a completion-based read.
@@ -68,8 +135,9 @@ pub trait RxBuf {
         None
     }
 
-    /// Takes the buffer back, empty. The byte count arrives separately,
-    /// through [`handle_result`](Self::handle_result).
+    /// Takes the buffer back, with what the kernel wrote at its start. How
+    /// many bytes that was arrives separately, through
+    /// [`handle_result`](Self::handle_result), unless the read failed.
     fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
         let _ = buffer;
         unreachable!(
@@ -79,6 +147,12 @@ pub trait RxBuf {
     }
 }
 
+/// The receive buffer of a stream that has none, so every read goes straight
+/// to the socket.
+///
+/// The default for [`TcpStream`](crate::net::TcpStream),
+/// [`UnixStream`](crate::net::UnixStream) and their read halves, and nameable
+/// so that generic code can spell out `TcpStream<NonBuffered>`.
 #[derive(Debug, Default)]
 pub struct NonBuffered;
 
@@ -217,7 +291,7 @@ impl RxBuf for Preallocated {
     }
 
     fn restore_kernel_buffer(&mut self, buffer: OwnedRxBuf) {
-        self.buf = buffer.memory;
+        self.buf = buffer.into_vec();
         self.head = 0;
         self.tail = 0;
     }

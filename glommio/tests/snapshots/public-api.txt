@@ -2324,6 +2324,98 @@ pub unsafe fn glommio::net::AcceptedUnixStream::init(init: <T as crossbeam_epoch
 impl<T> tracing::instrument::Instrument for glommio::net::AcceptedUnixStream
 impl<T> tracing::instrument::WithSubscriber for glommio::net::AcceptedUnixStream
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::AcceptedUnixStream where T: ?core::marker::Sized
+pub struct glommio::net::NonBuffered
+impl core::default::Default for glommio::net::NonBuffered
+pub fn glommio::net::NonBuffered::default() -> glommio::net::NonBuffered
+impl core::fmt::Debug for glommio::net::NonBuffered
+pub fn glommio::net::NonBuffered::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl glommio::net::RxBuf for glommio::net::NonBuffered
+pub fn glommio::net::NonBuffered::as_bytes(&self) -> &[u8]
+pub fn glommio::net::NonBuffered::buffer_size(&self) -> usize
+pub fn glommio::net::NonBuffered::consume(&mut self, _amt: usize)
+pub fn glommio::net::NonBuffered::handle_result(&mut self, _result: usize)
+pub fn glommio::net::NonBuffered::is_empty(&self) -> bool
+pub fn glommio::net::NonBuffered::peek(&self, _buf: &mut [u8]) -> usize
+pub fn glommio::net::NonBuffered::read(&mut self, _buf: &mut [u8]) -> usize
+pub fn glommio::net::NonBuffered::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::NonBuffered::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
+pub fn glommio::net::NonBuffered::unfilled(&mut self) -> &mut [u8]
+impl core::marker::Freeze for glommio::net::NonBuffered
+impl core::marker::Send for glommio::net::NonBuffered
+impl core::marker::Sync for glommio::net::NonBuffered
+impl core::marker::Unpin for glommio::net::NonBuffered
+impl core::marker::UnsafeUnpin for glommio::net::NonBuffered
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::net::NonBuffered
+impl core::panic::unwind_safe::UnwindSafe for glommio::net::NonBuffered
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::net::NonBuffered where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::net::NonBuffered where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::net::NonBuffered where U: core::convert::From<T>
+pub fn glommio::net::NonBuffered::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::net::NonBuffered where U: core::convert::Into<T>
+pub type glommio::net::NonBuffered::Error = core::convert::Infallible
+pub fn glommio::net::NonBuffered::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::net::NonBuffered where U: core::convert::TryFrom<T>
+pub type glommio::net::NonBuffered::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::net::NonBuffered::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for glommio::net::NonBuffered where T: 'static + ?core::marker::Sized
+pub fn glommio::net::NonBuffered::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::net::NonBuffered where T: ?core::marker::Sized
+pub fn glommio::net::NonBuffered::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::net::NonBuffered where T: ?core::marker::Sized
+pub fn glommio::net::NonBuffered::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for glommio::net::NonBuffered
+pub fn glommio::net::NonBuffered::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::net::NonBuffered
+pub type glommio::net::NonBuffered::Init = T
+pub const glommio::net::NonBuffered::ALIGN: usize
+pub unsafe fn glommio::net::NonBuffered::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::net::NonBuffered::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::net::NonBuffered::drop(ptr: usize)
+pub unsafe fn glommio::net::NonBuffered::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::net::NonBuffered
+impl<T> tracing::instrument::WithSubscriber for glommio::net::NonBuffered
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::NonBuffered where T: ?core::marker::Sized
+pub struct glommio::net::OwnedRxBuf
+impl glommio::net::OwnedRxBuf
+pub fn glommio::net::OwnedRxBuf::into_vec(self) -> alloc::vec::Vec<u8>
+pub fn glommio::net::OwnedRxBuf::new(memory: alloc::vec::Vec<u8>) -> Self
+impl core::fmt::Debug for glommio::net::OwnedRxBuf
+pub fn glommio::net::OwnedRxBuf::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for glommio::net::OwnedRxBuf
+impl core::marker::Send for glommio::net::OwnedRxBuf
+impl core::marker::Sync for glommio::net::OwnedRxBuf
+impl core::marker::Unpin for glommio::net::OwnedRxBuf
+impl core::marker::UnsafeUnpin for glommio::net::OwnedRxBuf
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::net::OwnedRxBuf
+impl core::panic::unwind_safe::UnwindSafe for glommio::net::OwnedRxBuf
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::net::OwnedRxBuf where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::net::OwnedRxBuf where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::net::OwnedRxBuf where U: core::convert::From<T>
+pub fn glommio::net::OwnedRxBuf::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::net::OwnedRxBuf where U: core::convert::Into<T>
+pub type glommio::net::OwnedRxBuf::Error = core::convert::Infallible
+pub fn glommio::net::OwnedRxBuf::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::net::OwnedRxBuf where U: core::convert::TryFrom<T>
+pub type glommio::net::OwnedRxBuf::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::net::OwnedRxBuf::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> core::any::Any for glommio::net::OwnedRxBuf where T: 'static + ?core::marker::Sized
+pub fn glommio::net::OwnedRxBuf::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::net::OwnedRxBuf where T: ?core::marker::Sized
+pub fn glommio::net::OwnedRxBuf::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::net::OwnedRxBuf where T: ?core::marker::Sized
+pub fn glommio::net::OwnedRxBuf::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for glommio::net::OwnedRxBuf
+pub fn glommio::net::OwnedRxBuf::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::net::OwnedRxBuf
+pub type glommio::net::OwnedRxBuf::Init = T
+pub const glommio::net::OwnedRxBuf::ALIGN: usize
+pub unsafe fn glommio::net::OwnedRxBuf::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::net::OwnedRxBuf::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::net::OwnedRxBuf::drop(ptr: usize)
+pub unsafe fn glommio::net::OwnedRxBuf::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::net::OwnedRxBuf
+impl<T> tracing::instrument::WithSubscriber for glommio::net::OwnedRxBuf
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::OwnedRxBuf where T: ?core::marker::Sized
 pub struct glommio::net::Preallocated
 impl glommio::net::Preallocated
 pub fn glommio::net::Preallocated::new(size: usize) -> Self
@@ -2332,6 +2424,17 @@ pub fn glommio::net::Preallocated::default() -> Self
 impl core::fmt::Debug for glommio::net::Preallocated
 pub fn glommio::net::Preallocated::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl glommio::net::Buffered for glommio::net::Preallocated
+impl glommio::net::RxBuf for glommio::net::Preallocated
+pub fn glommio::net::Preallocated::as_bytes(&self) -> &[u8]
+pub fn glommio::net::Preallocated::buffer_size(&self) -> usize
+pub fn glommio::net::Preallocated::consume(&mut self, amt: usize)
+pub fn glommio::net::Preallocated::handle_result(&mut self, result: usize)
+pub fn glommio::net::Preallocated::is_empty(&self) -> bool
+pub fn glommio::net::Preallocated::peek(&self, buf: &mut [u8]) -> usize
+pub fn glommio::net::Preallocated::read(&mut self, buf: &mut [u8]) -> usize
+pub fn glommio::net::Preallocated::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::Preallocated::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
+pub fn glommio::net::Preallocated::unfilled(&mut self) -> &mut [u8]
 impl core::marker::Freeze for glommio::net::Preallocated
 impl core::marker::Send for glommio::net::Preallocated
 impl core::marker::Sync for glommio::net::Preallocated
@@ -2417,22 +2520,22 @@ pub unsafe fn glommio::net::TcpListener::init(init: <T as crossbeam_epoch::atomi
 impl<T> tracing::instrument::Instrument for glommio::net::TcpListener
 impl<T> tracing::instrument::WithSubscriber for glommio::net::TcpListener
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::TcpListener where T: ?core::marker::Sized
-pub struct glommio::net::TcpReadHalf<B: glommio::net::stream::RxBuf>
-impl<B: glommio::net::stream::RxBuf> glommio::net::TcpReadHalf<B>
+pub struct glommio::net::TcpReadHalf<B: glommio::net::RxBuf>
+impl<B: glommio::net::RxBuf> glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::local_addr(&self) -> glommio::Result<core::net::socket_addr::SocketAddr>
 pub async fn glommio::net::TcpReadHalf<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::TcpReadHalf<B>::peer_addr(&self) -> glommio::Result<core::net::socket_addr::SocketAddr>
 pub fn glommio::net::TcpReadHalf<B>::read_timeout(&self) -> core::option::Option<core::time::Duration>
 pub fn glommio::net::TcpReadHalf<B>::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
-impl<'__pin, B: glommio::net::stream::RxBuf> core::marker::Unpin for glommio::net::TcpReadHalf<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
-impl<B: core::fmt::Debug + glommio::net::stream::RxBuf> core::fmt::Debug for glommio::net::TcpReadHalf<B>
+impl<'__pin, B: glommio::net::RxBuf> core::marker::Unpin for glommio::net::TcpReadHalf<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
+impl<B: core::fmt::Debug + glommio::net::RxBuf> core::fmt::Debug for glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<B: glommio::net::Buffered + core::marker::Unpin> futures_io::if_std::AsyncBufRead for glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::consume(self: core::pin::Pin<&mut Self>, amt: usize)
 pub fn glommio::net::TcpReadHalf<B>::poll_fill_buf<'a>(self: core::pin::Pin<&'a mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<&'a [u8]>>
-impl<B: glommio::net::stream::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::TcpReadHalf<B>
+impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::poll_read(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &mut [u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
-impl<B: glommio::net::stream::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::TcpReadHalf<B>
+impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::TcpReadHalf<B>
 impl<B> !core::marker::Send for glommio::net::TcpReadHalf<B>
@@ -2470,15 +2573,15 @@ pub unsafe fn glommio::net::TcpReadHalf<B>::init(init: <T as crossbeam_epoch::at
 impl<T> tracing::instrument::Instrument for glommio::net::TcpReadHalf<B>
 impl<T> tracing::instrument::WithSubscriber for glommio::net::TcpReadHalf<B>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::TcpReadHalf<B> where T: ?core::marker::Sized
-pub struct glommio::net::TcpStream<B: glommio::net::stream::RxBuf>
+pub struct glommio::net::TcpStream<B: glommio::net::RxBuf>
 impl glommio::net::TcpStream
 pub fn glommio::net::TcpStream::buffered(self) -> glommio::net::TcpStream<glommio::net::Preallocated>
 pub fn glommio::net::TcpStream::buffered_with<B: glommio::net::Buffered>(self, buf: B) -> glommio::net::TcpStream<B>
 pub async fn glommio::net::TcpStream::connect<A: std::net::socket_addr::ToSocketAddrs>(addr: A) -> glommio::Result<glommio::net::TcpStream>
 pub async fn glommio::net::TcpStream::connect_timeout<A: std::net::socket_addr::ToSocketAddrs>(addr: A, duration: core::time::Duration) -> glommio::Result<glommio::net::TcpStream>
-impl glommio::net::TcpStream<glommio::net::stream::NonBuffered>
-pub fn glommio::net::TcpStream<glommio::net::stream::NonBuffered>::into_accepted(self) -> glommio::net::AcceptedTcpStream
-impl<B: glommio::net::stream::RxBuf> glommio::net::TcpStream<B>
+impl glommio::net::TcpStream<glommio::net::NonBuffered>
+pub fn glommio::net::TcpStream<glommio::net::NonBuffered>::into_accepted(self) -> glommio::net::AcceptedTcpStream
+impl<B: glommio::net::RxBuf> glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::local_addr(&self) -> glommio::Result<core::net::socket_addr::SocketAddr>
 pub fn glommio::net::TcpStream<B>::nodelay(&self) -> glommio::Result<bool>
 pub async fn glommio::net::TcpStream<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
@@ -2492,29 +2595,29 @@ pub fn glommio::net::TcpStream<B>::set_write_timeout(&self, dur: core::option::O
 pub async fn glommio::net::TcpStream<B>::shutdown(&self, how: std::net::Shutdown) -> glommio::Result<()>
 pub fn glommio::net::TcpStream<B>::ttl(&self) -> glommio::Result<u32>
 pub fn glommio::net::TcpStream<B>::write_timeout(&self) -> core::option::Option<core::time::Duration>
-impl<B: glommio::net::stream::RxBuf> glommio::net::TcpStream<B>
+impl<B: glommio::net::RxBuf> glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::reunite(rx: glommio::net::TcpReadHalf<B>, tx: glommio::net::TcpWriteHalf) -> core::result::Result<Self, (glommio::net::TcpReadHalf<B>, glommio::net::TcpWriteHalf)>
 pub fn glommio::net::TcpStream<B>::split(self) -> (glommio::net::TcpReadHalf<B>, glommio::net::TcpWriteHalf)
 impl core::convert::From<socket2::socket::Socket> for glommio::net::TcpStream
 pub fn glommio::net::TcpStream::from(socket: socket2::socket::Socket) -> glommio::net::TcpStream
 impl std::os::fd::raw::FromRawFd for glommio::net::TcpStream
 pub unsafe fn glommio::net::TcpStream::from_raw_fd(fd: std::os::fd::raw::RawFd) -> Self
-impl std::os::fd::raw::IntoRawFd for glommio::net::TcpStream<glommio::net::stream::NonBuffered>
-pub fn glommio::net::TcpStream<glommio::net::stream::NonBuffered>::into_raw_fd(self) -> std::os::fd::raw::RawFd
-impl<'__pin, B: glommio::net::stream::RxBuf> core::marker::Unpin for glommio::net::TcpStream<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
-impl<B: core::fmt::Debug + glommio::net::stream::RxBuf> core::fmt::Debug for glommio::net::TcpStream<B>
+impl std::os::fd::raw::IntoRawFd for glommio::net::TcpStream<glommio::net::NonBuffered>
+pub fn glommio::net::TcpStream<glommio::net::NonBuffered>::into_raw_fd(self) -> std::os::fd::raw::RawFd
+impl<'__pin, B: glommio::net::RxBuf> core::marker::Unpin for glommio::net::TcpStream<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
+impl<B: core::fmt::Debug + glommio::net::RxBuf> core::fmt::Debug for glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<B: glommio::net::Buffered + core::marker::Unpin> futures_io::if_std::AsyncBufRead for glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::consume(self: core::pin::Pin<&mut Self>, amt: usize)
 pub fn glommio::net::TcpStream<B>::poll_fill_buf<'a>(self: core::pin::Pin<&'a mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<&'a [u8]>>
-impl<B: glommio::net::stream::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::TcpStream<B>
+impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::poll_read(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &mut [u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
-impl<B: glommio::net::stream::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncWrite for glommio::net::TcpStream<B>
+impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncWrite for glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::poll_close(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::TcpStream<B>::poll_flush(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::TcpStream<B>::poll_write(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &[u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
 pub fn glommio::net::TcpStream<B>::poll_write_vectored(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, bufs: &[core::io::io_slice::IoSlice<'_>]) -> core::task::poll::Poll<std::io::error::Result<usize>>
-impl<B: glommio::net::stream::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::TcpStream<B>
+impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::TcpStream<B>
 impl<B> !core::marker::Send for glommio::net::TcpStream<B>
@@ -2781,20 +2884,20 @@ pub unsafe fn glommio::net::UnixListener::init(init: <T as crossbeam_epoch::atom
 impl<T> tracing::instrument::Instrument for glommio::net::UnixListener
 impl<T> tracing::instrument::WithSubscriber for glommio::net::UnixListener
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::UnixListener where T: ?core::marker::Sized
-pub struct glommio::net::UnixReadHalf<B: glommio::net::stream::RxBuf>
-impl<B: glommio::net::stream::RxBuf> glommio::net::UnixReadHalf<B>
+pub struct glommio::net::UnixReadHalf<B: glommio::net::RxBuf>
+impl<B: glommio::net::RxBuf> glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixReadHalf<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::UnixReadHalf<B>::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
-impl<'__pin, B: glommio::net::stream::RxBuf> core::marker::Unpin for glommio::net::UnixReadHalf<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
-impl<B: core::fmt::Debug + glommio::net::stream::RxBuf> core::fmt::Debug for glommio::net::UnixReadHalf<B>
+impl<'__pin, B: glommio::net::RxBuf> core::marker::Unpin for glommio::net::UnixReadHalf<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
+impl<B: core::fmt::Debug + glommio::net::RxBuf> core::fmt::Debug for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<B: glommio::net::Buffered + core::marker::Unpin> futures_io::if_std::AsyncBufRead for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::consume(self: core::pin::Pin<&mut Self>, amt: usize)
 pub fn glommio::net::UnixReadHalf<B>::poll_fill_buf<'a>(self: core::pin::Pin<&'a mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<&'a [u8]>>
-impl<B: glommio::net::stream::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::UnixReadHalf<B>
+impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::poll_read(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &mut [u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
-impl<B: glommio::net::stream::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::UnixReadHalf<B>
+impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::UnixReadHalf<B>
 impl<B> !core::marker::Send for glommio::net::UnixReadHalf<B>
@@ -2832,31 +2935,31 @@ pub unsafe fn glommio::net::UnixReadHalf<B>::init(init: <T as crossbeam_epoch::a
 impl<T> tracing::instrument::Instrument for glommio::net::UnixReadHalf<B>
 impl<T> tracing::instrument::WithSubscriber for glommio::net::UnixReadHalf<B>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::UnixReadHalf<B> where T: ?core::marker::Sized
-pub struct glommio::net::UnixStream<B: glommio::net::stream::RxBuf>
+pub struct glommio::net::UnixStream<B: glommio::net::RxBuf>
 impl glommio::net::UnixStream
 pub fn glommio::net::UnixStream::buffered(self) -> glommio::net::UnixStream<glommio::net::Preallocated>
 pub fn glommio::net::UnixStream::buffered_with<B: glommio::net::Buffered>(self, buf: B) -> glommio::net::UnixStream<B>
 pub async fn glommio::net::UnixStream::connect<A: core::convert::AsRef<std::path::Path>>(addr: A) -> glommio::Result<glommio::net::UnixStream>
 pub fn glommio::net::UnixStream::pair() -> glommio::Result<(glommio::net::UnixStream, glommio::net::UnixStream)>
-impl<B: glommio::net::stream::RxBuf> glommio::net::UnixStream<B>
+impl<B: glommio::net::RxBuf> glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixStream<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::UnixStream<B>::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixStream<B>::shutdown(&self, how: std::net::Shutdown) -> glommio::Result<()>
-impl<B: glommio::net::stream::RxBuf> glommio::net::UnixStream<B>
+impl<B: glommio::net::RxBuf> glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::reunite(rx: glommio::net::UnixReadHalf<B>, tx: glommio::net::UnixWriteHalf) -> core::result::Result<Self, (glommio::net::UnixReadHalf<B>, glommio::net::UnixWriteHalf)>
 pub fn glommio::net::UnixStream<B>::split(self) -> (glommio::net::UnixReadHalf<B>, glommio::net::UnixWriteHalf)
 impl std::os::fd::raw::FromRawFd for glommio::net::UnixStream
 pub unsafe fn glommio::net::UnixStream::from_raw_fd(fd: std::os::fd::raw::RawFd) -> Self
-impl<'__pin, B: glommio::net::stream::RxBuf> core::marker::Unpin for glommio::net::UnixStream<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
-impl<B: core::fmt::Debug + glommio::net::stream::RxBuf> core::fmt::Debug for glommio::net::UnixStream<B>
+impl<'__pin, B: glommio::net::RxBuf> core::marker::Unpin for glommio::net::UnixStream<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
+impl<B: core::fmt::Debug + glommio::net::RxBuf> core::fmt::Debug for glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<B: glommio::net::Buffered + core::marker::Unpin> futures_io::if_std::AsyncBufRead for glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::consume(self: core::pin::Pin<&mut Self>, amt: usize)
 pub fn glommio::net::UnixStream<B>::poll_fill_buf<'a>(self: core::pin::Pin<&'a mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<&'a [u8]>>
-impl<B: glommio::net::stream::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::UnixStream<B>
+impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::poll_read(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &mut [u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
-impl<B: glommio::net::stream::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncWrite for glommio::net::UnixStream<B>
+impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncWrite for glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::poll_close(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::UnixStream<B>::poll_flush(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::UnixStream<B>::poll_write(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &[u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
@@ -2948,8 +3051,41 @@ impl<T> tracing::instrument::Instrument for glommio::net::UnixWriteHalf
 impl<T> tracing::instrument::WithSubscriber for glommio::net::UnixWriteHalf
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::net::UnixWriteHalf where T: ?core::marker::Sized
 impl<W> futures_lite::io::AsyncWriteExt for glommio::net::UnixWriteHalf where W: futures_io::if_std::AsyncWrite + ?core::marker::Sized
-pub trait glommio::net::Buffered: glommio::net::stream::RxBuf
+pub trait glommio::net::Buffered: glommio::net::RxBuf
 impl glommio::net::Buffered for glommio::net::Preallocated
+pub trait glommio::net::RxBuf
+pub fn glommio::net::RxBuf::as_bytes(&self) -> &[u8]
+pub fn glommio::net::RxBuf::buffer_size(&self) -> usize
+pub fn glommio::net::RxBuf::consume(&mut self, amt: usize)
+pub fn glommio::net::RxBuf::handle_result(&mut self, result: usize)
+pub fn glommio::net::RxBuf::is_empty(&self) -> bool
+pub fn glommio::net::RxBuf::peek(&self, buf: &mut [u8]) -> usize
+pub fn glommio::net::RxBuf::read(&mut self, buf: &mut [u8]) -> usize
+pub fn glommio::net::RxBuf::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::RxBuf::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
+pub fn glommio::net::RxBuf::unfilled(&mut self) -> &mut [u8]
+impl glommio::net::RxBuf for glommio::net::NonBuffered
+pub fn glommio::net::NonBuffered::as_bytes(&self) -> &[u8]
+pub fn glommio::net::NonBuffered::buffer_size(&self) -> usize
+pub fn glommio::net::NonBuffered::consume(&mut self, _amt: usize)
+pub fn glommio::net::NonBuffered::handle_result(&mut self, _result: usize)
+pub fn glommio::net::NonBuffered::is_empty(&self) -> bool
+pub fn glommio::net::NonBuffered::peek(&self, _buf: &mut [u8]) -> usize
+pub fn glommio::net::NonBuffered::read(&mut self, _buf: &mut [u8]) -> usize
+pub fn glommio::net::NonBuffered::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::NonBuffered::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
+pub fn glommio::net::NonBuffered::unfilled(&mut self) -> &mut [u8]
+impl glommio::net::RxBuf for glommio::net::Preallocated
+pub fn glommio::net::Preallocated::as_bytes(&self) -> &[u8]
+pub fn glommio::net::Preallocated::buffer_size(&self) -> usize
+pub fn glommio::net::Preallocated::consume(&mut self, amt: usize)
+pub fn glommio::net::Preallocated::handle_result(&mut self, result: usize)
+pub fn glommio::net::Preallocated::is_empty(&self) -> bool
+pub fn glommio::net::Preallocated::peek(&self, buf: &mut [u8]) -> usize
+pub fn glommio::net::Preallocated::read(&mut self, buf: &mut [u8]) -> usize
+pub fn glommio::net::Preallocated::restore_kernel_buffer(&mut self, buffer: glommio::net::OwnedRxBuf)
+pub fn glommio::net::Preallocated::take_kernel_buffer(&mut self) -> core::option::Option<glommio::net::OwnedRxBuf>
+pub fn glommio::net::Preallocated::unfilled(&mut self) -> &mut [u8]
 pub mod glommio::prelude
 pub mod glommio::prelude::executor
 pub enum glommio::prelude::executor::Placement

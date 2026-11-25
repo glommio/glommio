@@ -552,7 +552,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             let read = std::future::poll_fn(|cx| match source.result() {
                 Some(result) => Poll::Ready(result),
                 None => {
-                    source.add_waiter_single(cx.waker());
+                    source.add_waiter_unique(cx.waker());
                     Poll::Pending
                 }
             })
@@ -603,7 +603,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                     if settled {
                         return Poll::Ready(());
                     }
-                    multi.add_waiter_single(cx.waker());
+                    multi.add_waiter_unique(cx.waker());
                     Poll::Pending
                 })
                 .await;

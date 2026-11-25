@@ -327,3 +327,81 @@ fn shutdown_read_with_read_pending() {
         assert!(matches!(r, Ok(Ok(0))));
     });
 }
+
+/// Two tasks peeking one stream while a completion read is in flight both
+/// wait on that read, and both must be woken when it lands.
+#[test]
+fn two_tasks_peeking_a_pending_completion_read_both_finish() {
+    test_executor!(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut writer = TcpStream::connect(addr).await.unwrap();
+        let mut stream = listener.accept().await.unwrap().buffered();
+        let mut small = [0u8; 4];
+        assert!(poll_once(stream.read(&mut small)).await.is_none());
+        let stream = std::rc::Rc::new(stream);
+        let peekers: Vec<_> = (0..2)
+            .map(|_| {
+                let stream = stream.clone();
+                crate::spawn_local(async move {
+                    let mut p = [0u8; 5];
+                    let n = stream.peek(&mut p).await.unwrap();
+                    p[..n].to_vec()
+                })
+            })
+            .collect();
+        Timer::new(Duration::from_millis(20)).await;
+        writer.write_all(b"hello").await.unwrap();
+        for peeker in peekers {
+            let peeked =
+                crate::timer::timeout(Duration::from_secs(1), async { Ok(peeker.await) }).await;
+            assert_eq!(
+                peeked.ok().as_deref(),
+                Some(&b"hello"[..]),
+                "a peeker was never woken"
+            );
+        }
+    });
+}
+
+/// Peeks from two tasks that give up leave their wakers on the completion
+/// read. The read that then takes the stream back waits on it alone, and is
+/// woken when it lands.
+#[test]
+fn a_read_after_abandoned_peeks_from_two_tasks_finishes() {
+    test_executor!(async move {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut writer = TcpStream::connect(addr).await.unwrap();
+        let mut stream = listener.accept().await.unwrap().buffered();
+        let mut small = [0u8; 4];
+        assert!(poll_once(stream.read(&mut small)).await.is_none());
+        let stream = std::rc::Rc::new(stream);
+        let peekers: Vec<_> = (0..2)
+            .map(|_| {
+                let stream = stream.clone();
+                crate::spawn_local(async move {
+                    let mut p = [0u8; 4];
+                    crate::timer::timeout(Duration::from_millis(20), async {
+                        Ok(stream.peek(&mut p).await)
+                    })
+                    .await
+                    .is_err()
+                })
+            })
+            .collect();
+        for peeker in peekers {
+            assert!(peeker.await, "a peek finished with nothing sent");
+        }
+        let mut stream = std::rc::Rc::try_unwrap(stream).unwrap();
+        let read = crate::spawn_local(async move {
+            let mut got = [0u8; 4];
+            let n = stream.read(&mut got).await.unwrap();
+            got[..n].to_vec()
+        });
+        Timer::new(Duration::from_millis(20)).await;
+        writer.write_all(b"data").await.unwrap();
+        let got = crate::timer::timeout(Duration::from_secs(1), async { Ok(read.await) }).await;
+        assert_eq!(got.ok().as_deref(), Some(&b"data"[..]));
+    });
+}

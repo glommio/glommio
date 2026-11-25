@@ -430,18 +430,31 @@ impl Source {
     /// Adds a single waiter to the list, replacing any waiter that may already
     /// exist. Should be used for single streams that map a future 1:1 to their I/O
     /// source
+    ///
+    /// The list can hold several waiters when the source is also waited on
+    /// through [`add_waiter_unique`](Self::add_waiter_unique), by futures
+    /// that only borrow the stream. A caller here has the stream to itself,
+    /// so those futures were dropped before it got it, and their wakers go.
     pub(crate) fn add_waiter_single(&self, waker: &Waker) {
         let mut inner = self.inner.borrow_mut();
         let waiters = &mut inner.wakers.waiters;
-        match waiters.first_mut() {
-            Some(w) => {
-                if !w.will_wake(waker) {
-                    *w = waker.clone();
-                }
-            }
-            None => waiters.push(waker.clone()),
+        if waiters.len() == 1 && waiters[0].will_wake(waker) {
+            return;
         }
-        debug_assert_eq!(inner.wakers.waiters.len(), 1)
+        waiters.clear();
+        waiters.push(waker.clone());
+    }
+
+    /// Adds a waiter unless one in the list already wakes the same task. For
+    /// a source several tasks can wait on at once through a shared borrow,
+    /// where each of them must be woken, and a future polled again must not
+    /// add itself twice.
+    pub(crate) fn add_waiter_unique(&self, waker: &Waker) {
+        let mut inner = self.inner.borrow_mut();
+        let waiters = &mut inner.wakers.waiters;
+        if !waiters.iter().any(|w| w.will_wake(waker)) {
+            waiters.push(waker.clone());
+        }
     }
 
     /// Adds a waiter to the list. Useful for streams that have many futures waiting

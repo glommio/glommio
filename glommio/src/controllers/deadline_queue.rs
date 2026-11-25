@@ -37,7 +37,7 @@ pub trait DeadlineSource {
     /// complete.
     ///
     /// It is calculated from the point of Queueing, not from the point in which
-    /// the operation starts.
+    /// the operation starts. A zero duration means the item is due at once.
     fn expected_duration(&self) -> Duration;
 
     /// The action to execute. Usually your struct will implement an async
@@ -111,14 +111,14 @@ pub struct PriorityBump<T> {
 
 impl<T> PriorityBump<T> {
     fn new(queue: Rc<InnerQueue<T>>) -> PriorityBump<T> {
-        queue.min_shares.set(250);
+        queue.bumps.set(queue.bumps.get() + 1);
         PriorityBump { queue }
     }
 }
 
 impl<T> Drop for PriorityBump<T> {
     fn drop(&mut self) {
-        self.queue.min_shares.set(1);
+        self.queue.bumps.set(self.queue.bumps.get() - 1);
     }
 }
 
@@ -128,13 +128,14 @@ type Request<T> = (QueueItem<T>, LocalSender<T>);
 #[derive(Debug)]
 struct InnerQueue<T> {
     queue: RefCell<VecDeque<(Instant, QueueItem<T>)>>,
-    last_admitted: Cell<Instant>,
     _last_adjusted: Cell<Instant>,
     last_shares: Cell<usize>,
     accumulated_error: Cell<f64>,
     adjustment_period: Duration,
     last_error: Cell<f64>,
-    min_shares: Cell<usize>,
+    /// How many [`PriorityBump`]s are alive: the floor holds until the last
+    /// one is dropped.
+    bumps: Cell<usize>,
 
     state: Cell<ControllerStatus>,
 }
@@ -188,6 +189,10 @@ impl<T> SharesManager for InnerQueue<T> {
     /// the  last output, and not how much the shares should be. It also
     /// eliminates any  dependency on time when calculating the error which
     /// increases resiliency.
+    ///
+    ///  An item with a zero `expected_duration` has no time to divide: it is
+    /// due at once, so all of its units are expected, which is the value the
+    /// time fraction reaches for any item as its remaining time runs out.
     fn shares(&self) -> usize {
         if let ControllerStatus::Disabled(shares) = self.state.get() {
             return shares;
@@ -204,8 +209,12 @@ impl<T> SharesManager for InnerQueue<T> {
                 "Remaining time for this source: {remaining_time:#?}, total_units {}",
                 source.total_units()
             );
-            let time_fraction =
-                1.0 - (remaining_time.as_secs_f64() / source.expected_duration().as_secs_f64());
+            let expected_duration = source.expected_duration();
+            let time_fraction = if expected_duration.is_zero() {
+                1.0
+            } else {
+                1.0 - (remaining_time.as_secs_f64() / expected_duration.as_secs_f64())
+            };
             if remaining_time.as_nanos() == 0 && now.saturating_duration_since(*exp).as_secs() > 5 {
                 // already too late, bump it up hard
                 self.last_shares.set(1000);
@@ -246,7 +255,7 @@ impl<T> SharesManager for InnerQueue<T> {
 
         let mut shares = (dshares + self.last_shares.get() as f64) as isize;
         shares = std::cmp::min(shares, 1000);
-        shares = std::cmp::max(shares, self.min_shares.get() as isize);
+        shares = std::cmp::max(shares, self.min_shares() as isize);
         let shares = shares as usize;
 
         trace!(
@@ -274,26 +283,35 @@ impl<T> InnerQueue<T> {
         let now = Instant::now();
         Self {
             queue: RefCell::new(VecDeque::new()),
-            last_admitted: Cell::new(now),
             _last_adjusted: Cell::new(now),
             last_shares: Cell::new(1),
             accumulated_error: Cell::new(0.0),
             adjustment_period,
             last_error: Cell::new(0.0),
-            min_shares: Cell::new(1),
+            bumps: Cell::new(0),
             state: Cell::new(ControllerStatus::Enabled),
         }
     }
 
+    fn min_shares(&self) -> usize {
+        if self.bumps.get() > 0 {
+            250
+        } else {
+            1
+        }
+    }
+
+    /// Items are served in order, so a deadline may not fall before that of
+    /// an item still waiting. Items that finished or were withdrawn no longer
+    /// constrain it.
     fn admit(&self, source: Rc<dyn DeadlineSource<Output = T>>) -> io::Result<()> {
         let expiration = Instant::now()
             .checked_add(source.expected_duration())
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        expiration
-            .checked_duration_since(self.last_admitted.get())
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        self.last_admitted.set(expiration);
         let mut queue = self.queue.borrow_mut();
+        if queue.back().is_some_and(|(last, _)| expiration < *last) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         queue.push_back((expiration, source.clone()));
         Ok(())
     }
@@ -436,6 +454,17 @@ impl<T: 'static> DeadlineQueue<T> {
                         trace!("the caller stopped waiting for its result");
                     }
                 }
+                let removal = crate::spawn_local_into(
+                    async move {
+                        if let Err(err) = crate::executor().remove_task_queue(tq) {
+                            trace!("the deadline queue kept its task queue: {err}");
+                        }
+                    },
+                    TaskQueueHandle::default(),
+                );
+                if let Ok(removal) = removal {
+                    removal.detach();
+                }
             }},
             tq,
         )
@@ -507,6 +536,9 @@ impl<T: 'static> DeadlineQueue<T> {
     }
 
     /// Returns the TaskQueueHandle associated with this controller
+    ///
+    /// The task queue is removed once this controller is dropped and the
+    /// action in flight, if any, has finished.
     pub fn task_queue(&self) -> TaskQueueHandle {
         self.tq
     }
@@ -575,6 +607,147 @@ mod test {
         fn processed_units(&self) -> u64 {
             0
         }
+    }
+
+    /// Finishes at once, so only its deadline matters to the queue.
+    struct Due(Duration);
+
+    impl DeadlineSource for Due {
+        type Output = u32;
+
+        fn expected_duration(&self) -> Duration {
+            self.0
+        }
+
+        fn action(self: Rc<Self>) -> Pin<Box<dyn Future<Output = u32> + 'static>> {
+            Box::pin(async { 0 })
+        }
+
+        fn total_units(&self) -> u64 {
+            1
+        }
+
+        fn processed_units(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Records that its action ran to completion rather than being dropped.
+    struct Finishes(Rc<Cell<bool>>);
+
+    impl DeadlineSource for Finishes {
+        type Output = u32;
+
+        fn expected_duration(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn action(self: Rc<Self>) -> Pin<Box<dyn Future<Output = u32> + 'static>> {
+            Box::pin(async move {
+                crate::timer::sleep(Duration::from_millis(20)).await;
+                self.0.set(true);
+                0
+            })
+        }
+
+        fn total_units(&self) -> u64 {
+            1
+        }
+
+        fn processed_units(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn an_item_due_at_once_raises_the_shares() {
+        let queue = InnerQueue::<u32>::new(Duration::from_millis(250));
+        queue.admit(Rc::new(Due(Duration::ZERO))).unwrap();
+        let shares = queue.shares();
+        assert!(shares > 900, "an item already due left shares at {shares}");
+    }
+
+    #[test]
+    fn a_priority_bump_holds_while_another_is_dropped() {
+        let queue = Rc::new(InnerQueue::<usize>::new(Duration::from_millis(250)));
+        let ahead = DeadlineSourceTest::new(Duration::from_secs(1), 1000);
+        ahead.processed_units.set(1000 * 1000);
+        queue.admit(ahead).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let first = PriorityBump::new(queue.clone());
+        let second = PriorityBump::new(queue.clone());
+        drop(first);
+        assert_eq!(queue.shares(), 250);
+        drop(second);
+    }
+
+    #[test]
+    fn a_finished_item_does_not_hold_back_an_earlier_deadline() {
+        test_executor!(async move {
+            let queue = DeadlineQueue::<u32>::new("finished", Duration::from_millis(250));
+            queue
+                .push_work(Rc::new(Due(Duration::from_secs(60))))
+                .await
+                .unwrap();
+            queue
+                .push_work(Rc::new(Due(Duration::from_secs(1))))
+                .await
+                .expect("an empty queue refused an earlier deadline");
+        });
+    }
+
+    #[test]
+    fn a_dropped_queue_releases_its_task_queue() {
+        test_executor!(async move {
+            let queue = DeadlineQueue::<u32>::new("released", Duration::from_millis(250));
+            queue
+                .push_work(Rc::new(Due(Duration::from_secs(1))))
+                .await
+                .unwrap();
+            let tq = queue.task_queue();
+            let controller = Rc::downgrade(&queue.queue);
+            drop(queue);
+            for _ in 0..100 {
+                if controller.upgrade().is_none() {
+                    break;
+                }
+                crate::timer::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                controller.upgrade().is_none(),
+                "the controller outlived its queue"
+            );
+            assert!(crate::executor().task_queue_stats(tq).is_err());
+        });
+    }
+
+    #[test]
+    fn a_dropped_queue_finishes_the_action_in_flight() {
+        test_executor!(async move {
+            let queue = DeadlineQueue::<u32>::new("in flight", Duration::from_millis(250));
+            let done = Rc::new(Cell::new(false));
+            let abandoned = crate::timer::timeout(Duration::from_millis(5), async {
+                Ok(queue.push_work(Rc::new(Finishes(done.clone()))).await)
+            })
+            .await;
+            assert!(abandoned.is_err());
+            let controller = Rc::downgrade(&queue.queue);
+            drop(queue);
+            for _ in 0..100 {
+                if controller.upgrade().is_none() {
+                    break;
+                }
+                crate::timer::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                done.get(),
+                "dropping the queue cancelled the action in flight"
+            );
+            assert!(
+                controller.upgrade().is_none(),
+                "the controller outlived its queue"
+            );
+        });
     }
 
     #[test]

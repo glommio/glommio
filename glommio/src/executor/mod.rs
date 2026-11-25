@@ -48,7 +48,7 @@ use log::warn;
 pub use placement::{CpuSet, Placement, PoolPlacement};
 use std::{
     cell::RefCell,
-    collections::{hash_map::Entry, BinaryHeap, VecDeque},
+    collections::{BinaryHeap, VecDeque},
     fmt,
     future::Future,
     io,
@@ -1607,26 +1607,7 @@ impl LocalExecutor {
     ///
     /// The task queue cannot be removed if there are still pending tasks.
     pub fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
-        let mut queues = self.context.queues.borrow_mut();
-        if queues
-            .active_executing
-            .as_ref()
-            .is_some_and(|queue| queue.borrow().stats.index == handle)
-        {
-            return Err(GlommioError::queue_still_active(handle.index));
-        }
-
-        let queue_entry = queues.available_executors.entry(handle.index);
-        if let Entry::Occupied(entry) = queue_entry {
-            let tq = entry.get();
-            if tq.borrow().is_active() {
-                return Err(GlommioError::queue_still_active(handle.index));
-            }
-
-            entry.remove();
-            return Ok(());
-        }
-        Err(GlommioError::queue_not_found(handle.index))
+        self.context.remove_task_queue(handle)
     }
 
     /// Spawns a task directly onto this executor instance.
@@ -2819,6 +2800,20 @@ impl ExecutorProxy {
                 .as_ref()
                 .expect("this thread doesn't have a LocalExecutor running")
                 .current_task_queue()
+        };
+    }
+
+    /// Removes a task queue, as [`LocalExecutor::remove_task_queue`] does.
+    pub(crate) fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
+        #[cfg(any(not(nightly), not(feature = "native-tls")))]
+        return LOCAL_EX.with(|local_ex| local_ex.remove_task_queue(handle));
+
+        #[cfg(all(nightly, feature = "native-tls"))]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .remove_task_queue(handle)
         };
     }
 

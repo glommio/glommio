@@ -13,7 +13,7 @@
 
 /// The status of a particular controller. In some situations it is useful
 /// to disable the controller and use static shares instead.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ControllerStatus {
     /// Controller Enabled. Shares are automatically determined
     Enabled,

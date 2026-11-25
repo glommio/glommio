@@ -726,9 +726,13 @@ pub glommio::controllers::ControllerStatus::Disabled(usize)
 pub glommio::controllers::ControllerStatus::Enabled
 impl core::clone::Clone for glommio::controllers::ControllerStatus
 pub fn glommio::controllers::ControllerStatus::clone(&self) -> glommio::controllers::ControllerStatus
+impl core::cmp::Eq for glommio::controllers::ControllerStatus
+impl core::cmp::PartialEq for glommio::controllers::ControllerStatus
+pub fn glommio::controllers::ControllerStatus::eq(&self, other: &glommio::controllers::ControllerStatus) -> bool
 impl core::fmt::Debug for glommio::controllers::ControllerStatus
 pub fn glommio::controllers::ControllerStatus::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Copy for glommio::controllers::ControllerStatus
+impl core::marker::StructuralPartialEq for glommio::controllers::ControllerStatus
 impl core::marker::Freeze for glommio::controllers::ControllerStatus
 impl core::marker::Send for glommio::controllers::ControllerStatus
 impl core::marker::Sync for glommio::controllers::ControllerStatus
@@ -868,8 +872,14 @@ pub mod glommio::io
 pub enum glommio::io::CloseResult
 pub glommio::io::CloseResult::Closed
 pub glommio::io::CloseResult::Unreferenced
+impl core::clone::Clone for glommio::io::CloseResult
+pub fn glommio::io::CloseResult::clone(&self) -> glommio::io::CloseResult
+impl core::cmp::Eq for glommio::io::CloseResult
+impl core::cmp::PartialEq for glommio::io::CloseResult
+pub fn glommio::io::CloseResult::eq(&self, other: &glommio::io::CloseResult) -> bool
 impl core::fmt::Debug for glommio::io::CloseResult
 pub fn glommio::io::CloseResult::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for glommio::io::CloseResult
 impl core::marker::Freeze for glommio::io::CloseResult
 impl core::marker::Send for glommio::io::CloseResult
 impl core::marker::Sync for glommio::io::CloseResult
@@ -887,12 +897,18 @@ pub fn glommio::io::CloseResult::try_from(value: U) -> core::result::Result<T, <
 impl<T, U> core::convert::TryInto<U> for glommio::io::CloseResult where U: core::convert::TryFrom<T>
 pub type glommio::io::CloseResult::Error = <U as core::convert::TryFrom<T>>::Error
 pub fn glommio::io::CloseResult::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::io::CloseResult where T: core::clone::Clone
+pub type glommio::io::CloseResult::Owned = T
+pub fn glommio::io::CloseResult::clone_into(&self, target: &mut T)
+pub fn glommio::io::CloseResult::to_owned(&self) -> T
 impl<T> core::any::Any for glommio::io::CloseResult where T: 'static + ?core::marker::Sized
 pub fn glommio::io::CloseResult::type_id(&self) -> core::any::TypeId
 impl<T> core::borrow::Borrow<T> for glommio::io::CloseResult where T: ?core::marker::Sized
 pub fn glommio::io::CloseResult::borrow(&self) -> &T
 impl<T> core::borrow::BorrowMut<T> for glommio::io::CloseResult where T: ?core::marker::Sized
 pub fn glommio::io::CloseResult::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::io::CloseResult where T: core::clone::Clone
+pub unsafe fn glommio::io::CloseResult::clone_to_uninit(&self, dest: *mut u8)
 impl<T> core::convert::From<T> for glommio::io::CloseResult
 pub fn glommio::io::CloseResult::from(t: T) -> T
 impl<T> crossbeam_epoch::atomic::Pointable for glommio::io::CloseResult
@@ -1203,7 +1219,7 @@ pub unsafe fn glommio::io::DmaBuffer::deref_mut<'a>(ptr: usize) -> &'a mut T
 pub unsafe fn glommio::io::DmaBuffer::drop(ptr: usize)
 pub unsafe fn glommio::io::DmaBuffer::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
 impl<T> glommio::ByteSliceExt for glommio::io::DmaBuffer where T: core::convert::AsRef<[u8]> + ?core::marker::Sized
-pub fn glommio::io::DmaBuffer::read_at<D: core::convert::AsMut<[u8]> + ?core::marker::Sized>(&self, offset: usize, destination: &mut D) -> usize
+pub fn glommio::io::DmaBuffer::read_at<D>(&self, offset: usize, destination: &mut D) -> usize where D: core::convert::AsMut<[u8]> + ?core::marker::Sized
 impl<T> glommio::ByteSliceMutExt for glommio::io::DmaBuffer where T: core::convert::AsMut<[u8]> + ?core::marker::Sized
 pub fn glommio::io::DmaBuffer::memset(&mut self, value: u8)
 pub fn glommio::io::DmaBuffer::write_at<S: core::convert::AsRef<[u8]> + ?core::marker::Sized>(&mut self, offset: usize, src: &S) -> usize
@@ -1835,6 +1851,11 @@ pub fn glommio::io::ReadResult::slice(this: &Self, extra_offset: usize, len: usi
 pub unsafe fn glommio::io::ReadResult::slice_unchecked(this: &Self, extra_offset: usize, len: usize) -> Self
 impl core::clone::Clone for glommio::io::ReadResult
 pub fn glommio::io::ReadResult::clone(&self) -> glommio::io::ReadResult
+impl core::cmp::Eq for glommio::io::ReadResult
+impl core::cmp::PartialEq for glommio::io::ReadResult
+pub fn glommio::io::ReadResult::eq(&self, other: &Self) -> bool
+impl core::convert::AsRef<[u8]> for glommio::io::ReadResult
+pub fn glommio::io::ReadResult::as_ref(&self) -> &[u8]
 impl core::convert::From<glommio::io::ReadResult> for glommio::io::DmaBuffer
 pub fn glommio::io::DmaBuffer::from(value: glommio::io::ReadResult) -> Self
 impl core::default::Default for glommio::io::ReadResult
@@ -1884,6 +1905,8 @@ pub unsafe fn glommio::io::ReadResult::deref<'a>(ptr: usize) -> &'a T
 pub unsafe fn glommio::io::ReadResult::deref_mut<'a>(ptr: usize) -> &'a mut T
 pub unsafe fn glommio::io::ReadResult::drop(ptr: usize)
 pub unsafe fn glommio::io::ReadResult::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> glommio::ByteSliceExt for glommio::io::ReadResult where T: core::convert::AsRef<[u8]> + ?core::marker::Sized
+pub fn glommio::io::ReadResult::read_at<D>(&self, offset: usize, destination: &mut D) -> usize where D: core::convert::AsMut<[u8]> + ?core::marker::Sized
 impl<T> tracing::instrument::Instrument for glommio::io::ReadResult
 impl<T> tracing::instrument::WithSubscriber for glommio::io::ReadResult
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::io::ReadResult where T: ?core::marker::Sized
@@ -1891,8 +1914,14 @@ pub struct glommio::io::Stat
 pub glommio::io::Stat::allocated_file_size: u64
 pub glommio::io::Stat::file_size: u64
 pub glommio::io::Stat::fs_cluster_size: u32
+impl core::clone::Clone for glommio::io::Stat
+pub fn glommio::io::Stat::clone(&self) -> glommio::io::Stat
+impl core::cmp::Eq for glommio::io::Stat
+impl core::cmp::PartialEq for glommio::io::Stat
+pub fn glommio::io::Stat::eq(&self, other: &glommio::io::Stat) -> bool
 impl core::fmt::Debug for glommio::io::Stat
 pub fn glommio::io::Stat::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for glommio::io::Stat
 impl core::marker::Freeze for glommio::io::Stat
 impl core::marker::Send for glommio::io::Stat
 impl core::marker::Sync for glommio::io::Stat
@@ -1910,12 +1939,18 @@ pub fn glommio::io::Stat::try_from(value: U) -> core::result::Result<T, <T as co
 impl<T, U> core::convert::TryInto<U> for glommio::io::Stat where U: core::convert::TryFrom<T>
 pub type glommio::io::Stat::Error = <U as core::convert::TryFrom<T>>::Error
 pub fn glommio::io::Stat::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::io::Stat where T: core::clone::Clone
+pub type glommio::io::Stat::Owned = T
+pub fn glommio::io::Stat::clone_into(&self, target: &mut T)
+pub fn glommio::io::Stat::to_owned(&self) -> T
 impl<T> core::any::Any for glommio::io::Stat where T: 'static + ?core::marker::Sized
 pub fn glommio::io::Stat::type_id(&self) -> core::any::TypeId
 impl<T> core::borrow::Borrow<T> for glommio::io::Stat where T: ?core::marker::Sized
 pub fn glommio::io::Stat::borrow(&self) -> &T
 impl<T> core::borrow::BorrowMut<T> for glommio::io::Stat where T: ?core::marker::Sized
 pub fn glommio::io::Stat::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::io::Stat where T: core::clone::Clone
+pub unsafe fn glommio::io::Stat::clone_to_uninit(&self, dest: *mut u8)
 impl<T> core::convert::From<T> for glommio::io::Stat
 pub fn glommio::io::Stat::from(t: T) -> T
 impl<T> crossbeam_epoch::atomic::Pointable for glommio::io::Stat
@@ -4144,10 +4179,13 @@ pub glommio::prelude::Latency::Matters(core::time::Duration)
 pub glommio::prelude::Latency::NotImportant
 impl core::clone::Clone for glommio::Latency
 pub fn glommio::Latency::clone(&self) -> glommio::Latency
+impl core::cmp::Eq for glommio::Latency
 impl core::cmp::PartialEq for glommio::Latency
 pub fn glommio::Latency::eq(&self, other: &glommio::Latency) -> bool
 impl core::fmt::Debug for glommio::Latency
 pub fn glommio::Latency::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for glommio::Latency
+pub fn glommio::Latency::hash<__H: core::hash::Hasher>(&self, state: &mut __H)
 impl core::marker::Copy for glommio::Latency
 impl core::marker::StructuralPartialEq for glommio::Latency
 impl core::marker::Freeze for glommio::Latency
@@ -4424,6 +4462,10 @@ pub glommio::prelude::IoStats::main_ring: glommio::RingIoStats
 pub glommio::prelude::IoStats::poll_ring: glommio::RingIoStats
 impl glommio::IoStats
 pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
+impl core::clone::Clone for glommio::IoStats
+pub fn glommio::IoStats::clone(&self) -> glommio::IoStats
+impl core::default::Default for glommio::IoStats
+pub fn glommio::IoStats::default() -> glommio::IoStats
 impl core::fmt::Debug for glommio::IoStats
 pub fn glommio::IoStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::IoStats
@@ -4443,12 +4485,18 @@ pub fn glommio::IoStats::try_from(value: U) -> core::result::Result<T, <T as cor
 impl<T, U> core::convert::TryInto<U> for glommio::IoStats where U: core::convert::TryFrom<T>
 pub type glommio::IoStats::Error = <U as core::convert::TryFrom<T>>::Error
 pub fn glommio::IoStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::IoStats where T: core::clone::Clone
+pub type glommio::IoStats::Owned = T
+pub fn glommio::IoStats::clone_into(&self, target: &mut T)
+pub fn glommio::IoStats::to_owned(&self) -> T
 impl<T> core::any::Any for glommio::IoStats where T: 'static + ?core::marker::Sized
 pub fn glommio::IoStats::type_id(&self) -> core::any::TypeId
 impl<T> core::borrow::Borrow<T> for glommio::IoStats where T: ?core::marker::Sized
 pub fn glommio::IoStats::borrow(&self) -> &T
 impl<T> core::borrow::BorrowMut<T> for glommio::IoStats where T: ?core::marker::Sized
 pub fn glommio::IoStats::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::IoStats where T: core::clone::Clone
+pub unsafe fn glommio::IoStats::clone_to_uninit(&self, dest: *mut u8)
 impl<T> core::convert::From<T> for glommio::IoStats
 pub fn glommio::IoStats::from(t: T) -> T
 impl<T> crossbeam_epoch::atomic::Pointable for glommio::IoStats
@@ -4777,7 +4825,7 @@ impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusi
 pub trait glommio::prelude::ByteSliceExt
 pub fn glommio::prelude::ByteSliceExt::read_at<D: core::convert::AsMut<[u8]> + ?core::marker::Sized>(&self, offset: usize, destination: &mut D) -> usize
 impl<T: core::convert::AsRef<[u8]> + ?core::marker::Sized> glommio::ByteSliceExt for T
-pub fn T::read_at<D: core::convert::AsMut<[u8]> + ?core::marker::Sized>(&self, offset: usize, destination: &mut D) -> usize
+pub fn T::read_at<D>(&self, offset: usize, destination: &mut D) -> usize where D: core::convert::AsMut<[u8]> + ?core::marker::Sized
 pub trait glommio::prelude::ByteSliceMutExt
 pub fn glommio::prelude::ByteSliceMutExt::memset(&mut self, value: u8)
 pub fn glommio::prelude::ByteSliceMutExt::write_at<S: core::convert::AsRef<[u8]> + ?core::marker::Sized>(&mut self, offset: usize, src: &S) -> usize
@@ -4800,6 +4848,8 @@ pub fn glommio::sync::Gate::spawn<T: 'static>(&self, future: impl core::future::
 pub fn glommio::sync::Gate::spawn_into<T: 'static>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> core::result::Result<glommio::Task<T>, glommio::GlommioError<()>>
 impl core::clone::Clone for glommio::sync::Gate
 pub fn glommio::sync::Gate::clone(&self) -> glommio::sync::Gate
+impl core::default::Default for glommio::sync::Gate
+pub fn glommio::sync::Gate::default() -> Self
 impl core::fmt::Debug for glommio::sync::Gate
 pub fn glommio::sync::Gate::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::sync::Gate
@@ -5142,6 +5192,7 @@ pub async fn glommio::sync::Semaphore::acquire_permit(&self, units: u64) -> glom
 pub async fn glommio::sync::Semaphore::acquire_static_permit(self: &alloc::rc::Rc<Self>, units: u64) -> glommio::Result<glommio::sync::StaticPermit, ()>
 pub fn glommio::sync::Semaphore::available(&self) -> u64
 pub fn glommio::sync::Semaphore::close(&self)
+pub fn glommio::sync::Semaphore::is_closed(&self) -> bool
 pub fn glommio::sync::Semaphore::new(avail: u64) -> glommio::sync::Semaphore
 pub fn glommio::sync::Semaphore::signal(&self, units: u64)
 pub fn glommio::sync::Semaphore::try_acquire(&self, units: u64) -> glommio::Result<bool, ()>
@@ -5324,8 +5375,11 @@ impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusi
 pub mod glommio::timer
 pub struct glommio::timer::Timer
 impl glommio::timer::Timer
+pub fn glommio::timer::Timer::at(when: std::time::Instant) -> glommio::timer::Timer
+pub fn glommio::timer::Timer::deadline(&self) -> core::option::Option<std::time::Instant>
 pub fn glommio::timer::Timer::new(dur: core::time::Duration) -> glommio::timer::Timer
 pub fn glommio::timer::Timer::reset(&mut self, dur: core::time::Duration)
+pub fn glommio::timer::Timer::reset_at(&mut self, when: std::time::Instant)
 impl core::fmt::Debug for glommio::timer::Timer
 pub fn glommio::timer::Timer::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::future::future::Future for glommio::timer::Timer
@@ -5426,8 +5480,8 @@ impl glommio::timer::TimerActionRepeat
 pub async fn glommio::timer::TimerActionRepeat::cancel(self)
 pub fn glommio::timer::TimerActionRepeat::destroy(&self)
 pub async fn glommio::timer::TimerActionRepeat::join(self) -> core::option::Option<()>
-pub fn glommio::timer::TimerActionRepeat::repeat<G, F>(action_gen: G) -> glommio::timer::TimerActionRepeat where G: core::ops::function::Fn() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
-pub fn glommio::timer::TimerActionRepeat::repeat_into<G, F>(action_gen: G, tq: glommio::TaskQueueHandle) -> glommio::Result<glommio::timer::TimerActionRepeat> where G: core::ops::function::Fn() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
+pub fn glommio::timer::TimerActionRepeat::repeat<G, F>(action_gen: G) -> glommio::timer::TimerActionRepeat where G: core::ops::function::FnMut() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
+pub fn glommio::timer::TimerActionRepeat::repeat_into<G, F>(action_gen: G, tq: glommio::TaskQueueHandle) -> glommio::Result<glommio::timer::TimerActionRepeat> where G: core::ops::function::FnMut() -> F + 'static, F: core::future::future::Future<Output = core::option::Option<core::time::Duration>> + 'static
 impl core::fmt::Debug for glommio::timer::TimerActionRepeat
 pub fn glommio::timer::TimerActionRepeat::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::timer::TimerActionRepeat
@@ -5648,10 +5702,13 @@ pub glommio::Latency::Matters(core::time::Duration)
 pub glommio::Latency::NotImportant
 impl core::clone::Clone for glommio::Latency
 pub fn glommio::Latency::clone(&self) -> glommio::Latency
+impl core::cmp::Eq for glommio::Latency
 impl core::cmp::PartialEq for glommio::Latency
 pub fn glommio::Latency::eq(&self, other: &glommio::Latency) -> bool
 impl core::fmt::Debug for glommio::Latency
 pub fn glommio::Latency::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for glommio::Latency
+pub fn glommio::Latency::hash<__H: core::hash::Hasher>(&self, state: &mut __H)
 impl core::marker::Copy for glommio::Latency
 impl core::marker::StructuralPartialEq for glommio::Latency
 impl core::marker::Freeze for glommio::Latency
@@ -6412,6 +6469,10 @@ pub glommio::IoStats::main_ring: glommio::RingIoStats
 pub glommio::IoStats::poll_ring: glommio::RingIoStats
 impl glommio::IoStats
 pub fn glommio::IoStats::all_rings(&self) -> glommio::RingIoStats
+impl core::clone::Clone for glommio::IoStats
+pub fn glommio::IoStats::clone(&self) -> glommio::IoStats
+impl core::default::Default for glommio::IoStats
+pub fn glommio::IoStats::default() -> glommio::IoStats
 impl core::fmt::Debug for glommio::IoStats
 pub fn glommio::IoStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::IoStats
@@ -6431,12 +6492,18 @@ pub fn glommio::IoStats::try_from(value: U) -> core::result::Result<T, <T as cor
 impl<T, U> core::convert::TryInto<U> for glommio::IoStats where U: core::convert::TryFrom<T>
 pub type glommio::IoStats::Error = <U as core::convert::TryFrom<T>>::Error
 pub fn glommio::IoStats::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::IoStats where T: core::clone::Clone
+pub type glommio::IoStats::Owned = T
+pub fn glommio::IoStats::clone_into(&self, target: &mut T)
+pub fn glommio::IoStats::to_owned(&self) -> T
 impl<T> core::any::Any for glommio::IoStats where T: 'static + ?core::marker::Sized
 pub fn glommio::IoStats::type_id(&self) -> core::any::TypeId
 impl<T> core::borrow::Borrow<T> for glommio::IoStats where T: ?core::marker::Sized
 pub fn glommio::IoStats::borrow(&self) -> &T
 impl<T> core::borrow::BorrowMut<T> for glommio::IoStats where T: ?core::marker::Sized
 pub fn glommio::IoStats::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::IoStats where T: core::clone::Clone
+pub unsafe fn glommio::IoStats::clone_to_uninit(&self, dest: *mut u8)
 impl<T> core::convert::From<T> for glommio::IoStats
 pub fn glommio::IoStats::from(t: T) -> T
 impl<T> crossbeam_epoch::atomic::Pointable for glommio::IoStats
@@ -7096,7 +7163,7 @@ impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusi
 pub trait glommio::ByteSliceExt
 pub fn glommio::ByteSliceExt::read_at<D: core::convert::AsMut<[u8]> + ?core::marker::Sized>(&self, offset: usize, destination: &mut D) -> usize
 impl<T: core::convert::AsRef<[u8]> + ?core::marker::Sized> glommio::ByteSliceExt for T
-pub fn T::read_at<D: core::convert::AsMut<[u8]> + ?core::marker::Sized>(&self, offset: usize, destination: &mut D) -> usize
+pub fn T::read_at<D>(&self, offset: usize, destination: &mut D) -> usize where D: core::convert::AsMut<[u8]> + ?core::marker::Sized
 pub trait glommio::ByteSliceMutExt
 pub fn glommio::ByteSliceMutExt::memset(&mut self, value: u8)
 pub fn glommio::ByteSliceMutExt::write_at<S: core::convert::AsRef<[u8]> + ?core::marker::Sized>(&mut self, offset: usize, src: &S) -> usize

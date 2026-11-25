@@ -69,7 +69,6 @@ pub struct Gate {
 
 impl Gate {
     /// Create a new [`Gate`](crate::sync::Gate)
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             inner: Rc::new(GateInner {
@@ -143,6 +142,13 @@ impl Gate {
     #[cfg(test)]
     pub(crate) fn passes(&self) -> usize {
         self.inner.count.get()
+    }
+}
+
+impl Default for Gate {
+    /// An open gate with no passes, the same as [`Gate::new`].
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -255,6 +261,20 @@ mod tests {
     use futures_lite::pin;
     use std::task::{Context, Waker};
     use std::time::Duration;
+
+    #[test]
+    fn a_default_gate_is_open_and_closes_like_a_new_one() {
+        LocalExecutor::default().run(async {
+            let gate = Gate::default();
+            assert!(gate.is_open());
+            assert!(!gate.is_closed());
+            let pass = gate.enter().unwrap();
+            let closing = gate.close();
+            drop(pass);
+            closing.await.unwrap();
+            assert!(gate.is_closed());
+        })
+    }
 
     #[test]
     fn test_immediate_close() {

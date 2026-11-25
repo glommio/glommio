@@ -39,7 +39,7 @@ pub(super) use crate::Result;
 
 /// Close result of [`DmaFile::close_rc()`]. Indicates which operation was
 /// performed on close.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloseResult {
     /// The file is closed.
     Closed,

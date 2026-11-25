@@ -276,6 +276,8 @@ pub struct Permit<'a> {
 /// Resources are held while the Permit is alive, and released when the
 /// permit is dropped.
 #[derive(Debug)]
+#[must_use = "units are only held while the permit is alive. If unused then semaphore will \
+              immediately release units"]
 pub struct StaticPermit {
     units: u64,
     sem: Rc<Semaphore>,
@@ -686,6 +688,25 @@ impl Semaphore {
             waker.wake();
         }
     }
+
+    /// Whether the semaphore has been closed, by [`close`] or by
+    /// [`StaticPermit::close`]. A closed semaphore stays closed: every
+    /// acquisition fails, and signalling units does not reopen it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glommio::sync::Semaphore;
+    ///
+    /// let sem = Semaphore::new(1);
+    /// assert!(!sem.is_closed());
+    /// sem.close();
+    /// assert!(sem.is_closed());
+    /// ```
+    /// [`close`]: Semaphore::close
+    pub fn is_closed(&self) -> bool {
+        self.state.borrow().closed
+    }
 }
 
 impl Drop for Semaphore {
@@ -882,6 +903,25 @@ mod test {
         if !matches!(err, GlommioError::Closed(ResourceType::Semaphore { .. })) {
             panic!("Incorrect error type is returned from try_acquire method");
         }
+    }
+
+    #[test]
+    fn a_semaphore_reports_closed_once_closed_and_stays_closed() {
+        let sem = Semaphore::new(1);
+        assert!(!sem.is_closed());
+        sem.close();
+        assert!(sem.is_closed());
+        sem.signal(1);
+        assert!(sem.is_closed());
+    }
+
+    #[test]
+    fn closing_through_a_static_permit_closes_its_semaphore() {
+        let sem = Rc::new(Semaphore::new(1));
+        let permit = sem.try_acquire_static_permit(1).unwrap();
+        assert!(!sem.is_closed());
+        permit.close();
+        assert!(sem.is_closed());
     }
 
     #[test]

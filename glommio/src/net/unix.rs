@@ -735,15 +735,16 @@ impl UnixDatagram {
         self.socket.rx_buf_size
     }
 
-    /// Receives single datagram on the socket from the remote address to which
-    /// it is connected, without removing the message from input queue. On
-    /// success, returns the number of bytes peeked.
+    /// Receives single datagram on the socket, without removing the message
+    /// from input queue. On success, returns the number of bytes peeked.
     ///
     /// The function must be called with valid byte array buf of sufficient size
     /// to hold the message bytes. If a message is too long to fit in the
     /// supplied buffer, excess bytes may be discarded.
     ///
-    /// To use this function, [`connect`] must have been called
+    /// As with [`recv`](UnixDatagram::recv), the socket need not be connected:
+    /// once [`connect`] has been called only datagrams from that peer arrive,
+    /// and before that the next datagram from any sender is peeked.
     ///
     /// # Examples
     ///
@@ -764,7 +765,6 @@ impl UnixDatagram {
     ///
     /// [`connect`]: UnixDatagram::connect
     pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
-        let _ = self.peer_addr()?;
         self.socket.peek(buf).await.map_err(Into::into)
     }
 
@@ -791,16 +791,16 @@ impl UnixDatagram {
         self.socket.socket.local_addr().map_err(Into::into)
     }
 
-    /// Receives a single datagram message on the socket from the remote address
-    /// to which it is connected.
+    /// Receives a single datagram message on the socket.
     ///
     /// On success, returns the number of bytes read.  The function must be
     /// called with valid byte array buf of sufficient size to hold the
     /// message bytes. If a message is too long to fit in the supplied
     /// buffer, excess bytes may be discarded.
     ///
-    ///
-    /// To use this function, [`connect`] must have been called
+    /// The socket need not be connected: once [`connect`] has been called only
+    /// datagrams from that peer arrive, and before that the next datagram from
+    /// any sender is received.
     ///
     /// # Examples
     ///
@@ -1154,6 +1154,22 @@ mod tests {
             "UnixDatagram::send_to"
         );
     });
+
+    unix_socket_test!(
+        peek_on_a_bound_unconnected_datagram_socket_sees_the_next_message,
+        dir,
+        {
+            let path = dir.join("dgram");
+            let receiver = UnixDatagram::bind(&path).unwrap();
+            let sender = UnixDatagram::unbound().unwrap();
+            sender.connect(&path).await.unwrap();
+            sender.send(&[1; 1]).await.unwrap();
+
+            let mut buf = vec![0; 32];
+            assert_eq!(receiver.peek(&mut buf).await.unwrap(), 1);
+            assert_eq!(receiver.recv(&mut buf).await.unwrap(), 1);
+        }
+    );
 
     unix_socket_test!(datagram_connect_unbounded, dir, {
         let mut file = dir.clone();

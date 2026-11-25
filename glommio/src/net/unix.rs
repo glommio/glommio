@@ -11,6 +11,7 @@ use crate::{
 use futures_lite::{
     future::poll_fn,
     io::{AsyncBufRead, AsyncRead, AsyncWrite},
+    ready,
     stream::{self, Stream},
 };
 use nix::sys::socket::UnixAddr;
@@ -18,15 +19,20 @@ use pin_project_lite::pin_project;
 use socket2::{Domain, Socket, Type};
 use std::{
     io::{self, IoSlice},
+    mem::ManuallyDrop,
     net::Shutdown,
-    os::unix::{
-        io::{AsRawFd, FromRawFd, RawFd},
-        net::{self, SocketAddr},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::{
+            io::{AsRawFd, FromRawFd, RawFd},
+            net::{self, SocketAddr},
+        },
     },
     path::Path,
     pin::Pin,
     rc::{Rc, Weak},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use crate::Result;
@@ -69,6 +75,18 @@ use crate::Result;
 pub struct UnixListener {
     reactor: Weak<Reactor>,
     listener: net::UnixListener,
+}
+
+impl AsRawFd for UnixListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.listener.as_fd()
+    }
 }
 
 impl UnixListener {
@@ -231,6 +249,15 @@ pub struct AcceptedUnixStream {
 }
 
 impl AcceptedUnixStream {
+    /// Returns the socket address of the remote peer
+    ///
+    /// A peer that connected without binding first, which is the usual case,
+    /// has an unnamed address.
+    pub fn peer_addr(&self) -> Result<SocketAddr> {
+        let stream = ManuallyDrop::new(unsafe { net::UnixStream::from_raw_fd(self.fd) });
+        stream.peer_addr().map_err(Into::into)
+    }
+
     /// Binds this `AcceptedUnixStream` to the current executor
     ///
     /// This returns a [`UnixStream`] that can then be used normally
@@ -289,6 +316,18 @@ impl FromRawFd for UnixStream {
         UnixStream {
             stream: GlommioStream::from_raw_fd(fd as _),
         }
+    }
+}
+
+impl<B: RxBuf> AsRawFd for UnixStream<B> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.stream().as_raw_fd()
+    }
+}
+
+impl<B: RxBuf> AsFd for UnixStream<B> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
     }
 }
 
@@ -357,11 +396,73 @@ impl UnixStream {
 }
 
 impl<B: RxBuf> UnixStream<B> {
+    /// Sets the read timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then read calls will block
+    /// indefinitely. An [`Err`] is returned if the zero [`Duration`] is
+    /// passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use glommio::{net::UnixStream, LocalExecutor};
+    /// # use std::time::Duration;
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let (stream, _peer) = UnixStream::pair().unwrap();
+    /// stream
+    ///     .set_read_timeout(Some(Duration::from_secs(1)))
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.stream.set_read_timeout(dur)
+    }
+
+    /// Sets the write timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then write calls will block
+    /// indefinitely. An [`Err`] is returned if the zero [`Duration`] is
+    /// passed to this method.
+    ///
+    /// ```
+    /// # use glommio::{net::UnixStream, LocalExecutor};
+    /// # use std::time::Duration;
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let (stream, _peer) = UnixStream::pair().unwrap();
+    /// stream
+    ///     .set_write_timeout(Some(Duration::from_secs(1)))
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.stream.set_write_timeout(dur)
+    }
+
+    /// Returns the read timeout of this socket.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.stream.read_timeout()
+    }
+
+    /// Returns the write timeout of this socket.
+    pub fn write_timeout(&self) -> Option<Duration> {
+        self.stream.write_timeout()
+    }
+
     /// Shuts down the read, write, or both halves of this connection.
     pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
-        poll_fn(|cx| self.stream.poll_shutdown(cx, how))
-            .await
-            .map_err(Into::into)
+        poll_fn(|cx| self.poll_shutdown(cx, how)).await
+    }
+
+    /// Polling version of [`shutdown`].
+    ///
+    /// [`shutdown`]: UnixStream::shutdown
+    pub fn poll_shutdown(&self, cx: &mut Context<'_>, how: Shutdown) -> Poll<Result<()>> {
+        match ready!(self.stream.poll_shutdown(cx, how)) {
+            Ok(()) => Poll::Ready(Ok(())),
+            Err(err) => Poll::Ready(Err(err.into())),
+        }
     }
 
     /// Receives data on the socket from the remote address to which it is
@@ -468,13 +569,35 @@ impl<B: RxBuf> AsRawFd for UnixReadHalf<B> {
     }
 }
 
+impl<B: RxBuf> AsFd for UnixReadHalf<B> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
+    }
+}
+
 impl AsRawFd for UnixWriteHalf {
     fn as_raw_fd(&self) -> RawFd {
         self.stream.stream().as_raw_fd()
     }
 }
 
+impl AsFd for UnixWriteHalf {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
+    }
+}
+
 impl<B: RxBuf> UnixReadHalf<B> {
+    /// Sets the read timeout, as [`UnixStream::set_read_timeout`] does.
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.stream.set_read_timeout(dur)
+    }
+
+    /// Returns the read timeout.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.stream.read_timeout()
+    }
+
     /// Receives data without removing it from the queue, as
     /// [`UnixStream::peek`] does.
     pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
@@ -493,6 +616,16 @@ impl<B: RxBuf> UnixReadHalf<B> {
 }
 
 impl UnixWriteHalf {
+    /// Sets the write timeout, as [`UnixStream::set_write_timeout`] does.
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.stream.set_write_timeout(dur)
+    }
+
+    /// Returns the write timeout.
+    pub fn write_timeout(&self) -> Option<Duration> {
+        self.stream.write_timeout()
+    }
+
     /// Shuts down the write direction, so the peer reads end of file.
     ///
     /// Only this direction: the read half's stream is not this half's to end.
@@ -618,6 +751,18 @@ impl<B: RxBuf + Unpin> AsyncWrite for UnixStream<B> {
 /// A Unix Datagram Socket.
 pub struct UnixDatagram {
     socket: GlommioDatagram<net::UnixDatagram>,
+}
+
+impl AsRawFd for UnixDatagram {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+}
+
+impl AsFd for UnixDatagram {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.socket.as_fd()
+    }
 }
 
 impl UnixDatagram {
@@ -777,6 +922,60 @@ impl UnixDatagram {
     /// supplied buffer, excess bytes may be discarded.
     pub async fn peek_from(&self, buf: &mut [u8]) -> Result<(usize, UnixAddr)> {
         self.socket.peek_from(buf).await.map_err(Into::into)
+    }
+
+    /// Sets the read timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then read calls will block
+    /// indefinitely. An [`Err`] is returned if the zero [`Duration`] is
+    /// passed to this method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use glommio::{net::UnixDatagram, LocalExecutor};
+    /// # use std::time::Duration;
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let (socket, _peer) = UnixDatagram::pair().unwrap();
+    /// socket
+    ///     .set_read_timeout(Some(Duration::from_secs(1)))
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.socket.set_read_timeout(dur)
+    }
+
+    /// Sets the write timeout to the timeout specified.
+    ///
+    /// If the value specified is [`None`], then write calls will block
+    /// indefinitely. An [`Err`] is returned if the zero [`Duration`] is
+    /// passed to this method.
+    ///
+    /// ```
+    /// # use glommio::{net::UnixDatagram, LocalExecutor};
+    /// # use std::time::Duration;
+    /// # let ex = LocalExecutor::default();
+    /// # ex.run(async move {
+    /// let (socket, _peer) = UnixDatagram::pair().unwrap();
+    /// socket
+    ///     .set_write_timeout(Some(Duration::from_secs(1)))
+    ///     .unwrap();
+    /// # })
+    /// ```
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        self.socket.set_write_timeout(dur)
+    }
+
+    /// Returns the read timeout of this socket.
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.socket.read_timeout()
+    }
+
+    /// Returns the write timeout of this socket.
+    pub fn write_timeout(&self) -> Option<Duration> {
+        self.socket.write_timeout()
     }
 
     /// Returns the socket address of the remote peer this socket was connected
@@ -1139,4 +1338,129 @@ mod tests {
         let p2 = UnixDatagram::unbound().unwrap();
         p2.connect(&file).await.unwrap();
     });
+
+    /// A read from a peer that never writes ends in `TimedOut`, and a zero
+    /// timeout is refused as it is on `TcpStream`.
+    #[test]
+    fn a_unix_stream_read_times_out_on_a_silent_peer() {
+        test_executor!(async move {
+            let (mut stream, _silent) = UnixStream::pair().unwrap();
+            assert!(stream.set_read_timeout(Some(Duration::ZERO)).is_err());
+            assert_eq!(stream.read_timeout(), None);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let read = crate::timer::timeout(Duration::from_secs(5), async {
+                Ok(stream.read(&mut [0u8; 8]).await)
+            })
+            .await
+            .expect("the read timeout never fired");
+            assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        });
+    }
+
+    /// A buffered stream keeps the timeout set before it was buffered.
+    #[test]
+    fn a_buffered_unix_stream_read_times_out_on_a_silent_peer() {
+        test_executor!(async move {
+            let (stream, _silent) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut stream = stream.buffered();
+            assert_eq!(stream.read_timeout(), Some(Duration::from_millis(100)));
+            let read = crate::timer::timeout(Duration::from_secs(5), async {
+                Ok(stream.read(&mut [0u8; 8]).await)
+            })
+            .await
+            .expect("the read timeout never fired");
+            assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        });
+    }
+
+    #[test]
+    fn a_unix_read_half_read_times_out_on_a_silent_peer() {
+        test_executor!(async move {
+            let (stream, _silent) = UnixStream::pair().unwrap();
+            let (mut rx, _tx) = stream.split();
+            rx.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let read = crate::timer::timeout(Duration::from_secs(5), async {
+                Ok(rx.read(&mut [0u8; 8]).await)
+            })
+            .await
+            .expect("the read timeout never fired");
+            assert_eq!(read.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        });
+    }
+
+    /// Writes into a peer that never reads fill the socket buffer, and the
+    /// write that finds it full ends in `TimedOut`.
+    #[test]
+    fn a_unix_write_half_write_times_out_on_a_peer_that_stops_reading() {
+        test_executor!(async move {
+            let (stream, _silent) = UnixStream::pair().unwrap();
+            let (_rx, mut tx) = stream.split();
+            tx.set_write_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let chunk = vec![0u8; 64 * 1024];
+            let err = crate::timer::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Err(err) = tx.write(&chunk).await {
+                        return Ok(err);
+                    }
+                }
+            })
+            .await
+            .expect("the write timeout never fired");
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        });
+    }
+
+    #[test]
+    fn a_unix_datagram_recv_times_out_on_a_silent_peer() {
+        test_executor!(async move {
+            let (socket, _silent) = UnixDatagram::pair().unwrap();
+            assert!(socket.set_read_timeout(Some(Duration::ZERO)).is_err());
+            socket
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let recv = crate::timer::timeout(Duration::from_secs(5), async {
+                Ok(socket.recv(&mut [0u8; 8]).await)
+            })
+            .await
+            .expect("the recv timeout never fired");
+            assert_eq!(
+                io::Error::from(recv.unwrap_err()).kind(),
+                io::ErrorKind::TimedOut
+            );
+        });
+    }
+
+    /// `poll_shutdown` ends the write direction, so the peer reads end of
+    /// file.
+    #[test]
+    fn a_unix_stream_poll_shutdown_ends_the_write_direction() {
+        test_executor!(async move {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            poll_fn(|cx| stream.poll_shutdown(cx, Shutdown::Write))
+                .await
+                .unwrap();
+            assert_eq!(peer.read(&mut [0u8; 8]).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn an_accepted_unix_stream_from_an_unbound_peer_is_unnamed() {
+        test_executor!(async move {
+            let td = make_tmp_test_directory("uds-accepted-peer");
+            let path = td.path.join("listener");
+            let listener = UnixListener::bind(&path).unwrap();
+            let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let accepted = listener.shared_accept().await.unwrap();
+            assert!(accepted.peer_addr().unwrap().is_unnamed());
+            accepted.bind_to_executor();
+        });
+    }
 }

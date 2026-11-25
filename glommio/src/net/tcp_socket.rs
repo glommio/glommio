@@ -27,7 +27,7 @@ use std::{
     io::{self, IoSlice},
     net::{self, Shutdown, SocketAddr, ToSocketAddrs},
     os::{
-        fd::AsFd,
+        fd::{AsFd, BorrowedFd},
         unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     },
     pin::Pin,
@@ -98,6 +98,18 @@ impl FromRawFd for TcpListener {
             listener,
             current_source: Default::default(),
         }
+    }
+}
+
+impl AsRawFd for TcpListener {
+    fn as_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+
+impl AsFd for TcpListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.listener.as_fd()
     }
 }
 
@@ -427,6 +439,12 @@ impl From<socket2::Socket> for TcpStream {
 impl<B: RxBuf> AsRawFd for TcpStream<B> {
     fn as_raw_fd(&self) -> RawFd {
         self.stream.stream().as_raw_fd()
+    }
+}
+
+impl<B: RxBuf> AsFd for TcpStream<B> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
     }
 }
 
@@ -867,9 +885,21 @@ impl<B: RxBuf> AsRawFd for TcpReadHalf<B> {
     }
 }
 
+impl<B: RxBuf> AsFd for TcpReadHalf<B> {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
+    }
+}
+
 impl AsRawFd for TcpWriteHalf {
     fn as_raw_fd(&self) -> RawFd {
         self.stream.stream().as_raw_fd()
+    }
+}
+
+impl AsFd for TcpWriteHalf {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.stream.stream().as_fd()
     }
 }
 

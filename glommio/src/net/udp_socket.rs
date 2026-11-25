@@ -9,7 +9,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     io,
     net::{self, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
-    os::unix::io::{AsRawFd, FromRawFd, RawFd},
+    os::{
+        fd::{AsFd, BorrowedFd},
+        unix::io::{AsRawFd, FromRawFd, RawFd},
+    },
     time::Duration,
 };
 
@@ -32,6 +35,12 @@ impl From<socket2::Socket> for UdpSocket {
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
+    }
+}
+
+impl AsFd for UdpSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.socket.as_fd()
     }
 }
 

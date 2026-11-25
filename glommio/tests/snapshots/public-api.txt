@@ -1062,6 +1062,8 @@ pub async fn glommio::io::BufferedFile::truncate(&self, size: u64) -> glommio::R
 pub async fn glommio::io::BufferedFile::write_at(&self, buf: alloc::vec::Vec<u8>, pos: u64) -> glommio::Result<usize>
 impl core::fmt::Debug for glommio::io::BufferedFile
 pub fn glommio::io::BufferedFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for glommio::io::BufferedFile
+pub fn glommio::io::BufferedFile::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for glommio::io::BufferedFile
 pub fn glommio::io::BufferedFile::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl std::os::fd::raw::FromRawFd for glommio::io::BufferedFile
@@ -1732,6 +1734,8 @@ impl core::convert::From<glommio::io::OwnedDmaFile> for glommio::io::DmaFile
 pub fn glommio::io::DmaFile::from(value: glommio::io::OwnedDmaFile) -> Self
 impl core::fmt::Debug for glommio::io::OwnedDmaFile
 pub fn glommio::io::OwnedDmaFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for glommio::io::OwnedDmaFile
+pub fn glommio::io::OwnedDmaFile::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for glommio::io::OwnedDmaFile
 pub fn glommio::io::OwnedDmaFile::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl core::marker::Freeze for glommio::io::OwnedDmaFile
@@ -2278,6 +2282,7 @@ impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusi
 pub struct glommio::net::AcceptedUnixStream
 impl glommio::net::AcceptedUnixStream
 pub fn glommio::net::AcceptedUnixStream::bind_to_executor(self) -> glommio::net::UnixStream
+pub fn glommio::net::AcceptedUnixStream::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 impl core::clone::Clone for glommio::net::AcceptedUnixStream
 pub fn glommio::net::AcceptedUnixStream::clone(&self) -> glommio::net::AcceptedUnixStream
 impl core::fmt::Debug for glommio::net::AcceptedUnixStream
@@ -2483,6 +2488,10 @@ pub async fn glommio::net::TcpListener::shared_accept(&self) -> glommio::Result<
 pub fn glommio::net::TcpListener::ttl(&self) -> glommio::Result<u32>
 impl core::fmt::Debug for glommio::net::TcpListener
 pub fn glommio::net::TcpListener::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for glommio::net::TcpListener
+pub fn glommio::net::TcpListener::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
+impl std::os::fd::raw::AsRawFd for glommio::net::TcpListener
+pub fn glommio::net::TcpListener::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl std::os::fd::raw::FromRawFd for glommio::net::TcpListener
 pub unsafe fn glommio::net::TcpListener::from_raw_fd(fd: std::os::fd::raw::RawFd) -> Self
 impl !core::marker::Freeze for glommio::net::TcpListener
@@ -2535,6 +2544,8 @@ pub fn glommio::net::TcpReadHalf<B>::consume(self: core::pin::Pin<&mut Self>, am
 pub fn glommio::net::TcpReadHalf<B>::poll_fill_buf<'a>(self: core::pin::Pin<&'a mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<&'a [u8]>>
 impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::poll_read(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &mut [u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
+impl<B: glommio::net::RxBuf> std::os::fd::owned::AsFd for glommio::net::TcpReadHalf<B>
+pub fn glommio::net::TcpReadHalf<B>::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::TcpReadHalf<B>
 pub fn glommio::net::TcpReadHalf<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::TcpReadHalf<B>
@@ -2617,6 +2628,8 @@ pub fn glommio::net::TcpStream<B>::poll_close(self: core::pin::Pin<&mut Self>, c
 pub fn glommio::net::TcpStream<B>::poll_flush(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::TcpStream<B>::poll_write(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &[u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
 pub fn glommio::net::TcpStream<B>::poll_write_vectored(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, bufs: &[core::io::io_slice::IoSlice<'_>]) -> core::task::poll::Poll<std::io::error::Result<usize>>
+impl<B: glommio::net::RxBuf> std::os::fd::owned::AsFd for glommio::net::TcpStream<B>
+pub fn glommio::net::TcpStream<B>::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::TcpStream<B>
 pub fn glommio::net::TcpStream<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::TcpStream<B>
@@ -2674,6 +2687,8 @@ pub fn glommio::net::TcpWriteHalf::poll_close(self: core::pin::Pin<&mut Self>, c
 pub fn glommio::net::TcpWriteHalf::poll_flush(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::TcpWriteHalf::poll_write(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &[u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
 pub fn glommio::net::TcpWriteHalf::poll_write_vectored(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, bufs: &[core::io::io_slice::IoSlice<'_>]) -> core::task::poll::Poll<std::io::error::Result<usize>>
+impl std::os::fd::owned::AsFd for glommio::net::TcpWriteHalf
+pub fn glommio::net::TcpWriteHalf::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for glommio::net::TcpWriteHalf
 pub fn glommio::net::TcpWriteHalf::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<'__pin> core::marker::Unpin for glommio::net::TcpWriteHalf where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin>>: core::marker::Unpin
@@ -2748,6 +2763,8 @@ impl core::convert::From<socket2::socket::Socket> for glommio::net::UdpSocket
 pub fn glommio::net::UdpSocket::from(socket: socket2::socket::Socket) -> glommio::net::UdpSocket
 impl core::fmt::Debug for glommio::net::UdpSocket
 pub fn glommio::net::UdpSocket::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for glommio::net::UdpSocket
+pub fn glommio::net::UdpSocket::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for glommio::net::UdpSocket
 pub fn glommio::net::UdpSocket::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl std::os::fd::raw::FromRawFd for glommio::net::UdpSocket
@@ -2797,14 +2814,22 @@ pub fn glommio::net::UnixDatagram::pair() -> glommio::Result<(glommio::net::Unix
 pub async fn glommio::net::UnixDatagram::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub async fn glommio::net::UnixDatagram::peek_from(&self, buf: &mut [u8]) -> glommio::Result<(usize, nix::sys::socket::addr::UnixAddr)>
 pub fn glommio::net::UnixDatagram::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixDatagram::read_timeout(&self) -> core::option::Option<core::time::Duration>
 pub async fn glommio::net::UnixDatagram::recv(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub async fn glommio::net::UnixDatagram::recv_from(&self, buf: &mut [u8]) -> glommio::Result<(usize, nix::sys::socket::addr::UnixAddr)>
 pub async fn glommio::net::UnixDatagram::send(&self, buf: &[u8]) -> glommio::Result<usize>
 pub async fn glommio::net::UnixDatagram::send_to<A: core::convert::AsRef<std::path::Path>>(&self, buf: &[u8], addr: A) -> glommio::Result<usize>
 pub fn glommio::net::UnixDatagram::set_buffer_size(&mut self, buffer_size: usize)
+pub fn glommio::net::UnixDatagram::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
+pub fn glommio::net::UnixDatagram::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 pub fn glommio::net::UnixDatagram::unbound() -> glommio::Result<glommio::net::UnixDatagram>
+pub fn glommio::net::UnixDatagram::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl core::fmt::Debug for glommio::net::UnixDatagram
 pub fn glommio::net::UnixDatagram::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for glommio::net::UnixDatagram
+pub fn glommio::net::UnixDatagram::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
+impl std::os::fd::raw::AsRawFd for glommio::net::UnixDatagram
+pub fn glommio::net::UnixDatagram::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl !core::marker::Freeze for glommio::net::UnixDatagram
 impl !core::marker::Send for glommio::net::UnixDatagram
 impl !core::marker::Sync for glommio::net::UnixDatagram
@@ -2849,6 +2874,10 @@ pub fn glommio::net::UnixListener::local_addr(&self) -> glommio::Result<std::os:
 pub async fn glommio::net::UnixListener::shared_accept(&self) -> glommio::Result<glommio::net::AcceptedUnixStream>
 impl core::fmt::Debug for glommio::net::UnixListener
 pub fn glommio::net::UnixListener::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl std::os::fd::owned::AsFd for glommio::net::UnixListener
+pub fn glommio::net::UnixListener::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
+impl std::os::fd::raw::AsRawFd for glommio::net::UnixListener
+pub fn glommio::net::UnixListener::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl core::marker::Freeze for glommio::net::UnixListener
 impl !core::marker::Send for glommio::net::UnixListener
 impl !core::marker::Sync for glommio::net::UnixListener
@@ -2889,6 +2918,8 @@ impl<B: glommio::net::RxBuf> glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixReadHalf<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::UnixReadHalf<B>::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixReadHalf<B>::read_timeout(&self) -> core::option::Option<core::time::Duration>
+pub fn glommio::net::UnixReadHalf<B>::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 impl<'__pin, B: glommio::net::RxBuf> core::marker::Unpin for glommio::net::UnixReadHalf<B> where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin, B>>: core::marker::Unpin
 impl<B: core::fmt::Debug + glommio::net::RxBuf> core::fmt::Debug for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2897,6 +2928,8 @@ pub fn glommio::net::UnixReadHalf<B>::consume(self: core::pin::Pin<&mut Self>, a
 pub fn glommio::net::UnixReadHalf<B>::poll_fill_buf<'a>(self: core::pin::Pin<&'a mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<&'a [u8]>>
 impl<B: glommio::net::RxBuf + core::marker::Unpin> futures_io::if_std::AsyncRead for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::poll_read(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &mut [u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
+impl<B: glommio::net::RxBuf> std::os::fd::owned::AsFd for glommio::net::UnixReadHalf<B>
+pub fn glommio::net::UnixReadHalf<B>::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::UnixReadHalf<B>
 pub fn glommio::net::UnixReadHalf<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::UnixReadHalf<B>
@@ -2945,7 +2978,12 @@ impl<B: glommio::net::RxBuf> glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub async fn glommio::net::UnixStream<B>::peek(&self, buf: &mut [u8]) -> glommio::Result<usize>
 pub fn glommio::net::UnixStream<B>::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixStream<B>::poll_shutdown(&self, cx: &mut core::task::wake::Context<'_>, how: std::net::Shutdown) -> core::task::poll::Poll<glommio::Result<()>>
+pub fn glommio::net::UnixStream<B>::read_timeout(&self) -> core::option::Option<core::time::Duration>
+pub fn glommio::net::UnixStream<B>::set_read_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
+pub fn glommio::net::UnixStream<B>::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 pub async fn glommio::net::UnixStream<B>::shutdown(&self, how: std::net::Shutdown) -> glommio::Result<()>
+pub fn glommio::net::UnixStream<B>::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl<B: glommio::net::RxBuf> glommio::net::UnixStream<B>
 pub fn glommio::net::UnixStream<B>::reunite(rx: glommio::net::UnixReadHalf<B>, tx: glommio::net::UnixWriteHalf) -> core::result::Result<Self, (glommio::net::UnixReadHalf<B>, glommio::net::UnixWriteHalf)>
 pub fn glommio::net::UnixStream<B>::split(self) -> (glommio::net::UnixReadHalf<B>, glommio::net::UnixWriteHalf)
@@ -2964,6 +3002,10 @@ pub fn glommio::net::UnixStream<B>::poll_close(self: core::pin::Pin<&mut Self>, 
 pub fn glommio::net::UnixStream<B>::poll_flush(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::UnixStream<B>::poll_write(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &[u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
 pub fn glommio::net::UnixStream<B>::poll_write_vectored(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, bufs: &[core::io::io_slice::IoSlice<'_>]) -> core::task::poll::Poll<std::io::error::Result<usize>>
+impl<B: glommio::net::RxBuf> std::os::fd::owned::AsFd for glommio::net::UnixStream<B>
+pub fn glommio::net::UnixStream<B>::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
+impl<B: glommio::net::RxBuf> std::os::fd::raw::AsRawFd for glommio::net::UnixStream<B>
+pub fn glommio::net::UnixStream<B>::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<B> !core::marker::Freeze for glommio::net::UnixStream<B>
 impl<B> !core::marker::Send for glommio::net::UnixStream<B>
 impl<B> !core::marker::Sync for glommio::net::UnixStream<B>
@@ -3005,7 +3047,9 @@ pub struct glommio::net::UnixWriteHalf
 impl glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::local_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
 pub fn glommio::net::UnixWriteHalf::peer_addr(&self) -> glommio::Result<std::os::unix::net::addr::SocketAddr>
+pub fn glommio::net::UnixWriteHalf::set_write_timeout(&self, dur: core::option::Option<core::time::Duration>) -> glommio::Result<()>
 pub async fn glommio::net::UnixWriteHalf::shutdown(&self) -> glommio::Result<()>
+pub fn glommio::net::UnixWriteHalf::write_timeout(&self) -> core::option::Option<core::time::Duration>
 impl core::fmt::Debug for glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl futures_io::if_std::AsyncWrite for glommio::net::UnixWriteHalf
@@ -3013,6 +3057,8 @@ pub fn glommio::net::UnixWriteHalf::poll_close(self: core::pin::Pin<&mut Self>, 
 pub fn glommio::net::UnixWriteHalf::poll_flush(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<std::io::error::Result<()>>
 pub fn glommio::net::UnixWriteHalf::poll_write(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, buf: &[u8]) -> core::task::poll::Poll<std::io::error::Result<usize>>
 pub fn glommio::net::UnixWriteHalf::poll_write_vectored(self: core::pin::Pin<&mut Self>, cx: &mut core::task::wake::Context<'_>, bufs: &[core::io::io_slice::IoSlice<'_>]) -> core::task::poll::Poll<std::io::error::Result<usize>>
+impl std::os::fd::owned::AsFd for glommio::net::UnixWriteHalf
+pub fn glommio::net::UnixWriteHalf::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for glommio::net::UnixWriteHalf
 pub fn glommio::net::UnixWriteHalf::as_raw_fd(&self) -> std::os::fd::raw::RawFd
 impl<'__pin> core::marker::Unpin for glommio::net::UnixWriteHalf where pin_project_lite::__private::PinnedFieldsOf<__Origin<'__pin>>: core::marker::Unpin

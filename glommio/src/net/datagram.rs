@@ -88,13 +88,10 @@ impl<S: AsRawFd + FromRawFd + From<socket2::Socket>> GlommioDatagram<S> {
     }
 
     pub(crate) async fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let source = self.reactor.upgrade().unwrap().recv(
-            self.socket.as_raw_fd(),
-            buf.len(),
-            MsgFlags::MSG_PEEK,
-        );
-
-        self.consume_receive_buffer(source, buf).await
+        match self.yolo_peek(buf) {
+            Some(x) => x,
+            None => self.recv_blocking(buf, MsgFlags::MSG_PEEK).await,
+        }
     }
 
     pub(crate) async fn peek_from<T: SockaddrLike>(
@@ -110,15 +107,18 @@ impl<S: AsRawFd + FromRawFd + From<socket2::Socket>> GlommioDatagram<S> {
     pub(crate) async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self.yolo_rx(buf) {
             Some(x) => x,
-            None => {
-                let source = self.reactor.upgrade().unwrap().rushed_recv(
-                    self.socket.as_raw_fd(),
-                    buf.len(),
-                    self.read_timeout.get(),
-                )?;
-                self.consume_receive_buffer(source, buf).await
-            }
+            None => self.recv_blocking(buf, MsgFlags::empty()).await,
         }
+    }
+
+    async fn recv_blocking(&self, buf: &mut [u8], flags: MsgFlags) -> io::Result<usize> {
+        let source = self.reactor.upgrade().unwrap().rushed_recv(
+            self.socket.as_raw_fd(),
+            buf.len(),
+            flags,
+            self.read_timeout.get(),
+        )?;
+        self.consume_receive_buffer(source, buf).await
     }
 
     pub(crate) async fn recv_from_blocking<T: SockaddrLike>(
@@ -238,6 +238,18 @@ impl<S: AsRawFd + FromRawFd + From<socket2::Socket>> GlommioDatagram<S> {
     fn yolo_rx(&self, buf: &mut [u8]) -> Option<io::Result<usize>> {
         if self.rx_yolo.get() {
             super::yolo_recv(self.socket.as_raw_fd(), buf)
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.rx_yolo.set(false);
+            None
+        })
+    }
+
+    fn yolo_peek(&self, buf: &mut [u8]) -> Option<io::Result<usize>> {
+        if self.rx_yolo.get() {
+            super::yolo_peek(self.socket.as_raw_fd(), buf)
         } else {
             None
         }

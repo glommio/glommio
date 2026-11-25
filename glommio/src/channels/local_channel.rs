@@ -462,6 +462,11 @@ pub fn new_unbounded<T>() -> (LocalSender<T>, LocalReceiver<T>) {
 
 /// Creates a new `local_channel` with capacity limited to the `size` argument
 ///
+/// A `size` of zero is taken as one, as
+/// [`shared_channel::new_bounded`](crate::channels::shared_channel::new_bounded)
+/// does. Neither is a rendezvous channel, and a channel with no room would
+/// make every send wait until the receiver is dropped.
+///
 /// # Examples
 /// ```
 /// use futures_lite::StreamExt;
@@ -478,7 +483,7 @@ pub fn new_unbounded<T>() -> (LocalSender<T>, LocalReceiver<T>) {
 /// });
 /// ```
 pub fn new_bounded<T>(size: usize) -> (LocalSender<T>, LocalReceiver<T>) {
-    LocalChannel::new(ChannelCapacity::Bounded(size))
+    LocalChannel::new(ChannelCapacity::Bounded(size.max(1)))
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -787,6 +792,7 @@ mod test {
             Arc,
         },
         task::Wake,
+        time::Duration,
     };
 
     #[test]
@@ -918,6 +924,30 @@ mod test {
             }
             drop(sender);
             handle.await;
+        });
+    }
+
+    /// Guards against a channel made with no room, where every send waited
+    /// for a receiver that was already waiting for it.
+    #[test]
+    fn a_channel_bounded_at_zero_still_delivers() {
+        test_executor!(async move {
+            let (sender, receiver) = new_bounded(0);
+            let handle =
+                crate::spawn_local(
+                    async move { receiver.stream().fold(0, |acc, x| acc + x).await },
+                )
+                .detach();
+            crate::timer::timeout(Duration::from_secs(5), async {
+                for _ in 0..3 {
+                    sender.send(1).await.unwrap();
+                }
+                Ok(())
+            })
+            .await
+            .expect("a send on a channel bounded at zero never completed");
+            drop(sender);
+            assert_eq!(handle.await, Some(3));
         });
     }
 

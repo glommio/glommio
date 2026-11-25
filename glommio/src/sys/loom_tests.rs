@@ -172,3 +172,39 @@ fn a_notify_after_a_plain_publish_is_not_lost() {
         }
     });
 }
+
+/// P5: an owner that comes back awake, whether it found a waker or slept,
+/// has notification off, so an ordinary wake after that writes nothing.
+#[test]
+fn an_awake_owner_is_not_signalled_by_an_ordinary_wake() {
+    loom::model(|| {
+        let notifier = new_sleep_notifier().unwrap();
+        let (w, _) = waker();
+
+        let mut producer = Some({
+            let notifier = notifier.clone();
+            thread::spawn(move || notifier.queue_waker(w, false))
+        });
+
+        notifier
+            .sleep_unless_woken(
+                || notifier.process_foreign_wakes(),
+                || {
+                    producer.take().unwrap().join().unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        if let Some(producer) = producer {
+            producer.join().unwrap();
+        }
+
+        let before = notifier.signals();
+        notifier.notify(false);
+        assert_eq!(
+            notifier.signals(),
+            before,
+            "an ordinary wake signalled an owner that was awake"
+        );
+    });
+}

@@ -5307,31 +5307,37 @@ mod test {
     /// The bound is 250 ms: fifty times the promised 5 ms, so a loaded
     /// machine has room to be late, and a quarter of the 1 s the bug yields,
     /// so the timer cannot pass it by firing early.
+    ///
+    /// A stall before `q`'s first gap lets `n` finish its slices before `q`
+    /// runs again, leaving nothing measured, so such a run is retried and the
+    /// test fails if no run measured a gap.
     #[test]
     fn a_latency_queue_that_wakes_another_and_yields_keeps_its_preempt_timer() {
         const SLICES: usize = 4;
         const BOUND: Duration = Duration::from_millis(250);
         const LIMIT: Duration = Duration::from_secs(10);
+        const TRIES: usize = 3;
 
-        let ex = LocalExecutorBuilder::default()
-            .preempt_timer(Duration::from_secs(1))
-            .make()
-            .unwrap();
-        let worst = ex.run(async {
-            let q = crate::executor().create_task_queue(
-                Shares::Static(1),
-                Latency::Matters(Duration::from_millis(5)),
-                "latency",
-            );
-            let n = crate::executor().create_task_queue(
-                Shares::default(),
-                Latency::NotImportant,
-                "spinner",
-            );
-            crate::spawn_local_into(
-                async move {
-                    let slices = Rc::new(Cell::new(0));
-                    let spinner = crate::spawn_local_into(
+        let run = || {
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_secs(1))
+                .make()
+                .unwrap();
+            ex.run(async {
+                let q = crate::executor().create_task_queue(
+                    Shares::Static(1),
+                    Latency::Matters(Duration::from_millis(5)),
+                    "latency",
+                );
+                let n = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::NotImportant,
+                    "spinner",
+                );
+                crate::spawn_local_into(
+                    async move {
+                        let slices = Rc::new(Cell::new(0));
+                        let spinner = crate::spawn_local_into(
                         enclose! { (slices) async move {
                             let start = Instant::now();
                             while slices.get() < SLICES {
@@ -5345,25 +5351,32 @@ mod test {
                         n,
                     )
                     .unwrap();
-                    let mut worst = Duration::ZERO;
-                    let mut last = Instant::now();
-                    while slices.get() < SLICES {
-                        let before = slices.get();
-                        crate::executor().yield_task_queue_now().await;
-                        let now = Instant::now();
-                        if before >= 1 {
-                            worst = worst.max(now - last);
+                        let mut worst = Duration::ZERO;
+                        let mut measured = 0usize;
+                        let mut last = Instant::now();
+                        while slices.get() < SLICES {
+                            let before = slices.get();
+                            crate::executor().yield_task_queue_now().await;
+                            let now = Instant::now();
+                            if before >= 1 {
+                                worst = worst.max(now - last);
+                                measured += 1;
+                            }
+                            last = now;
                         }
-                        last = now;
-                    }
-                    spinner.await;
-                    worst
-                },
-                q,
-            )
-            .unwrap()
-            .await
-        });
+                        spinner.await;
+                        (worst, measured)
+                    },
+                    q,
+                )
+                .unwrap()
+                .await
+            })
+        };
+        let (worst, _) = (0..TRIES)
+            .map(|_| run())
+            .find(|&(_, measured)| measured > 0)
+            .expect("no run measured a gap between the latency queue's polls");
         assert!(
             worst < BOUND,
             "the latency queue waited {worst:?} for the CPU, its promise is 5ms"

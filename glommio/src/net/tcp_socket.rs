@@ -461,6 +461,20 @@ impl TcpListener {
 /// Once the `AcceptedTcpStream` arrives at its destination it can then be made
 /// active with [`bind_to_executor`]
 ///
+/// # Bind it exactly once
+///
+/// This type is `Copy` over a raw file descriptor and does not own it.
+/// Nothing closes the descriptor until [`bind_to_executor`] turns it into a
+/// [`TcpStream`], which closes it when dropped, so bind each accepted stream
+/// exactly once. Binding two copies closes the descriptor twice, and the
+/// second close can hit an unrelated file or socket that has since been given
+/// the same number. Dropping one without binding it leaks the descriptor.
+/// Sending it to another executor leaves a copy behind, which must not be
+/// bound or used afterwards.
+///
+/// This is slated to change in 0.13, when the type will own its descriptor
+/// and stop being `Copy`.
+///
 /// [`shared_accept`]: TcpListener::shared_accept
 /// [`bind_to_executor`]: AcceptedTcpStream::bind_to_executor
 pub struct AcceptedTcpStream {
@@ -1232,9 +1246,90 @@ mod tests {
             });
     }
 
+    /// A real `ETIMEDOUT` can end a request the reactor has just throttled,
+    /// before the throttle's cancellation lands. It is still the reader's:
+    /// only the cancellation itself is the throttle's.
+    #[test]
+    fn a_real_timeout_ending_a_throttled_receive_reaches_the_reader() {
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let _writer = TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                reader.stream.throttle_multishot();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::ETIMEDOUT), false);
+                let mut got = [0u8; 1];
+                let read = futures_lite::future::poll_once(reader.read(&mut got)).await;
+                let err = read
+                    .expect("the timeout was swallowed as the throttle's and the read re-armed")
+                    .unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(libc::ETIMEDOUT));
+            });
+    }
+
+    /// The same holds for a peek waiting on the throttled request: a real
+    /// `ETIMEDOUT` reaches it instead of being taken for the throttle's.
+    #[test]
+    fn a_real_timeout_ending_a_throttled_receive_reaches_a_peek() {
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let _writer = TcpStream::connect(addr).await.unwrap();
+                let reader = listener.accept().await.unwrap().buffered();
+                reader.stream.throttle_multishot();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::ETIMEDOUT), false);
+                let mut got = [0u8; 1];
+                let peeked = futures_lite::future::poll_once(reader.peek(&mut got)).await;
+                let err = peeked
+                    .expect("the timeout was swallowed as the throttle's and the peek waited")
+                    .unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(libc::ETIMEDOUT));
+            });
+    }
+
+    /// The throttle's cancellation ends the request with `ECANCELED`, which
+    /// the reader never sees: the request is re-armed and reads go on.
+    #[test]
+    fn the_throttles_cancellation_re_arms_the_receive() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let mut writer = TcpStream::connect(addr).await.unwrap();
+                let mut reader = listener.accept().await.unwrap().buffered();
+                reader.stream.throttle_multishot();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::ECANCELED), false);
+                writer.write_all(b"hello").await.unwrap();
+                let mut got = [0u8; 5];
+                reader.read_exact(&mut got).await.unwrap();
+                assert_eq!(&got, b"hello");
+                assert!(
+                    reader.stream.multishot_armed(),
+                    "the receive was not re-armed after the throttle's cancellation"
+                );
+            });
+    }
+
     /// The kernel ends a receive with a real `ETIMEDOUT` too, from a TCP
-    /// user or keepalive timeout. Only the reactor's own throttle reads as
-    /// one and is re-armed; a real one is the reader's.
+    /// user or keepalive timeout, and that is the reader's.
     #[test]
     fn a_real_timeout_ending_the_receive_reaches_the_reader() {
         crate::LocalExecutorBuilder::new(crate::Placement::Unbound)

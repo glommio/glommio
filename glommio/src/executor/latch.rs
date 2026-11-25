@@ -63,11 +63,17 @@ impl Latch {
     /// `LatchState` (e.g. it may return `Ok(0)` even if the state is `Canceled`
     /// if `n == 0`).
     ///
+    /// `count_down(0)` only reads the counter: it changes neither the counter
+    /// nor the state, so it cannot turn a `Canceled` latch `Ready`.
+    ///
     /// The method does not synchronize with other threads, so while setting the
     /// counter to 0 with this method (or checking its value with
     /// `count_down(0)`) is indicative that the state is either `Ready` or
     /// `Canceled`, other data may not yet be synchronized with other threads.
     pub fn count_down(&self, n: usize) -> Result<usize, usize> {
+        if n == 0 {
+            return Ok(self.inner.count.load(Ordering::Relaxed));
+        }
         #[allow(clippy::unnecessary_lazy_evaluations)]
         self.update(LatchState::Ready, |v| (v >= n).then(|| v - n))
     }
@@ -151,6 +157,14 @@ impl Latch {
 mod test {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn counting_down_by_zero_leaves_a_canceled_latch_canceled() {
+        let latch = Latch::new(1);
+        assert_eq!(latch.cancel(), Ok(1));
+        assert_eq!(latch.count_down(0), Ok(0));
+        assert_eq!(latch.wait(), LatchState::Canceled);
+    }
 
     #[test]
     fn cancel() {

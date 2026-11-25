@@ -242,6 +242,20 @@ impl UnixListener {
 /// Once the `AcceptedUnixStream` arrives at its destination it can then be made
 /// active with [`bind_to_executor`]
 ///
+/// # Bind it exactly once
+///
+/// This type is `Copy` over a raw file descriptor and does not own it.
+/// Nothing closes the descriptor until [`bind_to_executor`] turns it into a
+/// [`UnixStream`], which closes it when dropped, so bind each accepted stream
+/// exactly once. Binding two copies closes the descriptor twice, and the
+/// second close can hit an unrelated file or socket that has since been given
+/// the same number. Dropping one without binding it leaks the descriptor.
+/// Sending it to another executor leaves a copy behind, which must not be
+/// bound or used afterwards.
+///
+/// This is slated to change in 0.13, when the type will own its descriptor
+/// and stop being `Copy`.
+///
 /// [`shared_accept`]: UnixListener::shared_accept
 /// [`bind_to_executor`]: AcceptedUnixStream::bind_to_executor
 pub struct AcceptedUnixStream {

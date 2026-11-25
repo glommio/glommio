@@ -725,16 +725,22 @@ where
 
 /// Turns a raw CQE result into an `io::Result`. io_uring reports failure as a
 /// negative errno in the completion, not through errno.
-///
-/// `ECANCELED` is converted to `ETIMEDOUT`. This will be the case for linked
-/// `sqe`s with a timeout, and if we wanted to be really strict we'd check. But
-/// if the operation is truly cancelled no one will check the result, and we
-/// have no other use case for cancel at the moment so keep it simple
-fn transmute_error(res: i32) -> io::Result<usize> {
+fn completion_result(res: i32) -> io::Result<usize> {
     if res >= 0 {
-        return Ok(res as usize);
+        Ok(res as usize)
+    } else {
+        Err(io::Error::from_raw_os_error(-res))
     }
-    Err(io::Error::from_raw_os_error(-res)).map_err(|x: io::Error| {
+}
+
+/// [`completion_result`], with `ECANCELED` converted to `ETIMEDOUT`, so a
+/// request its linked timeout cancelled reports as timed out. Strictly only
+/// those should be converted, but a request cancelled any other way is one
+/// nobody reads the result of. The exception is a multishot receive, whose
+/// owner reads the throttle's cancellation and has to tell it from a real
+/// `ETIMEDOUT`; its completions skip this conversion.
+fn transmute_error(res: i32) -> io::Result<usize> {
+    completion_result(res).map_err(|x: io::Error| {
         if let Some(libc::ECANCELED) = x.raw_os_error() {
             io::Error::from_raw_os_error(libc::ETIMEDOUT)
         } else {
@@ -988,14 +994,22 @@ where
 
         let mut woke = false;
         if try_process(src.borrow()).is_none() {
-            {
+            let multishot = {
                 let mut inner = src.borrow_mut();
                 queue_multishot_arrival(&mut inner, &value);
                 if let SourceType::RecvMulti(state) = &mut inner.source_type {
                     state.armed = false;
+                    true
+                } else {
+                    false
                 }
-            }
-            let res = Some(post_process(src.borrow_mut(), transmute_error(result)));
+            };
+            let result = if multishot {
+                completion_result(result)
+            } else {
+                transmute_error(result)
+            };
+            let res = Some(post_process(src.borrow_mut(), result));
             let mut inner_source = src.borrow_mut();
             inner_source.wakers.result = res;
             woke = inner_source.wakers.wake_waiters();
@@ -3598,6 +3612,41 @@ mod tests {
                 started.elapsed()
             );
             drop(source);
+        });
+    }
+
+    /// The throttle's cancellation reaches the stream as `ECANCELED`, not as
+    /// the `ETIMEDOUT` other cancelled requests are reported as, so a real
+    /// `ETIMEDOUT` ending a throttled request stays distinguishable from it.
+    #[test]
+    fn a_throttled_multishot_source_ends_with_ecanceled() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap();
+        ex.run(async {
+            let (mut writer, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+            use std::os::fd::AsRawFd as _;
+            let reactor = crate::executor().reactor();
+            let source = reactor.recv_multi(reader.as_raw_fd(), 16).unwrap();
+            settle(&reactor);
+            std::io::Write::write_all(&mut writer, &[7u8; 200]).unwrap();
+            for _ in 0..50 {
+                if source.result().is_some() {
+                    break;
+                }
+                settle(&reactor);
+            }
+            let throttled = match &*source.source_type() {
+                SourceType::RecvMulti(state) => state.throttled,
+                other => panic!("not a multishot source: {other:?}"),
+            };
+            assert!(throttled, "200 bytes did not pass a 128 byte ceiling");
+            let err = source
+                .result()
+                .expect("the throttled request never ended")
+                .unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ECANCELED));
         });
     }
 

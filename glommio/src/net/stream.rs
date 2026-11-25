@@ -713,7 +713,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             Ok(_) => None,
             Err(err) => match err.raw_os_error() {
                 Some(libc::ENOBUFS | libc::EINVAL) => None,
-                Some(libc::ETIMEDOUT) if throttled => None,
+                Some(libc::ECANCELED) if throttled => None,
                 _ => Some(Err(err)),
             },
         }
@@ -818,12 +818,11 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
     /// take is re-armed here, which happens only once the queue is drained:
     /// that is
     /// the backpressure a connection nobody reads is given. The reactor
-    /// reports a cancelled request as timed out, since before this the only
-    /// thing that cancelled a request was a timeout, and this stream has no
-    /// timeout of its own on the request, so that is the value to match, on
-    /// a request the reactor did throttle: the kernel ends a receive with a
-    /// real `ETIMEDOUT` as well, from a TCP user or keepalive timeout, and
-    /// that one is the reader's.
+    /// reports a multishot receive's errno as the kernel gave it, so the
+    /// throttle's cancellation arrives as `ECANCELED`, matched only on a
+    /// request the reactor did throttle. A real `ETIMEDOUT`, from a TCP user
+    /// or keepalive timeout, is the reader's even when it ends a request the
+    /// throttle was about to cancel.
     ///
     /// Every way this returns ready cancels the read timeout, which a wait
     /// before it may have armed.
@@ -869,7 +868,7 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
                 Ok(_) if was_bundled => true,
                 Ok(_) => false,
                 Err(err) if err.raw_os_error() == Some(libc::ENOBUFS) => true,
-                Err(err) if was_throttled && err.raw_os_error() == Some(libc::ETIMEDOUT) => false,
+                Err(err) if was_throttled && err.raw_os_error() == Some(libc::ECANCELED) => false,
                 Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {
                     reactor.refuse_recv_multi(was_bundled);
                     if was_bundled {
@@ -942,6 +941,19 @@ impl<S: AsRawFd, B: RxBuf> GlommioStream<S, B> {
             state.bundled = bundled;
         }
         inner.wakers.result = Some(Err(err));
+    }
+
+    /// Marks the armed multishot receive as cancelled by the reactor's
+    /// throttle, as reaping an arrival past its ceiling does.
+    #[cfg(test)]
+    pub(crate) fn throttle_multishot(&self) {
+        let source = self
+            .rx_multi
+            .as_ref()
+            .expect("no multishot receive is armed");
+        if let SourceType::RecvMulti(state) = &mut source.inner.borrow_mut().source_type {
+            state.throttled = true;
+        }
     }
 
     #[cfg(test)]

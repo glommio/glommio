@@ -344,7 +344,7 @@ impl AsyncWrite for ImmutableFilePreSealSink {
 
 impl ImmutableFile {
     /// Returns an `Option` containing the path associated with this open
-    /// directory, or `None` if there isn't one.
+    /// file, or `None` if there isn't one.
     pub fn path(&self) -> Option<Ref<'_, Path>> {
         self.stream_builder.file.path()
     }

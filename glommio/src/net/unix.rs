@@ -72,13 +72,15 @@ pub struct UnixListener {
 }
 
 impl UnixListener {
-    /// Creates a Unix listener bound to the specified address.
+    /// Creates a Unix listener bound to the specified path.
     ///
-    /// Binding with port number 0 will request an available port from the OS.
+    /// The path must not already exist: binding fails if a file, including a
+    /// socket left behind by an earlier listener, is already there. A Unix
+    /// socket cannot be shared between listeners the way a TCP port bound
+    /// with `SO_REUSEPORT` can, so to spread connections over several
+    /// executors, accept them with [`shared_accept`] and send them on.
     ///
-    /// This method sets the ReusePort option in the bound socket, so it is
-    /// designed to be called from multiple executors to achieve
-    /// parallelism.
+    /// [`shared_accept`]: UnixListener::shared_accept
     ///
     /// # Examples
     ///
@@ -114,9 +116,9 @@ impl UnixListener {
     /// [`AcceptedUnixStream`] implements [`Send`], so it can be safely sent
     /// for processing over a shared channel to a different executor.
     ///
-    /// This is useful when the user wants to do her own load balancing across
-    /// multiple executors instead of relying on the load balancing the OS
-    /// would do with the ReusePort property of the bound socket.
+    /// This is how to balance connections across multiple executors: unlike
+    /// [`TcpListener`], a Unix listener cannot be bound by every executor and
+    /// balanced by the OS through `SO_REUSEPORT`.
     ///
     /// # Examples
     ///
@@ -134,6 +136,7 @@ impl UnixListener {
     /// [`AcceptedUnixStream`]: struct.AcceptedUnixStream.html
     /// [`UnixStream`]: struct.UnixStream.html
     /// [`Send`]: https://doc.rust-lang.org/std/marker/trait.Send.html
+    /// [`TcpListener`]: crate::net::TcpListener
     pub async fn shared_accept(&self) -> Result<AcceptedUnixStream> {
         let reactor = self.reactor.upgrade().unwrap();
         let source = reactor.accept(self.listener.as_raw_fd());
@@ -213,9 +216,9 @@ impl UnixListener {
 #[derive(Copy, Clone, Debug)]
 /// An Accepted Unix connection that can be moved to a different executor
 ///
-/// This is useful in situations where the load balancing provided by the
-/// Operating System through ReusePort is not desirable. The user can accept the
-/// connection in one executor through [`shared_accept`] which returns an
+/// A Unix listener has no OS load balancing to fall back on, so this is how
+/// its connections reach other executors. The user can accept the connection
+/// in one executor through [`shared_accept`] which returns an
 /// AcceptedUnixStream.
 ///
 /// Once the `AcceptedUnixStream` arrives at its destination it can then be made
@@ -672,17 +675,10 @@ impl UnixDatagram {
         })
     }
 
-    /// Connects an unbounded Unix Datagram socket to a remote address, allowing
-    /// the [`send`] and [`recv`] methods to be used to send data and also
-    /// applies filters to only receive data from the specified address.
-    ///
-    /// If `addr` yields multiple addresses, connect will be attempted with each
-    /// of the addresses until the underlying OS function returns no error.
-    /// Note that usually, a successful connect call does not specify that
-    /// there is a remote server listening on the port, rather, such an
-    /// error would only be detected after the first send. If the OS returns an
-    /// error for each of the specified addresses, the error returned from
-    /// the last connection attempt (the last address) is returned.
+    /// Connects an unbound Unix Datagram socket to the socket bound at the
+    /// path `addr`, allowing the [`send`] and [`recv`] methods to be used to
+    /// send data and also applies filters to only receive data from that
+    /// address.
     ///
     /// # Examples
     ///

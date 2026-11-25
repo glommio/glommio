@@ -81,7 +81,10 @@ impl Directory {
         .await
     }
 
-    /// Similar to create() in the standard library, but returns a DMA file
+    /// Creates a directory at `path` and opens it, similar to
+    /// [`std::fs::create_dir`] but returning a [`Directory`]. A directory that
+    /// already exists is opened rather than reported as an error. Missing
+    /// parent directories are not created.
     pub async fn create<P: AsRef<Path>>(path: P) -> Result<Directory> {
         let path = path.as_ref().to_owned();
         let source = crate::executor()
@@ -145,7 +148,7 @@ impl Directory {
         Ok(())
     }
 
-    /// Closes this DMA file.
+    /// Closes this directory.
     pub async fn close(self) -> Result<()> {
         self.file.close().await
     }

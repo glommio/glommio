@@ -37,7 +37,7 @@ use super::{
 
 pub(super) use crate::Result;
 
-/// Close result of [`DmaFile::close_rc()`] and [`DmaFile::close`]. Indicates which operation is
+/// Close result of [`DmaFile::close_rc()`]. Indicates which operation was
 /// performed on close.
 #[derive(Debug)]
 pub enum CloseResult {
@@ -71,6 +71,11 @@ impl Drop for AdvisoryLockGuard {
 
 impl AdvisoryLockGuard {
     /// Explicitly releases the lock. The file can be successfully closed after calling this.
+    ///
+    /// This only succeeds on the last clone of the guard. If another clone exists, an error is returned and this
+    /// guard is consumed without unlocking: the lock stays held until the last clone is unlocked or dropped.
+    ///
+    /// The unlock is a non-blocking `flock` call made inline; nothing is awaited despite the `async` signature.
     pub async fn unlock(mut self) -> Result<()> {
         let inner = self.0.take().unwrap();
 
@@ -682,7 +687,8 @@ impl DmaFile {
         self.file.file_size().await
     }
 
-    /// Returns the size of the filesystem cluster, in bytes
+    /// Performs a stat operation on a file to retrieve multiple properties at
+    /// once: see [`Stat`].
     pub async fn stat(&self) -> Result<Stat> {
         self.file.statx().await.map(Into::into)
     }
@@ -752,8 +758,9 @@ impl DmaFile {
     /// ```
     ///
     /// NOTE:
-    /// [Currently](https://github.com/axboe/liburing/issues/85) flock isn't implemented through io_uring so it requires
-    /// dispatching to a background thread.
+    /// [Currently](https://github.com/axboe/liburing/issues/85) flock isn't implemented through io_uring. Since this
+    /// is the non-blocking `LOCK_NB` variant, the `flock` call is made inline on the executor thread rather than in a
+    /// background thread, and nothing is awaited despite the `async` signature.
     pub async fn try_lock_shared(&self) -> Result<AdvisoryLockGuard> {
         self.file
             .try_lock_shared()
@@ -768,7 +775,7 @@ impl DmaFile {
     /// This is equivalent to [flock](https://linux.die.net/man/2/flock) with `LOCK_EX | LOCK_NB` and requires the
     /// file have [write](OpenOptions::write) allowed on it.
     ///
-    /// See [try_lock_shared](Self::try_lock_shared) for more details.
+    /// See [try_lock_shared](Self::try_lock_shared) for more details, including how the `flock` call is made.
     pub async fn try_lock_exclusive(&self) -> Result<AdvisoryLockGuard> {
         self.file
             .try_lock_exclusive()
@@ -850,7 +857,7 @@ impl DmaFile {
     }
 
     /// Returns an `Option` containing the path associated with this open
-    /// directory, or `None` if there isn't one.
+    /// file, or `None` if there isn't one.
     pub fn path(&self) -> Option<Ref<'_, Path>> {
         self.file.path()
     }
@@ -1019,7 +1026,7 @@ impl OwnedDmaFile {
     }
 
     /// Returns an `Option` containing the path associated with this open
-    /// directory, or `None` if there isn't one.
+    /// file, or `None` if there isn't one.
     pub fn path(&self) -> Option<&Path> {
         self.file.path.as_deref()
     }
@@ -1155,7 +1162,7 @@ impl WeakDmaFile {
     }
 
     /// Returns an `Option` containing the path associated with this open
-    /// directory, or `None` if there isn't one.
+    /// file, or `None` if there isn't one.
     pub fn path(&self) -> Option<&Path> {
         self.file.path.as_deref()
     }

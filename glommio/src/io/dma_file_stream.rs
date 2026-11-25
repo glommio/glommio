@@ -1138,10 +1138,16 @@ impl Drop for DmaStreamWriter {
 /// Very rarely does one need to issue random writes to a file. Therefore, the
 /// [`DmaStreamWriter`] is likely your go-to API when it comes to writing files.
 ///
-/// The [`DmaStreamWriter`] implements [`AsyncWrite`]. Because it is backed by a
-/// Direct I/O file, the flush method has no effect. Closing the file issues a
-/// sync so that the data can be flushed from the internal NVMe caches.
+/// The [`DmaStreamWriter`] implements [`AsyncWrite`]. Flushing writes out
+/// everything written so far, including a partly filled buffer, which is
+/// padded with zeros up to the buffer size, and waits for those writes to
+/// complete. Later writes overwrite the padding, and closing truncates it
+/// away. A flush does not sync; use [`sync`] for that. Closing the file
+/// issues a sync so that the data can be flushed from the internal NVMe
+/// caches, unless it was disabled with [`with_sync_on_close_disabled`].
 ///
+/// [`sync`]: DmaStreamWriter::sync
+/// [`with_sync_on_close_disabled`]: DmaStreamWriterBuilder::with_sync_on_close_disabled
 /// [`DmaFile`]: struct.DmaFile.html
 /// [`DmaStreamReader`]: struct.DmaStreamReader.html
 /// [`get_buffer_aligned`]:

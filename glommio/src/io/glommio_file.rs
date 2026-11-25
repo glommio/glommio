@@ -422,18 +422,16 @@ impl GlommioFile {
         Ok(())
     }
 
-    /// NOTE: The try variant could just do the syscall directly instead of
-    /// dispatching to a blocking thread. For consistency though it's
-    /// implemented the same way.
+    /// Makes the non-blocking `flock` call inline on the executor thread;
+    /// nothing is awaited.
     pub(crate) async fn try_lock_shared(&self) -> Result<OwnedGlommioFile> {
         self.flock("try_lock_shared", libc::LOCK_SH | libc::LOCK_NB)
             .await
             .map(|()| self.clone().into())
     }
 
-    /// NOTE: The try variant could just do the syscall directly instead of
-    /// dispatching to a blocking thread. For consistency though it's
-    /// implemented the same way.
+    /// Makes the non-blocking `flock` call inline on the executor thread;
+    /// nothing is awaited.
     pub(crate) async fn try_lock_exclusive(&self) -> Result<OwnedGlommioFile> {
         self.flock("try_lock_exclusive", libc::LOCK_EX | libc::LOCK_NB)
             .await

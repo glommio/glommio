@@ -48,20 +48,15 @@ impl ExecutorContext {
         }
     }
 
+    /// The default queue, which `init` creates and `remove_task_queue`
+    /// refuses to remove, so it is there for the executor's whole life.
     fn cleanup_queue(&self) -> Rc<RefCell<TaskQueue>> {
-        let queue = {
-            let queues = self.queues.borrow();
-            queues
-                .available_executors
-                .get(&TaskQueueHandle::default().index)
-                .or_else(|| queues.available_executors.values().next())
-                .cloned()
-        };
-        if let Some(queue) = queue {
-            return queue;
-        }
-        let handle = self.create_task_queue(Shares::default(), Latency::NotImportant, "cleanup");
-        self.get_queue(&handle).expect("cleanup queue disappeared")
+        self.queues
+            .borrow()
+            .available_executors
+            .get(&TaskQueueHandle::default().index)
+            .cloned()
+            .expect("the default task queue is never removed")
     }
 
     /// Provides queue and I/O context without retaining the public executor.

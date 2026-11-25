@@ -386,6 +386,7 @@ fn cross_executor_cancellation_during_shared_channel_connection() {
             .poll(&mut Context::from_waker(&waker))
             .is_pending());
         drop(waker);
+        let trigger_receiver = trigger_receiver.connect().await;
         while handle_to_drop.borrow().is_some() {
             Timer::new(Duration::from_millis(10)).await;
         }
@@ -393,7 +394,6 @@ fn cross_executor_cancellation_during_shared_channel_connection() {
             handle_to_drop.borrow().is_none(),
             "connection dispatch did not invoke its pending waker",
         );
-        let trigger_receiver = trigger_receiver.connect().await;
         let trigger_sender = connection.await;
         drop((trigger_sender, trigger_receiver));
     });

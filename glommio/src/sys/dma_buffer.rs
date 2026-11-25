@@ -104,8 +104,7 @@ impl BufferStorage {
 /// suitable for io_uring's Direct I/O.
 pub struct DmaBuffer {
     storage: BufferStorage,
-    /// Invariant: `trim` + `size` are at most one byte past the original allocation.
-    trim: usize,
+    /// Invariant: at most the length of the original allocation.
     size: usize,
 }
 
@@ -114,16 +113,11 @@ impl DmaBuffer {
         Some(DmaBuffer {
             storage: BufferStorage::Sys(SysAlloc::new(size)?),
             size,
-            trim: 0,
         })
     }
 
     pub(crate) fn with_storage(size: usize, storage: BufferStorage) -> DmaBuffer {
-        DmaBuffer {
-            storage,
-            size,
-            trim: 0,
-        }
+        DmaBuffer { storage, size }
     }
 
     pub(crate) fn uring_buffer_id(&self) -> Option<u32> {
@@ -180,7 +174,7 @@ impl DmaBuffer {
     /// `DmaBuffer` as mutable pointer
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.make_owned();
-        unsafe { self.storage.as_mut_ptr().add(self.trim) }
+        self.storage.as_mut_ptr()
     }
 
     /// A buffer made from a [`ReadResult`] shares its bytes with every other
@@ -188,16 +182,15 @@ impl DmaBuffer {
     /// are copied into storage this buffer owns alone.
     fn make_owned(&mut self) {
         if let BufferStorage::ReadResult(shared) = &self.storage {
-            let owned = SysAlloc::copy_of(&shared[self.trim..self.trim + self.size]);
+            let owned = SysAlloc::copy_of(&shared[..self.size]);
             self.storage = BufferStorage::Sys(owned);
-            self.trim = 0;
         }
     }
 
     /// Returns a representation of the current addressable contents of this
     /// `DmaBuffer` as pointer
     pub fn as_ptr(&self) -> *const u8 {
-        unsafe { self.storage.as_ptr().add(self.trim) }
+        self.storage.as_ptr()
     }
 }
 
@@ -218,7 +211,6 @@ impl AsMut<[u8]> for DmaBuffer {
 impl From<ReadResult> for DmaBuffer {
     fn from(value: ReadResult) -> Self {
         Self {
-            trim: 0,
             size: value.len(),
             storage: BufferStorage::ReadResult(value),
         }
@@ -318,5 +310,15 @@ mod tests {
                 file.close().await.unwrap();
             });
         }
+    }
+
+    /// A buffer is its storage and a length; every view starts at the
+    /// storage's first byte, so there is no offset to carry.
+    #[test]
+    fn a_buffer_is_its_storage_and_a_length() {
+        assert_eq!(
+            std::mem::size_of::<DmaBuffer>(),
+            std::mem::size_of::<BufferStorage>() + std::mem::size_of::<usize>()
+        );
     }
 }

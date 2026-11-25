@@ -662,6 +662,10 @@ impl DmaFile {
     /// the name from the filesystem but the file will still be accessible for
     /// as long as it is open.
     ///
+    /// A removed file has no path: [`path`](Self::path) returns `None`, and
+    /// [`rename`](Self::rename) and `remove` fail, rather than act on another
+    /// file created under the old name.
+    ///
     /// Note: this syscall might be issued in a background thread depending on
     /// the system's capabilities.
     pub async fn remove(&self) -> Result<()> {
@@ -2187,6 +2191,60 @@ pub(crate) mod test {
             .unlock()
             .await
             .unwrap();
+    });
+
+    dma_file_test!(a_removed_file_has_no_path_to_rename, path, _k, {
+        let name = path.join("removed");
+        let file = DmaFile::create(&name).await.unwrap();
+        file.remove().await.unwrap();
+        std::fs::write(&name, b"unrelated").unwrap();
+
+        file.rename(path.join("moved"))
+            .await
+            .expect_err("a removed file cannot be renamed");
+        assert_eq!(std::fs::read(&name).unwrap(), b"unrelated");
+        assert!(!path.join("moved").exists());
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(a_removed_file_has_no_path_to_remove_again, path, _k, {
+        let name = path.join("removed");
+        let file = DmaFile::create(&name).await.unwrap();
+        file.remove().await.unwrap();
+        std::fs::write(&name, b"unrelated").unwrap();
+
+        file.remove()
+            .await
+            .expect_err("a removed file cannot be removed again");
+        assert_eq!(std::fs::read(&name).unwrap(), b"unrelated");
+        assert!(file.path().is_none(), "a removed file has no path");
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(a_failed_remove_keeps_the_path, path, _k, {
+        let name = path.join("removed");
+        let file = DmaFile::create(&name).await.unwrap();
+        std::fs::remove_file(&name).unwrap();
+
+        file.remove()
+            .await
+            .expect_err("a name that is gone cannot be removed");
+        assert_eq!(file.path().as_deref(), Some(name.as_path()));
+        file.close().await.unwrap();
+    });
+
+    dma_file_test!(a_cancelled_remove_leaves_no_path_behind, path, _k, {
+        let file = DmaFile::create(path.join("removed")).await.unwrap();
+        assert!(futures_lite::future::poll_once(file.remove())
+            .await
+            .is_none());
+
+        assert!(file.path().is_none(), "a remove in flight forgets the path");
+        file.rename(path.join("moved"))
+            .await
+            .expect_err("a file that may be removed cannot be renamed");
+        assert!(!path.join("moved").exists());
+        file.close().await.unwrap();
     });
 
     dma_file_test!(resize_dma_buf, path, _k, {

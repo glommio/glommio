@@ -649,10 +649,18 @@ impl ExecutorQueues {
         }
     }
 
+    /// Sets the preempt timer to the tightest latency among runnable queues.
+    ///
+    /// The queue that is running counts: it was popped from the heap, but it
+    /// is pushed back if still runnable when its slice ends, and that repush
+    /// does not recompute. Leaving it out lets a queue it activated reset the
+    /// timer to the default, which the next slice then runs under while the
+    /// latency queue waits.
     fn reevaluate_preempt_timer(&mut self) {
         self.preempt_timer_duration = self
             .active_executors
             .iter()
+            .chain(self.active_executing.as_ref())
             .map(|tq| match tq.borrow().io_requirements.latency_req {
                 Latency::NotImportant => self.default_preempt_timer_duration,
                 Latency::Matters(d) => d,
@@ -5274,6 +5282,104 @@ mod test {
                 }))
             ),
             "removing the default queue returned {out:?}"
+        );
+    }
+
+    /// A `Latency::Matters` queue that wakes an idle queue and then yields
+    /// while still runnable must not wait out the default preempt timer.
+    ///
+    /// `q` promises 5 ms and the executor's default is 1 s. `q` spawns a
+    /// spinner into `n`, which only gives up the CPU when preempted, then
+    /// yields in a loop and records the longest gap between its own polls.
+    /// Every gap is a slice `n` ran, so the worst gap is how long the timer
+    /// let `n` run while `q` was waiting. Activating `n` used to recompute the
+    /// timer without the queue that was running, and the repush after that
+    /// slice did not recompute it, so `n` ran under the 1 s default.
+    ///
+    /// `q` holds one share against `n`'s thousand, so its yields catch up with
+    /// `n`'s vruntime in microseconds rather than taking a share of each slice
+    /// for themselves, and every slice `n` gets is as long as the timer allows.
+    ///
+    /// Only slices after `n`'s first preemption are measured. The first runs
+    /// under the timer armed before `q` was activated, in the same pass, which
+    /// is a separate matter: a pass keeps the timer it started with.
+    ///
+    /// The bound is 250 ms: fifty times the promised 5 ms, so a loaded
+    /// machine has room to be late, and a quarter of the 1 s the bug yields,
+    /// so the timer cannot pass it by firing early.
+    ///
+    /// A stall before `q`'s first gap lets `n` finish its slices before `q`
+    /// runs again, leaving nothing measured, so such a run is retried and the
+    /// test fails if no run measured a gap.
+    #[test]
+    fn a_latency_queue_that_wakes_another_and_yields_keeps_its_preempt_timer() {
+        const SLICES: usize = 4;
+        const BOUND: Duration = Duration::from_millis(250);
+        const LIMIT: Duration = Duration::from_secs(10);
+        const TRIES: usize = 3;
+
+        let run = || {
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_secs(1))
+                .make()
+                .unwrap();
+            ex.run(async {
+                let q = crate::executor().create_task_queue(
+                    Shares::Static(1),
+                    Latency::Matters(Duration::from_millis(5)),
+                    "latency",
+                );
+                let n = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::NotImportant,
+                    "spinner",
+                );
+                crate::spawn_local_into(
+                    async move {
+                        let slices = Rc::new(Cell::new(0));
+                        let spinner = crate::spawn_local_into(
+                        enclose! { (slices) async move {
+                            let start = Instant::now();
+                            while slices.get() < SLICES {
+                                assert!(start.elapsed() < LIMIT, "the spinner was never preempted");
+                                if crate::executor().need_preempt() {
+                                    slices.set(slices.get() + 1);
+                                    crate::yield_if_needed().await;
+                                }
+                            }
+                        }},
+                        n,
+                    )
+                    .unwrap();
+                        let mut worst = Duration::ZERO;
+                        let mut measured = 0usize;
+                        let mut last = Instant::now();
+                        while slices.get() < SLICES {
+                            let before = slices.get();
+                            crate::executor().yield_task_queue_now().await;
+                            let now = Instant::now();
+                            if before >= 1 {
+                                worst = worst.max(now - last);
+                                measured += 1;
+                            }
+                            last = now;
+                        }
+                        spinner.await;
+                        (worst, measured)
+                    },
+                    q,
+                )
+                .unwrap()
+                .await
+            })
+        };
+        let (worst, _) = (0..TRIES)
+            .map(|_| run())
+            .find(|&(_, measured)| measured > 0)
+            .expect("no run measured a gap between the latency queue's polls");
+        assert!(
+            worst < BOUND,
+            "the latency queue waited {worst:?} for the CPU, its promise is 5ms"
         );
     }
 }

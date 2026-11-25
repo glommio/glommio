@@ -606,3 +606,34 @@ fn an_unread_connection_is_throttled_and_the_others_keep_their_buffers() {
         drop(flooder);
     });
 }
+
+/// Two tasks peeking one stream while its multishot receive waits for data
+/// both wait on that request, and both must be woken by the arrival.
+#[test]
+fn two_tasks_peeking_an_armed_multishot_both_finish() {
+    executor(8, 64).run(async {
+        let (mut writer, reader) = pair(Preallocated::default()).await;
+        let reader = std::rc::Rc::new(reader);
+        let peekers: Vec<_> = (0..2)
+            .map(|_| {
+                let reader = reader.clone();
+                crate::spawn_local(async move {
+                    let mut p = [0u8; 4];
+                    let n = reader.peek(&mut p).await.unwrap();
+                    p[..n].to_vec()
+                })
+            })
+            .collect();
+        Timer::new(Duration::from_millis(20)).await;
+        writer.write_all(b"peek").await.unwrap();
+        for peeker in peekers {
+            let peeked =
+                crate::timer::timeout(Duration::from_secs(1), async { Ok(peeker.await) }).await;
+            assert_eq!(
+                peeked.ok().as_deref(),
+                Some(&b"peek"[..]),
+                "a peeker was never woken"
+            );
+        }
+    });
+}

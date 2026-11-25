@@ -1273,6 +1273,32 @@ mod tests {
             });
     }
 
+    /// The same holds for a peek waiting on the throttled request: a real
+    /// `ETIMEDOUT` reaches it instead of being taken for the throttle's.
+    #[test]
+    fn a_real_timeout_ending_a_throttled_receive_reaches_a_peek() {
+        crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .recv_buffers(crate::RecvBuffers::exact(8, 64))
+            .make()
+            .unwrap()
+            .run(async {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let _writer = TcpStream::connect(addr).await.unwrap();
+                let reader = listener.accept().await.unwrap().buffered();
+                reader.stream.throttle_multishot();
+                reader
+                    .stream
+                    .end_multishot_with(std::io::Error::from_raw_os_error(libc::ETIMEDOUT), false);
+                let mut got = [0u8; 1];
+                let peeked = futures_lite::future::poll_once(reader.peek(&mut got)).await;
+                let err = peeked
+                    .expect("the timeout was swallowed as the throttle's and the peek waited")
+                    .unwrap_err();
+                assert_eq!(err.raw_os_error(), Some(libc::ETIMEDOUT));
+            });
+    }
+
     /// The throttle's cancellation ends the request with `ECANCELED`, which
     /// the reader never sees: the request is re-armed and reads go on.
     #[test]

@@ -4975,6 +4975,33 @@ mod test {
     }
 
     #[test]
+    fn an_empty_custom_blocking_pool_is_a_shard_count_error() {
+        let ret = LocalExecutorBuilder::new(Placement::Unbound)
+            .blocking_thread_pool_placement(PoolPlacement::Custom(vec![]))
+            .make();
+        assert!(matches!(
+            ret,
+            Err(GlommioError::BuilderError(BuilderErrorKind::NrShards {
+                minimum: 1,
+                shards: 0
+            }))
+        ));
+    }
+
+    #[test]
+    fn an_empty_custom_executor_pool_is_a_shard_count_error() {
+        let ret = LocalExecutorPoolBuilder::new(PoolPlacement::Custom(vec![]))
+            .on_all_shards(|| async move {});
+        assert!(matches!(
+            ret,
+            Err(GlommioError::BuilderError(BuilderErrorKind::NrShards {
+                minimum: 1,
+                shards: 0
+            }))
+        ));
+    }
+
+    #[test]
     fn local_executor_unset() {
         LocalExecutor::default().run(async {});
 

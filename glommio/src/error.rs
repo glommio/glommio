@@ -62,7 +62,8 @@ pub enum ReactorErrorKind {
     /// Indicates an incorrect source type.
     IncorrectSourceType(String),
 
-    /// Reactor unable to lock memory (max allowed, min required)
+    /// The kernel refused a ring for memory under a low memlock limit (the
+    /// limit, the recommended minimum), both in bytes.
     MemLockLimit(u64, u64),
 }
 

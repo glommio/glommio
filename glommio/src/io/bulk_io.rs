@@ -292,11 +292,24 @@ impl<V: IoVec + Unpin, S: Stream<Item = V> + Unpin> Stream for CoalescedReads<V,
         }
     }
 
+    /// The upper bound counts the user reads still to come out, those held
+    /// for merging included. Each merged read carries at least one, so it
+    /// bounds the merged reads too, and [`ReadManyResult`], which yields one
+    /// item per user read, relies on it counting them.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self.iter.size_hint() {
-            (low, Some(hi)) => (low.min(1), Some(hi)),
-            (low, None) => (low.min(1), None),
-        }
+        let last = self
+            .last
+            .as_ref()
+            .map_or(0, |last| last.coalesced_user_iovecs.len());
+        let Some(merger) = &self.merger else {
+            return (usize::from(last > 0), Some(last));
+        };
+        let held = last + merger.merged.len();
+        let (low, high) = self.iter.size_hint();
+        (
+            usize::from(held > 0 || low > 0),
+            high.and_then(|high| high.checked_add(held)),
+        )
     }
 }
 
@@ -528,8 +541,20 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
         }
     }
 
+    /// A failed system read yields one error for all of its user reads, so
+    /// the lower bound counts system reads and the upper bound user reads.
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        let current = self
+            .current
+            .as_ref()
+            .map_or(0, |(_, args, _)| args.user_reads.len());
+        let inflight = &self.inner.inflight;
+        let inflight_reads: usize = inflight.iter().map(|(_, args)| args.user_reads.len()).sum();
+        let (low, high) = self.inner.iovs.size_hint();
+        (
+            low.saturating_add(current + inflight.len()),
+            high.and_then(|high| high.checked_add(current + inflight_reads)),
+        )
     }
 }
 
@@ -821,6 +846,44 @@ mod tests {
                 most <= CAP + LARGE,
                 "{most} bytes in flight against a limit of {CAP}"
             );
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// Drains `reads`, checking before every item that its bounds cover the
+    /// `total` items it must yield.
+    async fn assert_size_hint_holds<S: Stream + Unpin>(mut reads: S, total: usize) {
+        for remaining in (0..=total).rev() {
+            let (low, high) = reads.size_hint();
+            assert!(
+                low <= remaining && high.is_none_or(|high| high >= remaining),
+                "size_hint ({low}, {high:?}) with {remaining} left"
+            );
+            assert_eq!(reads.next().await.is_some(), remaining > 0);
+        }
+    }
+
+    /// Reads merged into one system read still yield one item each, and the
+    /// bounds must cover all of them: those of the read in hand, and those
+    /// coalescing still holds when the concurrency limit stops it early.
+    #[test]
+    fn size_hint_bounds_the_reads_left_to_yield() {
+        test_executor!(async move {
+            let file = a_file_of(65536).await;
+            let merged = file.read_many(
+                stream::iter((0..16u64).map(|i| (i * 512, 512usize))),
+                MergedBufferLimit::DeviceMaxSingleRequest,
+                ReadAmplificationLimit::NoAmplification,
+            );
+            assert_size_hint_holds(merged, 16).await;
+            let held = file
+                .read_many(
+                    stream::iter((0..16u64).map(|i| (i * 4096, 512usize))),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_concurrency(1);
+            assert_size_hint_holds(held, 16).await;
             file.close_rc().await.unwrap();
         });
     }

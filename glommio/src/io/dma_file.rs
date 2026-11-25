@@ -1214,6 +1214,34 @@ pub(crate) mod test {
         };
     }
 
+    /// Guards against the next executor on a thread writing a buffer from the
+    /// one before with the fixed-buffer opcode. The index the buffer carries
+    /// is into the first reactor's registration, so the kernel refused the
+    /// write with `EFAULT`.
+    #[test]
+    fn a_buffer_from_an_earlier_executor_on_the_thread_can_be_written() {
+        for dir in make_test_directories("dma-buffer-from-an-earlier-executor") {
+            let path = dir.path.clone();
+            let buf = LocalExecutor::default().run(enclose! {(path) async move {
+                let file = DmaFile::create(path.join("first")).await.unwrap();
+                let mut buf = file.alloc_dma_buffer(4096);
+                buf.as_bytes_mut().fill(b'x');
+                file.close().await.unwrap();
+                buf
+            }});
+            LocalExecutor::default().run(async move {
+                let file = DmaFile::create(path.join("second")).await.unwrap();
+                let written = file
+                    .write_at(buf, 0)
+                    .await
+                    .expect("writing a buffer from the earlier executor failed");
+                assert_eq!(written, 4096);
+                file.close().await.unwrap();
+                assert_eq!(std::fs::read(path.join("second")).unwrap(), [b'x'; 4096]);
+            });
+        }
+    }
+
     dma_file_test!(file_create_close, path, _k, {
         let new_file = DmaFile::create(path.join("testfile"))
             .await

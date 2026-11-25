@@ -10,7 +10,10 @@
 
 use std::ptr;
 
-use crate::{io::ReadResult, sys::uring::UringBuffer};
+use crate::{
+    io::ReadResult,
+    sys::uring::{UringBuffer, UringBufferAllocator},
+};
 use alloc::alloc::Layout;
 
 #[derive(Debug)]
@@ -126,6 +129,16 @@ impl DmaBuffer {
     pub(crate) fn uring_buffer_id(&self) -> Option<u32> {
         match &self.storage {
             BufferStorage::Uring(x) => x.uring_buffer_id(),
+            _ => None,
+        }
+    }
+
+    /// The index this buffer is registered under, if it came from `pool`.
+    /// A buffer from another reactor's pool has an index into that reactor's
+    /// registration, which means nothing to this one.
+    pub(crate) fn registered_index_in(&self, pool: &UringBufferAllocator) -> Option<u32> {
+        match &self.storage {
+            BufferStorage::Uring(x) if x.is_from(pool) => x.uring_buffer_id(),
             _ => None,
         }
     }

@@ -439,10 +439,10 @@ pub(crate) enum DmaSource {
 }
 
 impl DmaSource {
-    fn uring_buffer_id(&self) -> Option<u32> {
+    fn registered_index_in(&self, pool: &uring::UringBufferAllocator) -> Option<u32> {
         match self {
-            DmaSource::Owned(buffer) => buffer.uring_buffer_id(),
-            DmaSource::Shared(buffer) => buffer.uring_buffer_id(),
+            DmaSource::Owned(buffer) => buffer.registered_index_in(pool),
+            DmaSource::Shared(buffer) => buffer.registered_index_in(pool),
         }
     }
 }

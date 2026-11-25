@@ -204,6 +204,10 @@ impl UringBuffer {
     pub(crate) fn uring_buffer_id(&self) -> Option<u32> {
         self.uring_buffer_id
     }
+
+    pub(crate) fn is_from(&self, pool: &UringBufferAllocator) -> bool {
+        ptr::eq(&*self.allocator, pool)
+    }
 }
 
 impl Drop for UringBuffer {
@@ -2424,16 +2428,22 @@ impl Reactor {
         poll_ring.alloc_dma_buffer(size)
     }
 
+    /// Writes with the fixed-buffer opcode only a buffer from this reactor's
+    /// own pool. One from an executor that ran earlier on the thread carries
+    /// an index into that reactor's registration, which these rings do not
+    /// have, so it is written as plain memory.
     pub(crate) fn write_dma(&self, source: &Source, pos: u64) {
         let op = match &*source.source_type() {
             SourceType::Write(
                 PollableStatus::NonPollable(DirectIo::Disabled),
                 IoBuffer::DmaSource(buf),
             ) => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
-            SourceType::Write(_, IoBuffer::DmaSource(buf)) => match buf.uring_buffer_id() {
-                Some(id) => UringOpDescriptor::WriteFixed(buf.as_ptr(), buf.len(), pos, id),
-                None => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
-            },
+            SourceType::Write(_, IoBuffer::DmaSource(buf)) => {
+                match buf.registered_index_in(&self.poll_ring.borrow().allocator) {
+                    Some(id) => UringOpDescriptor::WriteFixed(buf.as_ptr(), buf.len(), pos, id),
+                    None => UringOpDescriptor::Write(buf.as_ptr(), buf.len(), pos),
+                }
+            }
             x => panic!("Unexpected source type for write: {:?}", x),
         };
         queue_request_into_ring(
@@ -4398,6 +4408,20 @@ mod tests {
         let x = allocator.malloc(1);
         assert_eq!(x as usize & 4095, 0);
         unsafe { alloc::alloc::dealloc(data.as_ptr(), l) }
+    }
+
+    /// A buffer keeps its fixed index in the pool that made it, so writes from
+    /// this reactor's own pool still take the fixed-buffer opcode, and loses
+    /// it in any other pool, even one registered under the same index.
+    #[test]
+    fn a_buffer_is_registered_only_in_its_own_pool() {
+        let own = Rc::new(UringBufferAllocator::new(65536));
+        let other = Rc::new(UringBufferAllocator::new(65536));
+        own.activate_registered_buffers(0);
+        other.activate_registered_buffers(0);
+        let buf = own.new_buffer(4096).unwrap();
+        assert_eq!(buf.registered_index_in(&own), Some(0));
+        assert_eq!(buf.registered_index_in(&other), None);
     }
 
     /// The allocator fails with a single page, because it needs extra metadata

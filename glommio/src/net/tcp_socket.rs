@@ -670,15 +670,7 @@ impl TcpStream {
         let source =
             reactor.connect_timeout(socket.as_raw_fd(), SockaddrStorage::from(addr), duration);
 
-        source
-            .collect_rw()
-            .await
-            .map_err(|err| match err.raw_os_error() {
-                Some(libc::ECANCELED) => {
-                    io::Error::new(io::ErrorKind::TimedOut, "connection timed out")
-                }
-                _ => err,
-            })?;
+        source.collect_rw().await?;
 
         Ok(TcpStream {
             stream: GlommioStream::from(socket),

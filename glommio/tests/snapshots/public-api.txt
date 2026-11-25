@@ -4800,6 +4800,8 @@ pub fn glommio::sync::Gate::spawn<T: 'static>(&self, future: impl core::future::
 pub fn glommio::sync::Gate::spawn_into<T: 'static>(&self, future: impl core::future::future::Future<Output = T> + 'static, handle: glommio::TaskQueueHandle) -> core::result::Result<glommio::Task<T>, glommio::GlommioError<()>>
 impl core::clone::Clone for glommio::sync::Gate
 pub fn glommio::sync::Gate::clone(&self) -> glommio::sync::Gate
+impl core::default::Default for glommio::sync::Gate
+pub fn glommio::sync::Gate::default() -> Self
 impl core::fmt::Debug for glommio::sync::Gate
 pub fn glommio::sync::Gate::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::Freeze for glommio::sync::Gate

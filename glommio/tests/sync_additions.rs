@@ -12,3 +12,12 @@ fn a_semaphore_tells_whether_it_is_closed() {
     assert!(sem.is_closed());
     assert!(sem.try_acquire(1).is_err());
 }
+
+#[test]
+fn a_gate_has_a_default() {
+    fn make<T: Default>() -> T {
+        T::default()
+    }
+    let gate: glommio::sync::Gate = make();
+    assert!(gate.is_open());
+}

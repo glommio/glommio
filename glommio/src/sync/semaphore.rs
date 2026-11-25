@@ -276,6 +276,8 @@ pub struct Permit<'a> {
 /// Resources are held while the Permit is alive, and released when the
 /// permit is dropped.
 #[derive(Debug)]
+#[must_use = "units are only held while the permit is alive. If unused then semaphore will \
+              immediately release units"]
 pub struct StaticPermit {
     units: u64,
     sem: Rc<Semaphore>,

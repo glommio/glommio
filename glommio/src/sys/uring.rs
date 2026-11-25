@@ -734,11 +734,12 @@ fn completion_result(res: i32) -> io::Result<usize> {
 }
 
 /// [`completion_result`], with `ECANCELED` converted to `ETIMEDOUT`, so a
-/// request its linked timeout cancelled reports as timed out. Strictly only
-/// those should be converted, but a request cancelled any other way is one
-/// nobody reads the result of. The exception is a multishot receive, whose
-/// owner reads the throttle's cancellation and has to tell it from a real
-/// `ETIMEDOUT`; its completions skip this conversion.
+/// request its linked timeout cancelled reports as timed out. Only for a
+/// request submitted with a linked timeout: any other cancellation keeps the
+/// kernel's `ECANCELED`, since the completion does not say why the kernel
+/// cancelled it, and a request that had no timeout did not time out. Those
+/// include a multishot receive the throttle cancelled, and work io-wq could
+/// not find a worker for.
 fn transmute_error(res: i32) -> io::Result<usize> {
     completion_result(res).map_err(|x: io::Error| {
         if let Some(libc::ECANCELED) = x.raw_os_error() {
@@ -994,20 +995,18 @@ where
 
         let mut woke = false;
         if try_process(src.borrow()).is_none() {
-            let multishot = {
+            let timed = {
                 let mut inner = src.borrow_mut();
                 queue_multishot_arrival(&mut inner, &value);
                 if let SourceType::RecvMulti(state) = &mut inner.source_type {
                     state.armed = false;
-                    true
-                } else {
-                    false
                 }
+                inner.timeout.is_some()
             };
-            let result = if multishot {
-                completion_result(result)
-            } else {
+            let result = if timed {
                 transmute_error(result)
+            } else {
+                completion_result(result)
             };
             let res = Some(post_process(src.borrow_mut(), result));
             let waiters = {
@@ -3619,8 +3618,9 @@ mod tests {
     }
 
     /// The throttle's cancellation reaches the stream as `ECANCELED`, not as
-    /// the `ETIMEDOUT` other cancelled requests are reported as, so a real
-    /// `ETIMEDOUT` ending a throttled request stays distinguishable from it.
+    /// the `ETIMEDOUT` a request its linked timeout cancelled is reported as,
+    /// so a real `ETIMEDOUT` ending a throttled request stays distinguishable
+    /// from it.
     #[test]
     fn a_throttled_multishot_source_ends_with_ecanceled() {
         let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
@@ -4860,6 +4860,45 @@ mod tests {
                 }
                 other => panic!("expected the ENOMEM, got {other:?}"),
             }
+        }
+    }
+
+    /// Leaves the process unable to start a thread, so the kernel cannot
+    /// create the io-wq worker a punted request needs. Root is exempt from
+    /// `RLIMIT_NPROC`, and CI runs the tests as root, so a root process
+    /// first becomes `nobody`.
+    fn forbid_new_threads() {
+        let (_, hard) = Resource::NPROC.get().unwrap();
+        Resource::NPROC.set(0, hard).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            let nobody = 65534;
+            assert_eq!(unsafe { libc::setresgid(nobody, nobody, nobody) }, 0);
+            assert_eq!(unsafe { libc::setresuid(nobody, nobody, nobody) }, 0);
+        }
+    }
+
+    rusty_fork_test! {
+        /// A request the kernel cancels for want of an io-wq worker has no
+        /// linked timeout, so it reports the kernel's `ECANCELED`, not a
+        /// timeout. Opening with `O_CREAT` is always punted to io-wq. Forked,
+        /// since the thread limit and the user are per process. Kernels before
+        /// 5.15 may not cancel such work, and the test expects one that does.
+        #[test]
+        fn a_request_the_kernel_cancels_without_a_timeout_reports_ecanceled() {
+            let path = std::env::temp_dir().join(format!(
+                "glommio-ecanceled-{}",
+                std::process::id()
+            ));
+            let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+                .make()
+                .unwrap();
+            let created = ex.run(async move {
+                forbid_new_threads();
+                crate::io::DmaFile::create(&path).await.map(|_| ())
+            });
+            let err = created.expect_err("created a file with no io-wq worker");
+            assert_eq!(err.raw_os_error(), Some(libc::ECANCELED), "{err}");
+            assert_ne!(io::Error::from(err).kind(), io::ErrorKind::TimedOut);
         }
     }
 

@@ -7,7 +7,7 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{btree_map::Entry, BTreeMap},
     ffi::CString,
     fmt,
     future::Future,
@@ -45,23 +45,36 @@ struct SharedChannels {
     checkers: BTreeMap<u64, Box<dyn Fn() -> usize>>,
     /// Wakers waiting on a channel. A channel has an entry only while some do.
     pending: BTreeMap<u64, SmallVec<[Waker; 1]>>,
-    connection_wakers: Vec<Waker>,
+    /// Halves waiting in `connect()` for their peer.
+    connecting: BTreeMap<u64, Connecting>,
+}
+
+/// A shared channel half waiting in `connect()`.
+struct Connecting {
+    /// Whether the peer has connected yet.
+    peer_connected: Rc<dyn Fn() -> bool>,
+    /// What to wake once it has.
+    waker: Waker,
 }
 
 impl SharedChannels {
     fn new() -> SharedChannels {
         SharedChannels {
             id: 0,
-            connection_wakers: Vec::new(),
             checkers: BTreeMap::new(),
             pending: BTreeMap::new(),
+            connecting: BTreeMap::new(),
         }
     }
 
     /// Detaches ready wakers so their callbacks can reenter the registry.
     fn take_ready_wakers(&mut self) -> SmallVec<[Waker; 8]> {
         let mut ready = SmallVec::new();
-        ready.extend(self.connection_wakers.drain(..));
+        ready.extend(
+            self.connecting
+                .extract_if(.., |_, connecting| (connecting.peer_connected)())
+                .map(|(_, connecting)| connecting.waker),
+        );
 
         let Self {
             checkers, pending, ..
@@ -239,6 +252,7 @@ impl Reactor {
             .checkers
             .keys()
             .chain(channels.pending.keys())
+            .chain(channels.connecting.keys())
             .copied()
             .collect();
         ids.sort_unstable();
@@ -248,14 +262,51 @@ impl Reactor {
 
     pub(crate) fn unregister_shared_channel(&self, id: u64) {
         let mut channels = self.shared_channels.borrow_mut();
-        let removed = (channels.checkers.remove(&id), channels.pending.remove(&id));
+        let removed = (
+            channels.checkers.remove(&id),
+            channels.pending.remove(&id),
+            channels.connecting.remove(&id),
+        );
         drop(channels);
         drop(removed);
     }
 
-    pub(crate) fn add_shared_channel_connection_waker(&self, waker: Waker) {
+    /// Wakes `waker` once `peer_connected` holds for the half `id`, in place
+    /// of whatever waker `id` waited with before.
+    ///
+    /// Only the peer's `notify`, sent once it has connected or been dropped,
+    /// wakes this executor for it, so `peer_connected` is checked on every
+    /// reactor pass, including the drain before a park.
+    pub(crate) fn wait_for_shared_channel_peer(
+        &self,
+        id: u64,
+        peer_connected: &Rc<dyn Fn() -> bool>,
+        waker: &Waker,
+    ) {
         let mut channels = self.shared_channels.borrow_mut();
-        channels.connection_wakers.push(waker);
+        let replaced = match channels.connecting.entry(id) {
+            Entry::Vacant(entry) => {
+                entry.insert(Connecting {
+                    peer_connected: peer_connected.clone(),
+                    waker: waker.clone(),
+                });
+                None
+            }
+            Entry::Occupied(entry) => {
+                let current = &mut entry.into_mut().waker;
+                (!current.will_wake(waker)).then(|| mem::replace(current, waker.clone()))
+            }
+        };
+        drop(channels);
+        drop(replaced);
+    }
+
+    /// Withdraws what [`wait_for_shared_channel_peer`] registered for `id`.
+    ///
+    /// [`wait_for_shared_channel_peer`]: Self::wait_for_shared_channel_peer
+    pub(crate) fn stop_waiting_for_shared_channel_peer(&self, id: u64) {
+        let removed = self.shared_channels.borrow_mut().connecting.remove(&id);
+        drop(removed);
     }
 
     pub(crate) fn add_shared_channel_waker(&self, id: u64, waker: Waker) {

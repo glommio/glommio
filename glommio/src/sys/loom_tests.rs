@@ -11,7 +11,10 @@
 //! decided to sleep. The properties are checked after every thread has joined.
 
 use super::new_sleep_notifier;
-use loom::thread;
+use loom::{
+    sync::atomic::{AtomicBool as LoomBool, AtomicUsize as LoomUsize},
+    thread,
+};
 use std::{
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -206,5 +209,69 @@ fn an_awake_owner_is_not_signalled_by_an_ordinary_wake() {
             before,
             "an ordinary wake signalled an owner that was awake"
         );
+    });
+}
+
+/// One half of a shared channel connecting, as `connect()` does: publish
+/// its executor's id, then look for the peer's. A half that finds its peer
+/// notifies the peer's executor; one that does not parks until it does.
+///
+/// Parking waits for the peer to finish, then checks it was signalled: a
+/// real executor stays asleep until something writes its eventfd.
+fn connect_half(
+    me: usize,
+    ids: &[LoomUsize; 2],
+    notifiers: &[Arc<super::SleepNotifier>; 2],
+    parked: &[LoomBool; 2],
+    done: &[LoomBool; 2],
+) {
+    let peer = 1 - me;
+    let peer_connected = || ids[peer].load(Ordering::Acquire) != 0;
+    ids[me].store(notifiers[me].id(), Ordering::Release);
+    let found = peer_connected()
+        || notifiers[me]
+            .sleep_unless_woken(
+                || peer_connected() as usize,
+                || {
+                    parked[me].store(true, Ordering::SeqCst);
+                    while !done[peer].load(Ordering::SeqCst) {
+                        assert!(
+                            !parked[peer].load(Ordering::SeqCst),
+                            "both halves parked, each waiting for the other"
+                        );
+                        thread::yield_now();
+                    }
+                    assert!(
+                        notifiers[me].signals() > 0,
+                        "a half parked with its peer connected and nothing to wake it"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap()
+            > 0;
+    if found {
+        notifiers[peer].notify(false);
+    }
+    done[me].store(true, Ordering::SeqCst);
+}
+
+/// P6: two halves of a shared channel connecting at once never leave one
+/// of them parked with nothing to wake it.
+#[test]
+fn a_connect_is_not_left_waiting_for_a_peer_that_connected() {
+    loom::model(|| {
+        let notifiers = Arc::new([new_sleep_notifier().unwrap(), new_sleep_notifier().unwrap()]);
+        let ids = Arc::new([LoomUsize::new(0), LoomUsize::new(0)]);
+        let parked = Arc::new([LoomBool::new(false), LoomBool::new(false)]);
+        let done = Arc::new([LoomBool::new(false), LoomBool::new(false)]);
+
+        let other = {
+            let (notifiers, ids, parked, done) =
+                (notifiers.clone(), ids.clone(), parked.clone(), done.clone());
+            thread::spawn(move || connect_half(1, &ids, &notifiers, &parked, &done))
+        };
+        connect_half(0, &ids, &notifiers, &parked, &done);
+        other.join().unwrap();
     });
 }

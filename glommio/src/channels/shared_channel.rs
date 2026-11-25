@@ -112,14 +112,31 @@ struct ReceiverState<V: Send + Sized> {
     buffer: Consumer<V>,
 }
 
+/// Waits for the peer half to connect, and returns its executor's notifier.
+///
+/// The half that connects second wakes the one waiting: it has published
+/// its id by then, so a notify on the waiting peer's executor finds the id
+/// when the reactor next checks `peer_connected`.
 struct Connector<T: BufferHalf> {
+    id: u64,
     buffer: T,
+    peer_connected: Rc<dyn Fn() -> bool>,
     reactor: Weak<Reactor>,
 }
 
 impl<T: BufferHalf> Connector<T> {
-    fn new(buffer: T, reactor: Weak<Reactor>) -> Self {
-        Self { buffer, reactor }
+    fn new(
+        id: u64,
+        buffer: T,
+        peer_connected: Rc<dyn Fn() -> bool>,
+        reactor: Weak<Reactor>,
+    ) -> Self {
+        Self {
+            id,
+            buffer,
+            peer_connected,
+            reactor,
+        }
     }
 }
 
@@ -130,7 +147,7 @@ impl<T: BufferHalf> Future for Connector<T> {
 
         match self.buffer.peer_id() {
             0 => {
-                reactor.add_shared_channel_connection_waker(cx.waker().clone());
+                reactor.wait_for_shared_channel_peer(self.id, &self.peer_connected, cx.waker());
                 Poll::Pending
             }
             // usize::MAX (the disconnected) always has a placeholder notifier that never
@@ -144,6 +161,11 @@ impl<T: BufferHalf> Future for Connector<T> {
                     .expect("the disconnected notifier is a static and always exists")
             })),
         }
+        .map(|notifier| {
+            reactor.stop_waiting_for_shared_channel_peer(self.id);
+            notifier.notify(false);
+            notifier
+        })
     }
 }
 
@@ -196,9 +218,16 @@ impl<T: 'static + Send + Sized> SharedSender<T> {
             }
         }}));
 
+        let peer_connected: Rc<dyn Fn() -> bool> =
+            Rc::new(enclose! {(state) move || state.buffer.peer_id() != 0});
         let reactor = Rc::downgrade(&reactor);
         let registration = unregister_on_drop(reactor.clone(), id);
-        let peer = Connector::new(state.buffer.clone_internal(), reactor.clone());
+        let peer = Connector::new(
+            id,
+            state.buffer.clone_internal(),
+            peer_connected,
+            reactor.clone(),
+        );
         let notifier = peer.await;
         ScopeGuard::into_inner(registration);
         self.state = None;
@@ -374,9 +403,16 @@ impl<T: 'static + Send + Sized> SharedReceiver<T> {
             }
         }}));
 
+        let peer_connected: Rc<dyn Fn() -> bool> =
+            Rc::new(enclose! {(state) move || state.buffer.peer_id() != 0});
         let reactor = Rc::downgrade(&reactor);
         let registration = unregister_on_drop(reactor.clone(), id);
-        let peer = Connector::new(state.buffer.clone_internal(), reactor.clone());
+        let peer = Connector::new(
+            id,
+            state.buffer.clone_internal(),
+            peer_connected,
+            reactor.clone(),
+        );
         let notifier = peer.await;
         ScopeGuard::into_inner(registration);
         self.state = None;
@@ -1241,5 +1277,114 @@ mod test {
             drop(receiver.connect().await);
         });
         drop(retained_waker);
+    }
+
+    /// CPU time the calling thread has used, user and system.
+    fn thread_cpu_time() -> Duration {
+        use nix::sys::{
+            resource::{getrusage, UsageWho},
+            time::TimeValLike,
+        };
+        let usage = getrusage(UsageWho::RUSAGE_THREAD).expect("getrusage failed");
+        let micros = usage.user_time().num_microseconds() + usage.system_time().num_microseconds();
+        Duration::from_micros(micros as u64)
+    }
+
+    /// Connects the receiver and the sender from two executors, each after
+    /// its delay, and returns the wall and CPU time each `connect()` took,
+    /// receiver first.
+    ///
+    /// Neither half is used or dropped until both connects have returned, so
+    /// nothing but the connect itself can wake an executor waiting in one.
+    fn connect_from_two_executors(
+        receiver_delay: Duration,
+        sender_delay: Duration,
+    ) -> [(Duration, Duration); 2] {
+        fn half<H: 'static, F: Future<Output = H>>(
+            delay: Duration,
+            start: Arc<std::sync::Barrier>,
+            connect: impl FnOnce() -> F + Send + 'static,
+            done: mpsc::Sender<(Duration, Duration)>,
+            release: mpsc::Receiver<()>,
+        ) -> crate::ExecutorJoinHandle<()> {
+            LocalExecutorBuilder::default()
+                .spawn(move || async move {
+                    start.wait();
+                    sleep(delay).await;
+                    let (cpu, wall) = (thread_cpu_time(), std::time::Instant::now());
+                    let connected = connect().await;
+                    done.send((wall.elapsed(), thread_cpu_time() - cpu))
+                        .unwrap();
+                    let _ = release.recv();
+                    drop(connected);
+                })
+                .unwrap()
+        }
+
+        let (sender, receiver) = new_bounded::<u32>(1);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (receiver_done, receiver_took) = mpsc::channel();
+        let (sender_done, sender_took) = mpsc::channel();
+        let (release_receiver, receiver_released) = mpsc::channel();
+        let (release_sender, sender_released) = mpsc::channel();
+        let receiver = half(
+            receiver_delay,
+            start.clone(),
+            move || receiver.connect(),
+            receiver_done,
+            receiver_released,
+        );
+        let sender = half(
+            sender_delay,
+            start,
+            move || sender.connect(),
+            sender_done,
+            sender_released,
+        );
+        let took = [receiver_took, sender_took].map(|took| {
+            took.recv_timeout(Duration::from_secs(5))
+                .expect("a connect() never returned")
+        });
+        drop((release_receiver, release_sender));
+        receiver.join().unwrap();
+        sender.join().unwrap();
+        took
+    }
+
+    /// Guards against an executor spinning a core while its `connect()`
+    /// waits for the peer, instead of parking until the peer connects.
+    #[test]
+    fn waiting_for_the_peer_to_connect_burns_no_cpu() {
+        const PEER_DELAY: Duration = Duration::from_millis(200);
+        let [(wall, cpu), _] = connect_from_two_executors(Duration::ZERO, PEER_DELAY);
+        assert!(
+            wall >= PEER_DELAY / 2,
+            "connect returned after {wall:?}, before the peer could have connected"
+        );
+        assert!(
+            cpu * 10 < wall,
+            "waiting {wall:?} for the peer used {cpu:?} of CPU"
+        );
+    }
+
+    /// Guards against a sender left waiting by a receiver that connects later.
+    #[test]
+    fn a_sender_connect_returns_once_the_receiver_connects() {
+        connect_from_two_executors(Duration::from_millis(100), Duration::ZERO);
+    }
+
+    /// Guards against a receiver left waiting by a sender that connects later.
+    #[test]
+    fn a_receiver_connect_returns_once_the_sender_connects() {
+        connect_from_two_executors(Duration::ZERO, Duration::from_millis(100));
+    }
+
+    /// Guards against both halves waiting for each other when they connect
+    /// at the same moment, each missing the other's arrival.
+    #[test]
+    fn both_halves_connect_when_they_connect_at_once() {
+        for _ in 0..50 {
+            connect_from_two_executors(Duration::ZERO, Duration::ZERO);
+        }
     }
 }

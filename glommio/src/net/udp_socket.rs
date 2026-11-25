@@ -59,6 +59,25 @@ fn sockaddr_storage_to_std(addr: SockaddrStorage) -> Option<SocketAddr> {
     }
 }
 
+/// Binds `sk` to `addr` with `SO_REUSEPORT` set, so other executors can bind
+/// the same address, without letting a request for any port land on a taken
+/// one.
+///
+/// The kernel's search for a free UDP port counts a port held by another
+/// `SO_REUSEPORT` socket of the same user as free, when the searching socket
+/// has the option set as well. Two sockets bound to port 0 can then share a
+/// port, and a datagram meant for one is delivered to the other. So a bind to
+/// port 0 sets the option only once the port is chosen.
+fn bind_shared(sk: &Socket, addr: &socket2::SockAddr) -> io::Result<()> {
+    if addr.as_socket().is_some_and(|addr| addr.port() == 0) {
+        sk.bind(addr)?;
+        sk.set_reuse_port(true)
+    } else {
+        sk.set_reuse_port(true)?;
+        sk.bind(addr)
+    }
+}
+
 impl UdpSocket {
     /// Creates a UDP socket bound to the specified address.
     ///
@@ -91,9 +110,7 @@ impl UdpSocket {
             Domain::IPV4
         };
         let sk = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        let addr = socket2::SockAddr::from(addr);
-        sk.set_reuse_port(true)?;
-        sk.bind(&addr)?;
+        bind_shared(&sk, &socket2::SockAddr::from(addr))?;
         Ok(Self {
             socket: GlommioDatagram::from(sk),
         })
@@ -703,6 +720,51 @@ mod tests {
             s2.connect(s1.local_addr().unwrap()).await.unwrap();
             (s1, s2)
         }};
+    }
+
+    /// The holder takes a port, and the second socket is then confined to
+    /// that one port (`IP_LOCAL_PORT_RANGE`, Linux 6.3), so the kernel's
+    /// choice for port 0 is either the held port or nothing. Skips on a
+    /// kernel without the option.
+    #[test]
+    fn binding_port_zero_never_shares_a_port_another_socket_holds() {
+        test_executor!(async move {
+            const IP_LOCAL_PORT_RANGE: libc::c_int = 51;
+            let holder = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = u32::from(holder.local_addr().unwrap().port());
+            let range = port | (port << 16);
+            let sk = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            let set = unsafe {
+                libc::setsockopt(
+                    sk.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    IP_LOCAL_PORT_RANGE,
+                    &range as *const u32 as *const libc::c_void,
+                    std::mem::size_of::<u32>() as libc::socklen_t,
+                )
+            };
+            if set != 0 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOPROTOOPT)
+                );
+                return;
+            }
+            let any = socket2::SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+            let err = bind_shared(&sk, &any).expect_err("bound a port another socket holds");
+            assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE));
+        });
+    }
+
+    /// A bind to port 0 still sets `SO_REUSEPORT`, only after the bind, so
+    /// other executors can join the port it chose.
+    #[test]
+    fn executors_can_still_bind_the_port_a_port_zero_bind_chose() {
+        test_executor!(async move {
+            let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let second = UdpSocket::bind(first.local_addr().unwrap()).unwrap();
+            assert_eq!(first.local_addr().unwrap(), second.local_addr().unwrap());
+        });
     }
 
     #[test]

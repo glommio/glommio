@@ -511,13 +511,14 @@ impl<T> Debug for GlommioError<T> {
 
 impl<T> From<GlommioError<T>> for io::Error {
     fn from(err: GlommioError<T>) -> Self {
-        let display_err = err.to_string();
         match err {
             GlommioError::IoError(io_err) => io_err,
-            GlommioError::WouldBlock(_) => io::Error::new(io::ErrorKind::WouldBlock, display_err),
-            GlommioError::Closed(_) => io::Error::new(io::ErrorKind::BrokenPipe, display_err),
+            GlommioError::WouldBlock(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, err.to_string())
+            }
+            GlommioError::Closed(_) => io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()),
             GlommioError::CanNotBeClosed(_, _) => {
-                io::Error::new(io::ErrorKind::BrokenPipe, display_err)
+                io::Error::new(io::ErrorKind::BrokenPipe, err.to_string())
             }
             GlommioError::ExecutorError(ExecutorErrorKind::QueueError { index, kind }) => {
                 match kind {
@@ -537,10 +538,10 @@ impl<T> From<GlommioError<T>> for io::Error {
             | GlommioError::BuilderError(BuilderErrorKind::InsufficientCpus { .. })
             | GlommioError::BuilderError(BuilderErrorKind::NrShards { .. })
             | GlommioError::BuilderError(BuilderErrorKind::ThreadPanic(_)) => {
-                io::Error::other(format!("Executor builder error: {display_err}"))
+                io::Error::other(format!("Executor builder error: {err}"))
             }
-            GlommioError::EnhancedIoError { source, .. } => {
-                io::Error::new(source.kind(), display_err)
+            GlommioError::EnhancedIoError { ref source, .. } => {
+                io::Error::new(source.kind(), err.to_string())
             }
             GlommioError::ReactorError(e) => match e {
                 ReactorErrorKind::IncorrectSourceType(x) => io::Error::new(
@@ -775,6 +776,211 @@ mod test {
             Some(32),
         );
         assert_eq!(source_errno(&enhanced), Some(9));
+    }
+
+    fn converted(err: GlommioError<()>) -> (io::ErrorKind, Option<i32>, String) {
+        let err: io::Error = err.into();
+        (err.kind(), err.raw_os_error(), err.to_string())
+    }
+
+    /// Pins the kind, errno and message of every variant but
+    /// `EnhancedIoError` (pinned on its own below) as converted into an
+    /// [`io::Error`], so a change to how the conversion is built cannot
+    /// change what callers see. The doubled "Executor builder error" prefix
+    /// is what the conversion has always produced.
+    #[test]
+    fn converting_to_an_io_error_keeps_each_variants_kind_errno_and_message() {
+        use io::ErrorKind::*;
+        let cases: Vec<(GlommioError<()>, io::ErrorKind, Option<i32>, &str)> = vec![
+            (
+                GlommioError::IoError(io::Error::from_raw_os_error(2)),
+                NotFound,
+                Some(2),
+                "No such file or directory (os error 2)",
+            ),
+            (
+                GlommioError::IoError(io::Error::other("plain other")),
+                Other,
+                None,
+                "plain other",
+            ),
+            (
+                GlommioError::ExecutorError(ExecutorErrorKind::QueueError {
+                    index: 3,
+                    kind: QueueErrorKind::StillActive,
+                }),
+                Other,
+                None,
+                "Queue #3 still active",
+            ),
+            (
+                GlommioError::ExecutorError(ExecutorErrorKind::QueueError {
+                    index: 4,
+                    kind: QueueErrorKind::NotFound,
+                }),
+                NotFound,
+                None,
+                "Queue #4 not found",
+            ),
+            (
+                GlommioError::ExecutorError(ExecutorErrorKind::InvalidId(7)),
+                InvalidInput,
+                None,
+                "invalid executor id 7",
+            ),
+            (
+                GlommioError::BuilderError(BuilderErrorKind::NonExistentCpus { cpu: 9 }),
+                Other,
+                None,
+                "Executor builder error: Executor builder error: CPU 9 doesn't exist on the host",
+            ),
+            (
+                GlommioError::BuilderError(BuilderErrorKind::InsufficientCpus {
+                    required: 4,
+                    available: 2,
+                }),
+                Other,
+                None,
+                "Executor builder error: Executor builder error: found 2 of 4 required CPUs",
+            ),
+            (
+                GlommioError::BuilderError(BuilderErrorKind::NrShards {
+                    minimum: 1,
+                    shards: 0,
+                }),
+                Other,
+                None,
+                "Executor builder error: Executor builder error: requested 0 shards but a \
+                 minimum of 1 is required",
+            ),
+            (
+                GlommioError::BuilderError(BuilderErrorKind::ThreadPanic(Box::new("boom"))),
+                Other,
+                None,
+                "Executor builder error: Executor builder error: thread panicked",
+            ),
+            (
+                GlommioError::Closed(ResourceType::Semaphore {
+                    requested: 1,
+                    available: 0,
+                }),
+                BrokenPipe,
+                None,
+                "Semaphore is closed (requested: 1, available: 0)",
+            ),
+            (
+                GlommioError::Closed(ResourceType::RwLock),
+                BrokenPipe,
+                None,
+                "RwLock is closed",
+            ),
+            (
+                GlommioError::Closed(ResourceType::Channel(())),
+                BrokenPipe,
+                None,
+                "Channel is closed",
+            ),
+            (
+                GlommioError::Closed(ResourceType::File("closed file".to_string())),
+                BrokenPipe,
+                None,
+                "File is closed (closed file)",
+            ),
+            (
+                GlommioError::Closed(ResourceType::Gate),
+                BrokenPipe,
+                None,
+                "Gate is closed",
+            ),
+            (
+                GlommioError::CanNotBeClosed(ResourceType::Gate, "still in use"),
+                BrokenPipe,
+                None,
+                "Can not be closed because certain conditions are not satisfied. still in use",
+            ),
+            (
+                GlommioError::WouldBlock(ResourceType::Semaphore {
+                    requested: 5,
+                    available: 2,
+                }),
+                WouldBlock,
+                None,
+                "Semaphore operation would block (requested: 5, available: 2)",
+            ),
+            (
+                GlommioError::WouldBlock(ResourceType::RwLock),
+                WouldBlock,
+                None,
+                "RwLock operation would block",
+            ),
+            (
+                GlommioError::WouldBlock(ResourceType::Channel(())),
+                WouldBlock,
+                None,
+                "Channel operation would block",
+            ),
+            (
+                GlommioError::WouldBlock(ResourceType::File("blocking file".to_string())),
+                WouldBlock,
+                None,
+                "File operation would block (blocking file)",
+            ),
+            (
+                GlommioError::WouldBlock(ResourceType::Gate),
+                WouldBlock,
+                None,
+                "Gate operation would block",
+            ),
+            (
+                GlommioError::ReactorError(ReactorErrorKind::IncorrectSourceType(
+                    "Timeout".to_string(),
+                )),
+                InvalidData,
+                None,
+                "IncorrectSourceType \"Timeout\"",
+            ),
+            (
+                GlommioError::ReactorError(ReactorErrorKind::MemLockLimit(1, 2)),
+                Other,
+                None,
+                "MemLockLimit(1/2)",
+            ),
+            (
+                GlommioError::TimedOut(Duration::from_millis(1500)),
+                TimedOut,
+                None,
+                "timed out after 1.5s",
+            ),
+        ];
+        for (err, kind, errno, message) in cases {
+            assert_eq!(converted(err), (kind, errno, message.to_string()));
+        }
+    }
+
+    /// Pins current behaviour, not intended behaviour: the conversion keeps
+    /// the source's kind and the enhanced message but drops its raw OS error,
+    /// so `?` from a glommio file op into `io::Result` loses the errno.
+    /// Changing that alters what `Display` or `source()` returns, which waits
+    /// on a decision; until then this test fails if the shape moves by
+    /// accident.
+    #[test]
+    fn an_enhanced_io_error_keeps_its_kind_and_message_but_not_its_errno() {
+        let err = GlommioError::create_enhanced(
+            io::Error::from_raw_os_error(2),
+            "Opening",
+            Some(PathBuf::from("/no/such/file")),
+            Some(3),
+        );
+        assert_eq!(
+            converted(err),
+            (
+                io::ErrorKind::NotFound,
+                None,
+                "No such file or directory (os error 2), op: Opening path: \
+                 Some(\"/no/such/file\") with fd: Some(3)"
+                    .to_string()
+            )
+        );
     }
 
     #[test]

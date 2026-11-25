@@ -552,6 +552,11 @@ impl UdpSocket {
     /// })
     /// ```
     ///
+    /// Whether the socket is connected is remembered once it has been seen
+    /// to be, so a disconnect made directly on the raw descriptor (a `connect`
+    /// to `AF_UNSPEC`) is not noticed: receiving then takes datagrams from
+    /// any sender instead of failing.
+    ///
     /// [`connect`]: UdpSocket::connect
     pub async fn peek(&self, buf: &mut [u8]) -> Result<usize> {
         self.ensure_connected()?;
@@ -627,6 +632,11 @@ impl UdpSocket {
     ///     assert_eq!(sz, 1);
     /// })
     /// ```
+    ///
+    /// Whether the socket is connected is remembered once it has been seen
+    /// to be, so a disconnect made directly on the raw descriptor (a `connect`
+    /// to `AF_UNSPEC`) is not noticed: receiving then takes datagrams from
+    /// any sender instead of failing.
     ///
     /// [`connect`]: UdpSocket::connect
     pub async fn recv(&self, buf: &mut [u8]) -> Result<usize> {

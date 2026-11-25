@@ -518,15 +518,19 @@ impl<V: IoVec + Unpin, S: Stream<Item = (ScheduledSource, ReadManyArgs<V>)> + Un
 {
     type Item = super::Result<(V, ReadResult)>;
 
+    /// Hands out the user reads carved from the current system read, and lets
+    /// go of it with the last one, so its buffer lives only as long as the
+    /// results that point into it.
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if let Some((source, args, read)) = &mut self.current {
             if let Some(io) = args.user_reads.pop_front() {
                 let offset = (io.pos() - args.system_read.pos()) as usize;
                 let len = read.saturating_sub(offset).min(io.size());
-                return Poll::Ready(Some(Ok((
-                    io,
-                    ReadResult::from_sliced_buffer(source.clone(), offset, len),
-                ))));
+                let result = ReadResult::from_sliced_buffer(source.clone(), offset, len);
+                if args.user_reads.is_empty() {
+                    self.current = None;
+                }
+                return Poll::Ready(Some(Ok((io, result))));
             }
         }
 
@@ -884,6 +888,37 @@ mod tests {
                 )
                 .with_concurrency(1);
             assert_size_hint_holds(held, 16).await;
+            file.close_rc().await.unwrap();
+        });
+    }
+
+    /// Once the last read carved out of a system read is handed out, the
+    /// stream lets go of its buffer: a later read of the same range finds
+    /// nothing in flight to reuse.
+    #[test]
+    fn a_spent_system_read_is_released_by_the_stream() {
+        test_executor!(async move {
+            let file = a_file_of(4096).await;
+            file.attach_scheduler();
+            let mut reads = file.read_many(
+                stream::iter((0..4u64).map(|i| (i * 512, 512usize))),
+                MergedBufferLimit::DeviceMaxSingleRequest,
+                ReadAmplificationLimit::NoAmplification,
+            );
+            for _ in 0..4 {
+                drop(reads.next().await.unwrap().unwrap());
+            }
+            let deduped = || {
+                crate::executor()
+                    .io_stats()
+                    .all_rings()
+                    .file_deduped_reads()
+                    .0
+            };
+            let before = deduped();
+            file.read_at(0, 512).await.unwrap();
+            assert_eq!(deduped(), before, "the stream still holds its last read");
+            drop(reads);
             file.close_rc().await.unwrap();
         });
     }

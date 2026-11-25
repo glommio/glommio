@@ -981,6 +981,47 @@ mod tests {
         });
     }
 
+    #[test]
+    fn a_connected_udp_peek_times_out_on_a_silent_peer() {
+        test_executor!(async move {
+            let (receiver, _silent) = connected_pair!();
+            receiver
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let peek = crate::timer::timeout(Duration::from_secs(2), async {
+                Ok(receiver.peek(&mut [0u8; 8]).await)
+            })
+            .await
+            .expect("the peek timeout never fired");
+            assert_eq!(
+                io::Error::from(peek.unwrap_err()).kind(),
+                io::ErrorKind::TimedOut
+            );
+        });
+    }
+
+    /// Peeks a queued datagram twice, through the direct syscall and then
+    /// through the ring, and `recv` still finds it afterwards.
+    #[test]
+    fn a_udp_peek_leaves_a_queued_datagram_for_recv() {
+        test_executor!(async move {
+            let (receiver, sender) = connected_pair!();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            sender.send(b"msg1").await.unwrap();
+            for yolo in [true, false] {
+                receiver.socket.rx_yolo.set(yolo);
+                let mut buf = [0u8; 8];
+                assert_eq!(receiver.peek(&mut buf).await.unwrap(), 4);
+                assert_eq!(&buf[..4], b"msg1");
+            }
+            let mut buf = [0u8; 8];
+            assert_eq!(receiver.recv(&mut buf).await.unwrap(), 4);
+            assert_eq!(&buf[..4], b"msg1");
+        });
+    }
+
     /// Sends first and then receive, so will hit the nonblocking path.
     #[test]
     fn peekfrom_non_blocking() {

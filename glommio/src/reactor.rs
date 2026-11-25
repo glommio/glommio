@@ -528,13 +528,14 @@ impl Reactor {
         &self,
         fd: RawFd,
         size: usize,
+        flags: MsgFlags,
         timeout: Option<Duration>,
     ) -> io::Result<Source> {
         let source = self.new_source(fd, SourceType::SockRecv(None), None);
         if let Some(timeout) = timeout {
             source.set_timeout(timeout);
         }
-        self.sys.recv(&source, size, MsgFlags::empty());
+        self.sys.recv(&source, size, flags);
         self.rush_dispatch(&source)?;
         Ok(source)
     }

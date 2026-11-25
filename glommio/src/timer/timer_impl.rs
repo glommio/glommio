@@ -392,8 +392,17 @@ impl<T: 'static> TimerActionOnce<T> {
         action: impl Future<Output = T> + 'static,
         tq: TaskQueueHandle,
     ) -> Result<TimerActionOnce<T>> {
+        Self::spawn_after(Timer::new(when), action, tq)
+    }
+
+    /// Spawns `action` into `tq` behind `timer`, which already holds the
+    /// deadline, so the clock is read at most once.
+    fn spawn_after(
+        timer: Timer,
+        action: impl Future<Output = T> + 'static,
+        tq: TaskQueueHandle,
+    ) -> Result<TimerActionOnce<T>> {
         let reactor = crate::executor().reactor();
-        let timer = Timer::new(when);
         let inner = timer.inner.clone();
 
         let task = crate::spawn_local_into(
@@ -490,15 +499,7 @@ impl<T: 'static> TimerActionOnce<T> {
         action: impl Future<Output = T> + 'static,
         tq: TaskQueueHandle,
     ) -> Result<TimerActionOnce<T>> {
-        let now = Instant::now();
-        let dur = {
-            if when > now {
-                when.duration_since(now)
-            } else {
-                Duration::from_micros(0)
-            }
-        };
-        Self::do_in_into(dur, action, tq)
+        Self::spawn_after(Timer::at(when), action, tq)
     }
 
     /// Cancel an existing [`TimerActionOnce`] and waits for it to return
@@ -643,15 +644,7 @@ impl<T: 'static> TimerActionOnce<T> {
     /// [`TimerActionOnce`]: struct.TimerActionOnce.html
     /// [`Instant`]: https://doc.rust-lang.org/std/time/struct.Instant.html
     pub fn rearm_at(&self, when: Instant) {
-        let now = Instant::now();
-        let dur = {
-            if when > now {
-                when.duration_since(now)
-            } else {
-                Duration::from_micros(0)
-            }
-        };
-        self.rearm_in(dur);
+        self.inner.borrow_mut().reset(Some(when));
     }
 }
 
@@ -978,6 +971,29 @@ mod test {
             action.rearm_in(Duration::MAX);
             assert!(!crate::executor().reactor().timer_exists(registered));
             assert!(action.inner.borrow().id.is_none());
+            action.destroy();
+        });
+    }
+
+    /// An action set or rearmed for an instant keeps that instant as its
+    /// deadline, past or future, rather than one rebuilt from a second read
+    /// of the clock.
+    #[test]
+    fn an_action_at_an_instant_keeps_that_instant_as_its_deadline() {
+        test_executor!(async move {
+            let past = Instant::now() - Duration::from_millis(1);
+            let future = Instant::now() + Duration::from_secs(60);
+
+            let action = TimerActionOnce::do_at(future, async {});
+            assert_eq!(action.inner.borrow().when, Some(future));
+            action.rearm_at(past);
+            assert_eq!(action.inner.borrow().when, Some(past));
+            action.join().await.unwrap();
+
+            let action = TimerActionOnce::do_at(past, async {});
+            assert_eq!(action.inner.borrow().when, Some(past));
+            action.rearm_at(future);
+            assert_eq!(action.inner.borrow().when, Some(future));
             action.destroy();
         });
     }

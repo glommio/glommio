@@ -321,11 +321,11 @@ impl<T: core::fmt::Debug> core::fmt::Debug for glommio::channels::local_channel:
 pub fn glommio::channels::local_channel::LocalReceiver<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::ops::drop::Drop for glommio::channels::local_channel::LocalReceiver<T>
 pub fn glommio::channels::local_channel::LocalReceiver<T>::drop(&mut self)
-impl<T> !core::marker::Freeze for glommio::channels::local_channel::LocalReceiver<T>
+impl<T> core::marker::Freeze for glommio::channels::local_channel::LocalReceiver<T>
 impl<T> !core::marker::Send for glommio::channels::local_channel::LocalReceiver<T>
 impl<T> !core::marker::Sync for glommio::channels::local_channel::LocalReceiver<T>
-impl<T> !core::marker::Unpin for glommio::channels::local_channel::LocalReceiver<T>
-impl<T> !core::marker::UnsafeUnpin for glommio::channels::local_channel::LocalReceiver<T>
+impl<T> core::marker::Unpin for glommio::channels::local_channel::LocalReceiver<T>
+impl<T> core::marker::UnsafeUnpin for glommio::channels::local_channel::LocalReceiver<T>
 impl<T> !core::panic::unwind_safe::RefUnwindSafe for glommio::channels::local_channel::LocalReceiver<T>
 impl<T> !core::panic::unwind_safe::UnwindSafe for glommio::channels::local_channel::LocalReceiver<T>
 impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::channels::local_channel::LocalReceiver<T> where ST: ?core::marker::Sized, DT: ?core::marker::Sized

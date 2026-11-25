@@ -61,7 +61,6 @@ pub struct LocalSender<T> {
 /// [`StreamExt`]: https://docs.rs/futures/0.3.6/futures/stream/trait.StreamExt.html
 pub struct LocalReceiver<T> {
     channel: LocalChannel<T>,
-    _node: WaiterNode,
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
@@ -425,17 +424,7 @@ impl<T> LocalChannel<T> {
             LocalSender {
                 channel: channel.clone(),
             },
-            LocalReceiver {
-                channel,
-                _node: WaiterNode {
-                    waker: RefCell::new(None),
-                    link: LinkedListLink::new(),
-                    kind: RefCell::new(None),
-                    woken: Cell::new(false),
-
-                    _p: PhantomPinned,
-                },
-            },
+            LocalReceiver { channel },
         )
     }
 }
@@ -1205,5 +1194,18 @@ mod test {
         );
         assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
         assert_eq!(receiver.try_recv(), Ok(1));
+    }
+
+    /// The receiver is a handle to the shared channel and nothing more:
+    /// `recv` and `stream` bring their own waiter nodes, so the receiver
+    /// carries none and need not be pinned.
+    #[test]
+    fn a_receiver_is_one_pointer_and_unpin() {
+        fn unpin<T: Unpin>() {}
+        unpin::<LocalReceiver<u64>>();
+        assert_eq!(
+            std::mem::size_of::<LocalReceiver<u64>>(),
+            std::mem::size_of::<usize>()
+        );
     }
 }

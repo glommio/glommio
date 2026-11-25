@@ -226,6 +226,8 @@ struct State {
     queued_writers: u32,
 
     waiters_queue: LinkedList<WaiterAdapter>,
+    /// Set only by `close`, which refuses while any guard is live, so no
+    /// guard ever sees it set.
     closed: bool,
 }
 
@@ -416,15 +418,12 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
         let mut state = self.rw.state.borrow_mut();
+        debug_assert!(!state.closed && state.readers > 0);
+        state.readers -= 1;
 
-        if !state.closed {
-            debug_assert!(state.readers > 0);
-            state.readers -= 1;
-
-            let wakers = RwLock::<T>::wake_up_fibers(&mut state);
-            drop(state);
-            wake_all(wakers);
-        }
+        let wakers = RwLock::<T>::wake_up_fibers(&mut state);
+        drop(state);
+        wake_all(wakers);
     }
 }
 
@@ -453,12 +452,6 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let state = self.rw.state.borrow();
-
-        if state.closed {
-            panic!("Related RwLock is already closed");
-        }
-
         self.value_ref.as_mut().unwrap()
     }
 }
@@ -466,15 +459,12 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
         let mut state = self.rw.state.borrow_mut();
+        debug_assert!(!state.closed && state.writers > 0);
+        state.writers -= 1;
 
-        if !state.closed {
-            debug_assert!(state.writers > 0);
-            state.writers -= 1;
-
-            let wakers = RwLock::<T>::wake_up_fibers(&mut state);
-            drop(state);
-            wake_all(wakers);
-        }
+        let wakers = RwLock::<T>::wake_up_fibers(&mut state);
+        drop(state);
+        wake_all(wakers);
     }
 }
 
@@ -1258,6 +1248,22 @@ mod test {
             })
             .await;
         });
+    }
+
+    /// `close` refuses while a writer holds the lock, so a write guard can
+    /// never see the lock closed and writing through it has no reason to look
+    /// at the lock state at all.
+    #[test]
+    fn writing_through_a_guard_does_not_touch_the_lock_state() {
+        let rw = RwLock::new(1);
+        let mut guard = rw.try_write().unwrap();
+        assert!(rw.close().is_err());
+        {
+            let _state = rw.state.borrow_mut();
+            *guard += 1;
+        }
+        drop(guard);
+        assert_eq!(*rw.try_write().unwrap(), 2);
     }
 
     #[test]

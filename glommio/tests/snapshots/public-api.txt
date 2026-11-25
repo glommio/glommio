@@ -5142,6 +5142,7 @@ pub async fn glommio::sync::Semaphore::acquire_permit(&self, units: u64) -> glom
 pub async fn glommio::sync::Semaphore::acquire_static_permit(self: &alloc::rc::Rc<Self>, units: u64) -> glommio::Result<glommio::sync::StaticPermit, ()>
 pub fn glommio::sync::Semaphore::available(&self) -> u64
 pub fn glommio::sync::Semaphore::close(&self)
+pub fn glommio::sync::Semaphore::is_closed(&self) -> bool
 pub fn glommio::sync::Semaphore::new(avail: u64) -> glommio::sync::Semaphore
 pub fn glommio::sync::Semaphore::signal(&self, units: u64)
 pub fn glommio::sync::Semaphore::try_acquire(&self, units: u64) -> glommio::Result<bool, ()>

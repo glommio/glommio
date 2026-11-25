@@ -3,7 +3,7 @@
 //!
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
-use super::{datagram::GlommioDatagram, stream::GlommioStream};
+use super::{datagram::GlommioDatagram, stream::GlommioStream, ImmediateAccepts};
 use crate::{
     net::stream::{Buffered, NonBuffered, Preallocated, RxBuf},
     reactor::Reactor,
@@ -89,6 +89,7 @@ fn bind_address(path: &Path) -> io::Result<socket2::SockAddr> {
 pub struct UnixListener {
     reactor: Weak<Reactor>,
     listener: net::UnixListener,
+    immediate: ImmediateAccepts,
 }
 
 impl AsRawFd for UnixListener {
@@ -143,6 +144,7 @@ impl UnixListener {
         Ok(UnixListener {
             reactor: Rc::downgrade(&crate::executor().reactor()),
             listener,
+            immediate: Default::default(),
         })
     }
 
@@ -177,6 +179,9 @@ impl UnixListener {
     /// [`TcpListener`]: crate::net::TcpListener
     pub async fn shared_accept(&self) -> Result<AcceptedUnixStream> {
         let reactor = self.reactor.upgrade().unwrap();
+        if let Some(fd) = self.immediate.accept(&reactor, self.listener.as_fd()) {
+            return Ok(AcceptedUnixStream { fd: fd? });
+        }
         let source = reactor.accept(self.listener.as_raw_fd());
         let fd = source.collect_fd().await?;
         Ok(AcceptedUnixStream { fd: fd as RawFd })
@@ -1568,6 +1573,35 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(peer.read(&mut [0u8; 8]).await.unwrap(), 0);
+        });
+    }
+
+    /// A connection already queued is accepted on the first poll, without
+    /// waiting for the ring, and is closed on exec like one accepted
+    /// through it. The preempt timer is long, since a preemption due would
+    /// send the accept to the ring.
+    #[test]
+    fn a_queued_unix_connection_is_accepted_without_the_ring() {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+            .preempt_timer(Duration::from_secs(10))
+            .make()
+            .unwrap();
+        ex.run(async move {
+            let td = make_tmp_test_directory("uds-queued-accept");
+            let path = td.path.join("listener");
+            let listener = UnixListener::bind(&path).unwrap();
+            let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let stream = futures_lite::future::poll_once(listener.accept())
+                .await
+                .expect("the accept waited for the ring")
+                .unwrap();
+            let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed on the accepted socket");
+            assert_eq!(
+                flags & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC,
+                "the accepted socket leaks across exec"
+            );
         });
     }
 

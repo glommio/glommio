@@ -156,8 +156,11 @@ pub use self::{
 
 #[cfg(test)]
 mod test {
-    use super::{TcpListener, UnixStream};
-    use crate::{timer::Timer, GlommioError, LocalExecutor, LocalExecutorBuilder, Placement};
+    use super::{TcpListener, UnixListener, UnixStream, IMMEDIATE_ACCEPT_BATCH};
+    use crate::{
+        test_utils::make_tmp_test_directory, timer::Timer, GlommioError, LocalExecutor,
+        LocalExecutorBuilder, Placement,
+    };
     use futures_lite::io::{AsyncWrite, AsyncWriteExt};
     use rusty_fork::rusty_fork_test;
     use std::{
@@ -312,6 +315,127 @@ mod test {
         });
     }
 
+    /// An accept loop on a listener that never runs dry still lets other
+    /// tasks run, within one batch of immediate accepts. The loop queues each
+    /// connection itself before accepting it, so every accept finds one
+    /// waiting. The other task yields once first: a spawned task is polled at
+    /// once, and would otherwise be done before the loop starts.
+    #[test]
+    fn a_unix_accept_loop_that_never_runs_dry_lets_other_tasks_run() {
+        never_preempted().run(async {
+            let td = make_tmp_test_directory("uds-accept-flood");
+            let path = td.path.join("listener");
+            let listener = UnixListener::bind(&path).unwrap();
+            let ran = Rc::new(Cell::new(false));
+            let other = crate::spawn_local({
+                let ran = ran.clone();
+                async move {
+                    futures_lite::future::yield_now().await;
+                    ran.set(true);
+                }
+            })
+            .detach();
+            let start = Instant::now();
+            let mut accepted = 0u64;
+            while !ran.get() && start.elapsed() < Duration::from_secs(5) {
+                let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                drop(listener.accept().await.unwrap());
+                accepted += 1;
+            }
+            drop(other);
+            assert!(accepted > 0, "the other task ran before the loop");
+            assert!(
+                ran.get(),
+                "{accepted} accepts in {:?} and the other task never ran",
+                start.elapsed()
+            );
+            assert!(
+                accepted <= u64::from(IMMEDIATE_ACCEPT_BATCH) + 1,
+                "the other task waited for {accepted} accepts"
+            );
+        });
+    }
+
+    fn assert_a_connection_is_queued(listener: &UnixListener) {
+        let mut pfd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(listener),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut pfd, 1, 0) },
+            1,
+            "no connection is queued"
+        );
+    }
+
+    /// A listener that always has a connection queued goes through the ring
+    /// once after every full batch of immediate accepts, and then starts a
+    /// new batch rather than staying on the ring.
+    #[test]
+    fn a_unix_listener_takes_the_ring_once_per_batch() {
+        never_preempted().run(async {
+            let td = make_tmp_test_directory("uds-accept-batches");
+            let path = td.path.join("listener");
+            let listener = UnixListener::bind(&path).unwrap();
+            let mut through_the_ring = Vec::new();
+            for i in 0..200 {
+                let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                assert_a_connection_is_queued(&listener);
+                let accept = listener.accept();
+                futures_lite::pin!(accept);
+                match futures_lite::future::poll_once(&mut accept).await {
+                    Some(stream) => drop(stream.unwrap()),
+                    None => {
+                        through_the_ring.push(i);
+                        accept.await.unwrap();
+                    }
+                }
+            }
+            let batch = IMMEDIATE_ACCEPT_BATCH as usize;
+            let expected: Vec<_> = (batch..200).step_by(batch + 1).collect();
+            assert_eq!(through_the_ring, expected);
+        });
+    }
+
+    /// An accept that finds nothing queued goes through the ring and starts
+    /// a new batch, so a full batch of immediate accepts follows it.
+    #[test]
+    fn a_unix_accept_that_would_block_starts_a_new_batch() {
+        never_preempted().run(async {
+            let td = make_tmp_test_directory("uds-accept-would-block");
+            let path = td.path.join("listener");
+            let listener = UnixListener::bind(&path).unwrap();
+            let accept_immediately = |i: u32| {
+                let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+                assert_a_connection_is_queued(&listener);
+                let accept = futures_lite::future::poll_once(listener.accept());
+                async move {
+                    assert!(
+                        accept.await.is_some(),
+                        "accept {i} of the batch went through the ring"
+                    );
+                }
+            };
+            for i in 0..IMMEDIATE_ACCEPT_BATCH - 1 {
+                accept_immediately(i).await;
+            }
+
+            let accept = listener.accept();
+            futures_lite::pin!(accept);
+            assert!(
+                futures_lite::future::poll_once(&mut accept).await.is_none(),
+                "an accept with nothing queued completed"
+            );
+            let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            accept.await.unwrap();
+
+            for i in 0..IMMEDIATE_ACCEPT_BATCH {
+                accept_immediately(i).await;
+            }
+        });
+    }
+
     rusty_fork_test! {
         /// An accept loop that keeps failing with `EMFILE` still lets the
         /// task that would free a descriptor run, although each accept fails
@@ -321,6 +445,18 @@ mod test {
             never_preempted().run(async {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                accept_once_a_descriptor_is_freed(|| listener.accept()).await;
+            });
+        }
+
+        /// The Unix listener accepts without the ring as well.
+        #[test]
+        fn a_unix_accept_loop_out_of_descriptors_lets_other_tasks_run() {
+            never_preempted().run(async {
+                let td = make_tmp_test_directory("uds-accept-emfile");
+                let path = td.path.join("listener");
+                let listener = UnixListener::bind(&path).unwrap();
+                let _client = std::os::unix::net::UnixStream::connect(&path).unwrap();
                 accept_once_a_descriptor_is_freed(|| listener.accept()).await;
             });
         }

@@ -3028,7 +3028,7 @@ impl std::os::fd::owned::AsFd for glommio::net::UnixListener
 pub fn glommio::net::UnixListener::as_fd(&self) -> std::os::fd::owned::BorrowedFd<'_>
 impl std::os::fd::raw::AsRawFd for glommio::net::UnixListener
 pub fn glommio::net::UnixListener::as_raw_fd(&self) -> std::os::fd::raw::RawFd
-impl core::marker::Freeze for glommio::net::UnixListener
+impl !core::marker::Freeze for glommio::net::UnixListener
 impl !core::marker::Send for glommio::net::UnixListener
 impl !core::marker::Sync for glommio::net::UnixListener
 impl core::marker::Unpin for glommio::net::UnixListener

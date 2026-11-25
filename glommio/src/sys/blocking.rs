@@ -301,7 +301,7 @@ impl BlockingThreadPool {
     ///
     /// Neither the table nor the source is borrowed while its waiters are
     /// woken, so a waker that polls its future on the spot can read the
-    /// result and send the next request.
+    /// result.
     pub(super) fn flush(&self) -> usize {
         let mut woke = 0;
         for x in self.rx.try_iter() {
@@ -400,12 +400,15 @@ mod tests {
 
     rusty_fork_test! {
         /// A waker that polls its future on the spot when the response
-        /// arrives reads the result and sends the next request, so neither
-        /// the source nor the pool's table may be borrowed while it wakes.
-        /// Forked, since a waker woken under the source's borrow aborted
-        /// the process.
+        /// arrives reads the result and pushes the next request into the
+        /// pool, so neither the source nor the pool's table may be borrowed
+        /// while it wakes. The push here is the pool's own; a blocking call
+        /// made through the reactor also creates a source, which needs an
+        /// executing task queue, and there is none during the reactor's
+        /// pass. Forked, since a waker woken under the source's borrow
+        /// aborted the process.
         #[test]
-        fn a_waiter_polled_inside_its_wake_reads_the_result_and_sends_again() {
+        fn a_waiter_polled_inside_its_wake_reads_the_result_and_pushes_again() {
             let pool = Rc::new(pool());
             let first = source();
             futures_lite::future::block_on(
@@ -431,7 +434,7 @@ mod tests {
 
             wait_for_response(&pool);
             assert!(pool.flush() >= 1);
-            assert!(done.get(), "the woken waiter did not get to send again");
+            assert!(done.get(), "the woken waiter did not get to push again");
         }
     }
 }

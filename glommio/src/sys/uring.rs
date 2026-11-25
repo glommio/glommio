@@ -1772,6 +1772,11 @@ impl SleepableRing {
     /// The read targets the eventfd source's own buffer, which the
     /// `SourceMap` keeps alive until the completion is reaped. The
     /// `is_full()` check above means the push cannot fail.
+    ///
+    /// Once pushed, the read is installed whether or not the submit here
+    /// succeeds: an entry the kernel did not take stays in the ring and goes
+    /// out with the next submit, and the ring cannot sleep until it has.
+    /// Calling it uninstalled would queue a second read into the same buffer.
     fn install_eventfd(&mut self, eventfd_src: &Source) -> bool {
         if !self.ring.submission().is_full() {
             let op = UringDescriptor {
@@ -1810,12 +1815,11 @@ impl SleepableRing {
             }
 
             match &mut *eventfd_src.source_type_mut() {
-                SourceType::ForeignNotifier(_, installed) => {
-                    *installed = self.submit_sqes().is_ok();
-                    *installed
-                }
+                SourceType::ForeignNotifier(_, installed) => *installed = true,
                 _ => unreachable!("Expected ForeignNotifier source type"),
             }
+            let _ = self.submit_sqes();
+            true
         } else {
             false
         }
@@ -4196,6 +4200,30 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the reactor panicked, or slept without its timer");
         assert!(!slept.unwrap());
+    }
+
+    /// A read the kernel did not take stays in the ring and goes out with the
+    /// next submit, so installing again must not queue a second read into the
+    /// same buffer.
+    #[test]
+    fn an_eventfd_read_the_kernel_did_not_take_is_not_queued_twice() {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        sys::test_support::fail_next_submit("latency", libc::EBUSY);
+        let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
+        assert!(
+            sys::test_support::take_submit_failure("latency").is_none(),
+            "the install did not submit"
+        );
+        let reads = || {
+            let mut ring = reactor.latency_ring.borrow_mut();
+            (ring.waiting_kernel_submission(), ring.in_kernel())
+        };
+        reactor.install_eventfd();
+        assert_eq!(reads(), (1, 0), "(queued, in kernel)");
+        reactor.wait(|| None, None, false, 0, || 0).unwrap();
+        assert_eq!(reads(), (0, 1), "(queued, in kernel)");
+        assert!(reactor.eventfd_src.is_installed().unwrap());
     }
 
     /// Every input the decision can be given, and the property that has to

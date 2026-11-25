@@ -492,4 +492,28 @@ mod cache_domain_tests {
             "the index that parsed still decides"
         );
     }
+
+    /// A malformed `shared_cpu_list` used to make the list iterator repeat its
+    /// error forever, so the `min` over its successes never returned. The
+    /// lookup runs on a thread with a deadline so that failure shows as an
+    /// assertion rather than a hung test run.
+    #[test]
+    fn a_malformed_shared_cpu_list_does_not_hang_the_lookup() {
+        let sysfs = FakeSysfs::new();
+        sysfs
+            .cache(0, 0, "2", "Unified", "0-1")
+            .cache(0, 1, "3", "Unified", "0,-3");
+
+        let root = sysfs.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(get_cache_domain_id(&root, 0));
+        });
+
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(Some(0)),
+            "the lookup returns, using the cpus listed before the error"
+        );
+    }
 }

@@ -24,6 +24,7 @@ use std::{
     os::{
         fd::{AsFd, BorrowedFd},
         unix::{
+            ffi::OsStrExt,
             io::{AsRawFd, FromRawFd, RawFd},
             net::{self, SocketAddr},
         },
@@ -36,6 +37,18 @@ use std::{
 };
 
 use crate::Result;
+
+/// Refuses a socket path holding a NUL anywhere but first, as a file path
+/// holding one is refused. The kernel ends such a path at its first NUL, so
+/// it would bind a different file. A leading NUL names a Linux abstract
+/// address instead, whose name is as long as the address says and may hold
+/// any byte.
+fn refuse_interior_nul(path: &Path) -> io::Result<()> {
+    match path.as_os_str().as_bytes() {
+        [0, ..] => Ok(()),
+        _ => crate::sys::source::NativePath::try_from(path).map(drop),
+    }
+}
 
 #[derive(Debug)]
 /// A Unix socket server, listening for connections.
@@ -111,6 +124,7 @@ impl UnixListener {
     /// });
     /// ```
     pub fn bind<A: AsRef<Path>>(addr: A) -> Result<UnixListener> {
+        refuse_interior_nul(addr.as_ref())?;
         let sk = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         let addr = socket2::SockAddr::unix(addr.as_ref())?;
 
@@ -818,6 +832,7 @@ impl UnixDatagram {
     /// });
     /// ```
     pub fn bind<A: AsRef<Path>>(addr: A) -> Result<UnixDatagram> {
+        refuse_interior_nul(addr.as_ref())?;
         let sk = Socket::new(Domain::UNIX, Type::DGRAM, None)?;
         let addr = socket2::SockAddr::unix(addr.as_ref())?;
         sk.bind(&addr)?;
@@ -1555,6 +1570,102 @@ mod tests {
             let accepted = listener.shared_accept().await.unwrap();
             assert!(accepted.peer_addr().unwrap().is_unnamed());
             accepted.bind_to_executor();
+        });
+    }
+
+    fn kind(err: crate::GlommioError<()>) -> io::ErrorKind {
+        io::Error::from(err).kind()
+    }
+
+    /// The kernel ends a socket path at its first NUL, so binding `lis\0ten`
+    /// would create `lis`. The bind is refused instead, as a file open is.
+    #[test]
+    fn a_listener_refuses_a_path_with_an_interior_nul() {
+        test_executor!(async move {
+            let td = make_tmp_test_directory("uds-listener-nul");
+            let err = UnixListener::bind(td.path.join("lis\0ten")).unwrap_err();
+            assert_eq!(kind(err), io::ErrorKind::InvalidInput);
+            assert!(!td.path.join("lis").exists(), "bound the truncated path");
+        });
+    }
+
+    /// As for a listener, a datagram bind would otherwise create the file
+    /// named by the path up to its first NUL.
+    #[test]
+    fn a_datagram_bind_refuses_a_path_with_an_interior_nul() {
+        test_executor!(async move {
+            let td = make_tmp_test_directory("uds-dgram-nul");
+            let err = UnixDatagram::bind(td.path.join("dg\0ram")).unwrap_err();
+            assert_eq!(kind(err), io::ErrorKind::InvalidInput);
+            assert!(!td.path.join("dg").exists(), "bound the truncated path");
+        });
+    }
+
+    /// A listener sits at the truncated path, so a connect that cut the name
+    /// short would reach it.
+    #[test]
+    fn a_stream_connect_refuses_a_path_with_an_interior_nul() {
+        test_executor!(async move {
+            let td = make_tmp_test_directory("uds-connect-nul");
+            let _listener = UnixListener::bind(td.path.join("lis")).unwrap();
+            let err = UnixStream::connect(td.path.join("lis\0ten"))
+                .await
+                .unwrap_err();
+            assert_eq!(kind(err), io::ErrorKind::InvalidInput);
+        });
+    }
+
+    /// A socket sits at the truncated path, so a connect that cut the name
+    /// short would reach it.
+    #[test]
+    fn a_datagram_connect_refuses_a_path_with_an_interior_nul() {
+        test_executor!(async move {
+            let td = make_tmp_test_directory("uds-dgram-connect-nul");
+            let _receiver = UnixDatagram::bind(td.path.join("dg")).unwrap();
+            let sender = UnixDatagram::unbound().unwrap();
+            let err = sender.connect(td.path.join("dg\0ram")).await.unwrap_err();
+            assert_eq!(kind(err), io::ErrorKind::InvalidInput);
+        });
+    }
+
+    /// A socket sits at the truncated path, so a send that cut the name
+    /// short would deliver to it.
+    #[test]
+    fn a_datagram_send_to_refuses_a_path_with_an_interior_nul() {
+        test_executor!(async move {
+            let td = make_tmp_test_directory("uds-send-to-nul");
+            let _receiver = UnixDatagram::bind(td.path.join("dg")).unwrap();
+            let sender = UnixDatagram::unbound().unwrap();
+            let err = sender
+                .send_to(b"x", td.path.join("dg\0ram"))
+                .await
+                .unwrap_err();
+            assert_eq!(kind(err), io::ErrorKind::InvalidInput);
+        });
+    }
+
+    /// A leading NUL names a Linux abstract address rather than a file. Its
+    /// name is as long as the address says, so a NUL inside it is kept and
+    /// nothing is cut short.
+    #[test]
+    fn a_leading_nul_still_binds_an_abstract_address() {
+        use std::os::linux::net::SocketAddrExt;
+
+        test_executor!(async move {
+            let name = format!("glommio-abstract\0{}", std::process::id());
+            let path = format!("\0{name}");
+
+            let listener = UnixListener::bind(format!("{path}-stream")).unwrap();
+            assert_eq!(
+                listener.local_addr().unwrap().as_abstract_name(),
+                Some(format!("{name}-stream").as_bytes())
+            );
+
+            let socket = UnixDatagram::bind(format!("{path}-dgram")).unwrap();
+            assert_eq!(
+                socket.local_addr().unwrap().as_abstract_name(),
+                Some(format!("{name}-dgram").as_bytes())
+            );
         });
     }
 }

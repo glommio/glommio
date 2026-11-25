@@ -2584,11 +2584,16 @@ impl ExecutorProxy {
     /// ex.join().unwrap();
     /// ```
     ///
+    /// Outside of a glommio context (no executor is installed on the thread)
+    /// there is nothing to preempt, and this returns `false`.
+    ///
     /// [`RefMut`]: https://doc.rust-lang.org/std/cell/struct.RefMut.html
     #[inline(always)]
     pub fn need_preempt(&self) -> bool {
         #[cfg(any(not(nightly), not(feature = "native-tls")))]
-        return LOCAL_EX.with(|local_ex| local_ex.need_preempt());
+        return LOCAL_EX
+            .try_with(|local_ex| local_ex.need_preempt())
+            .unwrap_or(false);
 
         #[cfg(all(nightly, feature = "native-tls"))]
         return unsafe {
@@ -3512,6 +3517,11 @@ mod test {
             }
             await_eventfd_count(initial_eventfds, "after 100 rounds");
         }
+    }
+
+    #[test]
+    fn need_preempt_outside_an_executor_is_false() {
+        assert!(!executor().need_preempt());
     }
 
     #[test]

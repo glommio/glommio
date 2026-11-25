@@ -374,12 +374,6 @@ pub(crate) struct NonBufferedStream<S> {
 }
 
 impl<S: AsRawFd> NonBufferedStream<S> {
-    fn init(&mut self) {
-        let reactor = self.reactor.upgrade().unwrap();
-        let stream_fd = self.stream.as_raw_fd();
-        self.source_rx = Some(reactor.poll_read_ready(stream_fd));
-    }
-
     pub(crate) fn try_peek(&self, buf: &mut [u8]) -> Option<io::Result<usize>> {
         super::yolo_peek(self.stream.as_raw_fd(), buf)
     }
@@ -547,7 +541,7 @@ where
 {
     fn from(socket: socket2::Socket) -> Self {
         let reactor = crate::executor().reactor();
-        let mut stream = NonBufferedStream {
+        let stream = NonBufferedStream {
             reactor: Rc::downgrade(&reactor),
             stream: socket.into(),
             source_tx: None,
@@ -555,7 +549,6 @@ where
             write_timeout: Timeout::new(),
             read_timeout: Timeout::new(),
         };
-        stream.init();
         GlommioStream {
             stream,
             rx_buf: NonBuffered,

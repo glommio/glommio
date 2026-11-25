@@ -2372,4 +2372,72 @@ mod tests {
         ex2.join().unwrap();
         ex3.join().unwrap();
     }
+
+    /// Blocks in `poll(2)` until `fd` is readable, which waits for data to
+    /// arrive without giving the reactor a pass.
+    fn wait_readable(fd: RawFd) {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pollfd, 1, 5000) };
+        assert_eq!(ready, 1, "no data arrived within five seconds");
+    }
+
+    /// Data the peer sent before the first read is there to take at once.
+    /// A stream that armed a readiness poll when it was built waited for the
+    /// reactor to complete that poll instead, a full pass later.
+    #[test]
+    fn a_new_stream_reads_waiting_data_on_its_first_poll() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut server = listener.accept().await.unwrap();
+
+            client.write_all(b"ping").await.unwrap();
+            wait_readable(server.as_raw_fd());
+            let mut buf = [0u8; 4];
+            let read = futures_lite::future::poll_once(server.read(&mut buf)).await;
+            assert_eq!(
+                read.expect("the accepted stream waited for a reactor pass")
+                    .unwrap(),
+                4
+            );
+
+            server.write_all(b"pong").await.unwrap();
+            wait_readable(client.as_raw_fd());
+            let read = futures_lite::future::poll_once(client.read(&mut buf)).await;
+            assert_eq!(
+                read.expect("the connected stream waited for a reactor pass")
+                    .unwrap(),
+                4
+            );
+        });
+    }
+
+    /// A buffered stream hands a read at least as large as its buffer
+    /// straight to the socket, which must not wait on a poll armed at
+    /// construction either.
+    #[test]
+    fn a_new_buffered_stream_reads_large_on_its_first_poll() {
+        test_executor!(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut server = listener.accept().await.unwrap().buffered();
+            assert!(!server.multishot_armed());
+
+            client.write_all(b"ping").await.unwrap();
+            wait_readable(server.as_raw_fd());
+            let mut buf = vec![0u8; Preallocated::DEFAULT_BUFFER_SIZE];
+            let read = futures_lite::future::poll_once(server.read(&mut buf)).await;
+            assert_eq!(
+                read.expect("the buffered stream waited for a reactor pass")
+                    .unwrap(),
+                4
+            );
+        });
+    }
 }

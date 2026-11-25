@@ -360,9 +360,10 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
     /// any, and replace it with a new one from the underlying stream.
     ///
     /// When we have a source with a result in the buffer, we take it out and
-    /// replace it with a new one from the stream, if any, to keep the buffer
-    /// full. When we have a source in the buffer but it's not ready yet, we
-    /// register the buffer and return.
+    /// replace it with a new one from the stream, if any and if the buffer
+    /// is not full without it, so the memory limit holds after small reads
+    /// give way to large ones. When we have a source in the buffer but it's
+    /// not ready yet, we register the buffer and return.
     ///
     /// When the internal buffer is full, we consume it instead of creating
     /// new ones. Otherwise fill the internal buffer as much as possible, and
@@ -386,10 +387,10 @@ impl<U: IoVec + Unpin, S: Stream<Item = (ScheduledSource, U)> + Unpin> Stream
         let poll_buffer = |this: &mut Self, cx: &mut Context<'_>| {
             if this.inflight.back_mut().unwrap().0.result().is_some() {
                 let ret = this.inflight.pop_back().unwrap();
-                if !this.terminated {
+                this.inflight_memory -= ret.1.size();
+                if !this.terminated && !this.is_full() {
                     let _ = poll_inner(this, cx);
                 }
-                this.inflight_memory -= ret.1.size();
                 Poll::Ready(Some(ret))
             } else {
                 this.inflight
@@ -770,6 +771,57 @@ mod tests {
                     ((0, 256), (0, 256)),
                 ]
             );
+        });
+    }
+
+    /// A temporary file of `bytes` bytes, a multiple of the `O_DIRECT`
+    /// alignment.
+    async fn a_file_of(bytes: usize) -> Rc<DmaFile> {
+        let file = crate::io::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .tmpfile(true)
+            .dma_open(std::env::temp_dir())
+            .await
+            .unwrap();
+        let mut buf = file.alloc_dma_buffer(bytes);
+        buf.as_bytes_mut().fill(7);
+        file.write_at(buf, 0).await.unwrap();
+        Rc::new(file)
+    }
+
+    /// A read returned to the caller is replaced only while the reads still
+    /// in flight are under the memory limit, so small reads giving way to
+    /// large ones do not carry the stream past it.
+    #[test]
+    fn replacing_returned_reads_keeps_to_the_memory_limit() {
+        test_executor!(async move {
+            const SMALL: usize = 4096;
+            const LARGE: usize = 65536;
+            const CAP: usize = 65536;
+            let file = a_file_of(32 * SMALL + 32 * LARGE).await;
+            let small = (0..32u64).map(|i| (i * SMALL as u64, SMALL));
+            let large = (0..32u64).map(|i| (32 * SMALL as u64 + i * LARGE as u64, LARGE));
+            let mut reads = file
+                .read_many(
+                    stream::iter(small.chain(large)),
+                    MergedBufferLimit::NoMerging,
+                    ReadAmplificationLimit::NoAmplification,
+                )
+                .with_memory_limit(Some(CAP));
+            let mut most = 0;
+            let mut yielded = 0;
+            while let Some(read) = reads.next().await {
+                read.unwrap();
+                yielded += 1;
+                most = most.max(reads.inner.inflight_memory);
+            }
+            assert_eq!(yielded, 64);
+            assert!(
+                most <= CAP + LARGE,
+                "{most} bytes in flight against a limit of {CAP}"
+            );
+            file.close_rc().await.unwrap();
         });
     }
 

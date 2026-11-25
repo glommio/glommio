@@ -4881,7 +4881,8 @@ mod tests {
         /// A request the kernel cancels for want of an io-wq worker has no
         /// linked timeout, so it reports the kernel's `ECANCELED`, not a
         /// timeout. Opening with `O_CREAT` is always punted to io-wq. Forked,
-        /// since the thread limit and the user are per process.
+        /// since the thread limit and the user are per process. Kernels before
+        /// 5.15 may not cancel such work, and the test expects one that does.
         #[test]
         fn a_request_the_kernel_cancels_without_a_timeout_reports_ecanceled() {
             let path = std::env::temp_dir().join(format!(

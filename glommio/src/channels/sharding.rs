@@ -8,6 +8,7 @@ use futures_lite::{Future, Stream, StreamExt};
 
 use crate::{
     channels::channel_mesh::{FullMesh, Senders},
+    sync::Gate,
     task::JoinHandle,
     GlommioError, ResourceType, Result,
 };
@@ -28,9 +29,10 @@ pub trait Handler<T>: Clone {
 /// The public interface for sharding
 pub struct Sharded<T: Send, H> {
     shard: Rc<Shard<T, H>>,
-    consumers: Vec<JoinHandle<()>>,
+    /// Holds a pass per stream still being consumed, so `close` can wait for
+    /// them without keeping anything for the streams that have finished.
+    consumers: Gate,
     forward_tasks: Vec<JoinHandle<()>>,
-    closed: bool,
 }
 
 impl<T: Send, H> Debug for Sharded<T, H> {
@@ -71,9 +73,8 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
 
         Ok(Self {
             shard,
-            consumers: Vec::new(),
+            consumers: Gate::new(),
             forward_tasks,
-            closed: false,
         })
     }
 
@@ -94,14 +95,16 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     ///
     /// [`GlommioError::Closed`]: crate::GlommioError::Closed
     pub fn handle<S: Stream<Item = T> + Unpin + 'static>(&mut self, messages: S) -> Result<(), S> {
-        if self.closed {
-            Err(GlommioError::Closed(ResourceType::Channel(messages)))
-        } else {
-            let shard = self.shard.clone();
-            let consumer = crate::spawn_local(async move { shard.handle(messages).await }).detach();
-            self.consumers.push(consumer);
-            Ok(())
-        }
+        let Ok(pass) = self.consumers.enter() else {
+            return Err(GlommioError::Closed(ResourceType::Channel(messages)));
+        };
+        let shard = self.shard.clone();
+        crate::spawn_local(async move {
+            shard.handle(messages).await;
+            drop(pass);
+        })
+        .detach();
+        Ok(())
     }
 
     /// Sends an individual message to a given shard.
@@ -114,6 +117,9 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     /// [`GlommioError::Closed`]: crate::GlommioError::Closed
     /// [`InvalidInput`]: std::io::ErrorKind::InvalidInput
     pub async fn send_to(&self, dst_shard: usize, message: T) -> Result<(), T> {
+        if !self.consumers.is_open() {
+            return Err(GlommioError::Closed(ResourceType::Channel(message)));
+        }
         self.shard.send_to(dst_shard, message).await
     }
 
@@ -127,7 +133,14 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     ///
     /// [`GlommioError::Closed`]: crate::GlommioError::Closed
     pub async fn send(&self, message: T) -> Result<(), T> {
-        self.shard.send(message).await
+        let dst_shard = (self.shard.shard_fn)(&message, self.shard.nr_shards);
+        self.send_to(dst_shard, message).await
+    }
+
+    /// How many consumer streams `close` would still wait for.
+    #[cfg(test)]
+    fn tracked_consumers(&self) -> usize {
+        self.consumers.passes()
     }
 
     /// Close this [`Sharded`] and wait for all existing background tasks to
@@ -136,10 +149,7 @@ impl<T: Send + 'static, H: Handler<T> + 'static> Sharded<T, H> {
     /// will not be rejected. So it would be important to truncate the streams
     /// from upstream before calling this method to prevent it from hanging.
     pub async fn close(&mut self) {
-        self.closed = true;
-        while let Some(consumer) = self.consumers.pop() {
-            consumer.await;
-        }
+        let _ = self.consumers.close().await;
 
         self.shard.close();
 
@@ -377,5 +387,93 @@ mod test {
         leaving.join().unwrap();
         gone_tx.send(()).unwrap();
         staying.join().unwrap();
+    }
+
+    /// Counts the messages it is handed.
+    #[derive(Clone, Default)]
+    struct Count(Rc<std::cell::Cell<usize>>);
+
+    impl Handler<u32> for Count {
+        fn handle(&self, _msg: u32, _src: usize, _cur: usize) -> HandlerResult {
+            self.0.set(self.0.get() + 1);
+            Box::pin(async {})
+        }
+    }
+
+    #[test]
+    fn a_closed_sharded_refuses_its_own_shard_like_any_other() {
+        let mesh = MeshBuilder::full(2, 4);
+        let shards: Vec<_> = (0..2)
+            .map(|_| {
+                let mesh = mesh.clone();
+                LocalExecutorBuilder::default()
+                    .spawn(move || async move {
+                        let count = Count::default();
+                        let mut sharded =
+                            Sharded::new(mesh, to_other, count.clone()).await.unwrap();
+                        sharded.close().await;
+                        for dst in 0..2u32 {
+                            let refused = sharded.send_to(dst as usize, dst).await;
+                            assert!(
+                                matches!(
+                                    refused,
+                                    Err(GlommioError::Closed(ResourceType::Channel(m))) if m == dst
+                                ),
+                                "send_to({dst}) after close: {refused:?}"
+                            );
+                            let refused = sharded.send(dst).await;
+                            assert!(
+                                matches!(
+                                    refused,
+                                    Err(GlommioError::Closed(ResourceType::Channel(m))) if m == dst
+                                ),
+                                "send({dst}) after close: {refused:?}"
+                            );
+                        }
+                        assert_eq!(count.0.get(), 0);
+                    })
+                    .unwrap()
+            })
+            .collect();
+        for shard in shards {
+            shard.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn finished_streams_leave_nothing_behind() {
+        test_executor!(async move {
+            let count = Count::default();
+            let mesh = MeshBuilder::full(1, 4);
+            let mut sharded = Sharded::new(mesh, to_other, count.clone()).await.unwrap();
+            for _ in 0..100 {
+                sharded
+                    .handle(futures_lite::stream::iter(vec![0u32]))
+                    .unwrap();
+            }
+            while count.0.get() < 100 {
+                futures_lite::future::yield_now().await;
+            }
+            assert_eq!(sharded.tracked_consumers(), 0);
+            sharded.close().await;
+        });
+    }
+
+    #[test]
+    fn close_waits_for_a_stream_still_being_handled() {
+        test_executor!(async move {
+            let count = Count::default();
+            let mesh = MeshBuilder::full(1, 4);
+            let mut sharded = Sharded::new(mesh, to_other, count.clone()).await.unwrap();
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            sharded.handle(rx).unwrap();
+            crate::spawn_local(async move {
+                sleep(Duration::from_millis(10)).await;
+                tx.unbounded_send(0u32).unwrap();
+            })
+            .detach();
+            sharded.close().await;
+            assert_eq!(count.0.get(), 1);
+        });
     }
 }

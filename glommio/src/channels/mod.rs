@@ -320,7 +320,35 @@ pub mod channel_mesh;
 /// ```
 pub mod sharding;
 
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
+
+/// Why a `try_recv` returned no item.
+///
+/// Returned by [`LocalReceiver::try_recv`] and [`ConnectedReceiver::try_recv`].
+/// The two cases call for different action: an empty channel may still yield
+/// items later, a closed one never will.
+///
+/// [`LocalReceiver::try_recv`]: local_channel::LocalReceiver::try_recv
+/// [`ConnectedReceiver::try_recv`]: shared_channel::ConnectedReceiver::try_recv
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryRecvError {
+    /// Nothing is queued right now, but the sender is still there and may
+    /// send more.
+    Empty,
+    /// The sender is gone and everything it sent has been received.
+    Closed,
+}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TryRecvError::Empty => "receiving on an empty channel",
+            TryRecvError::Closed => "receiving on a closed channel",
+        })
+    }
+}
+
+impl std::error::Error for TryRecvError {}
 
 #[derive(Debug)]
 /// Establishes the capacity of this channel.

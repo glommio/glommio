@@ -316,6 +316,7 @@ pub struct glommio::channels::local_channel::LocalReceiver<T>
 impl<T> glommio::channels::local_channel::LocalReceiver<T>
 pub async fn glommio::channels::local_channel::LocalReceiver<T>::recv(&self) -> core::option::Option<T>
 pub fn glommio::channels::local_channel::LocalReceiver<T>::stream(&self) -> impl futures_core::stream::Stream<Item = T> + '_
+pub fn glommio::channels::local_channel::LocalReceiver<T>::try_recv(&self) -> core::result::Result<T, glommio::channels::TryRecvError>
 impl<T: core::fmt::Debug> core::fmt::Debug for glommio::channels::local_channel::LocalReceiver<T>
 pub fn glommio::channels::local_channel::LocalReceiver<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T> core::ops::drop::Drop for glommio::channels::local_channel::LocalReceiver<T>
@@ -457,6 +458,7 @@ pub mod glommio::channels::shared_channel
 pub struct glommio::channels::shared_channel::ConnectedReceiver<T: core::marker::Send + core::marker::Sized>
 impl<T: core::marker::Send + core::marker::Sized> glommio::channels::shared_channel::ConnectedReceiver<T>
 pub async fn glommio::channels::shared_channel::ConnectedReceiver<T>::recv(&self) -> core::option::Option<T>
+pub fn glommio::channels::shared_channel::ConnectedReceiver<T>::try_recv(&self) -> core::result::Result<T, glommio::channels::TryRecvError>
 impl<T: core::marker::Send + core::marker::Sized> core::fmt::Debug for glommio::channels::shared_channel::ConnectedReceiver<T>
 pub fn glommio::channels::shared_channel::ConnectedReceiver<T>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<T: core::marker::Send + core::marker::Sized> core::ops::drop::Drop for glommio::channels::shared_channel::ConnectedReceiver<T>
@@ -720,6 +722,64 @@ impl<T> tracing::instrument::Instrument for glommio::channels::spsc_queue::Produ
 impl<T> tracing::instrument::WithSubscriber for glommio::channels::spsc_queue::Producer<T>
 impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::channels::spsc_queue::Producer<T> where T: ?core::marker::Sized
 pub fn glommio::channels::spsc_queue::make<T: core::marker::Send>(capacity: usize) -> (glommio::channels::spsc_queue::Producer<T>, glommio::channels::spsc_queue::Consumer<T>)
+pub enum glommio::channels::TryRecvError
+pub glommio::channels::TryRecvError::Closed
+pub glommio::channels::TryRecvError::Empty
+impl core::clone::Clone for glommio::channels::TryRecvError
+pub fn glommio::channels::TryRecvError::clone(&self) -> glommio::channels::TryRecvError
+impl core::cmp::Eq for glommio::channels::TryRecvError
+impl core::cmp::PartialEq for glommio::channels::TryRecvError
+pub fn glommio::channels::TryRecvError::eq(&self, other: &glommio::channels::TryRecvError) -> bool
+impl core::error::Error for glommio::channels::TryRecvError
+impl core::fmt::Debug for glommio::channels::TryRecvError
+pub fn glommio::channels::TryRecvError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for glommio::channels::TryRecvError
+pub fn glommio::channels::TryRecvError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for glommio::channels::TryRecvError
+impl core::marker::StructuralPartialEq for glommio::channels::TryRecvError
+impl core::marker::Freeze for glommio::channels::TryRecvError
+impl core::marker::Send for glommio::channels::TryRecvError
+impl core::marker::Sync for glommio::channels::TryRecvError
+impl core::marker::Unpin for glommio::channels::TryRecvError
+impl core::marker::UnsafeUnpin for glommio::channels::TryRecvError
+impl core::panic::unwind_safe::RefUnwindSafe for glommio::channels::TryRecvError
+impl core::panic::unwind_safe::UnwindSafe for glommio::channels::TryRecvError
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for glommio::channels::TryRecvError where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for glommio::channels::TryRecvError where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for glommio::channels::TryRecvError where U: core::convert::From<T>
+pub fn glommio::channels::TryRecvError::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for glommio::channels::TryRecvError where U: core::convert::Into<T>
+pub type glommio::channels::TryRecvError::Error = core::convert::Infallible
+pub fn glommio::channels::TryRecvError::try_from(value: U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for glommio::channels::TryRecvError where U: core::convert::TryFrom<T>
+pub type glommio::channels::TryRecvError::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn glommio::channels::TryRecvError::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for glommio::channels::TryRecvError where T: core::clone::Clone
+pub type glommio::channels::TryRecvError::Owned = T
+pub fn glommio::channels::TryRecvError::clone_into(&self, target: &mut T)
+pub fn glommio::channels::TryRecvError::to_owned(&self) -> T
+impl<T> alloc::string::ToString for glommio::channels::TryRecvError where T: core::fmt::Display + ?core::marker::Sized
+pub fn glommio::channels::TryRecvError::to_string(&self) -> alloc::string::String
+impl<T> core::any::Any for glommio::channels::TryRecvError where T: 'static + ?core::marker::Sized
+pub fn glommio::channels::TryRecvError::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for glommio::channels::TryRecvError where T: ?core::marker::Sized
+pub fn glommio::channels::TryRecvError::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for glommio::channels::TryRecvError where T: ?core::marker::Sized
+pub fn glommio::channels::TryRecvError::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for glommio::channels::TryRecvError where T: core::clone::Clone
+pub unsafe fn glommio::channels::TryRecvError::clone_to_uninit(&self, dest: *mut u8)
+impl<T> core::convert::From<T> for glommio::channels::TryRecvError
+pub fn glommio::channels::TryRecvError::from(t: T) -> T
+impl<T> crossbeam_epoch::atomic::Pointable for glommio::channels::TryRecvError
+pub type glommio::channels::TryRecvError::Init = T
+pub const glommio::channels::TryRecvError::ALIGN: usize
+pub unsafe fn glommio::channels::TryRecvError::deref<'a>(ptr: usize) -> &'a T
+pub unsafe fn glommio::channels::TryRecvError::deref_mut<'a>(ptr: usize) -> &'a mut T
+pub unsafe fn glommio::channels::TryRecvError::drop(ptr: usize)
+pub unsafe fn glommio::channels::TryRecvError::init(init: <T as crossbeam_epoch::atomic::Pointable>::Init) -> usize
+impl<T> tracing::instrument::Instrument for glommio::channels::TryRecvError
+impl<T> tracing::instrument::WithSubscriber for glommio::channels::TryRecvError
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for glommio::channels::TryRecvError where T: ?core::marker::Sized
 pub mod glommio::controllers
 pub enum glommio::controllers::ControllerStatus
 pub glommio::controllers::ControllerStatus::Disabled(usize)

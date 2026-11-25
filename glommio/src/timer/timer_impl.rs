@@ -925,8 +925,14 @@ mod test {
     fn destroying_a_forever_action_releases_its_waker() {
         test_executor!(async move {
             let action = TimerActionOnce::do_in(Duration::MAX, async {});
-            crate::timer::sleep(Duration::from_millis(10)).await;
-            assert!(action.inner.borrow().parked.is_some());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while action.inner.borrow().parked.is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the action's task never parked on its forever timer"
+                );
+                crate::executor().yield_now().await;
+            }
             action.destroy();
             assert!(action.inner.borrow().parked.is_none());
             action.rearm_in(Duration::from_secs(60));

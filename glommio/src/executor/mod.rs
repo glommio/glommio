@@ -5035,4 +5035,39 @@ mod test {
             "the second run never finished"
         );
     }
+
+    #[test]
+    fn an_executor_with_a_preempt_timer_of_duration_max_runs_its_tasks() {
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::MAX)
+            .make()
+            .unwrap();
+        let out = ex.run(async {
+            sleep(Duration::from_millis(1)).await;
+            crate::spawn_local(async { 7 }).await
+        });
+        assert_eq!(out, 7);
+    }
+
+    #[test]
+    fn a_task_queue_with_latency_of_duration_max_runs_its_tasks() {
+        let ex = LocalExecutor::default();
+        let out = ex.run(async {
+            let tq = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::MAX),
+                "forever",
+            );
+            crate::spawn_local_into(
+                async {
+                    sleep(Duration::from_millis(1)).await;
+                    7
+                },
+                tq,
+            )
+            .unwrap()
+            .await
+        });
+        assert_eq!(out, 7);
+    }
 }

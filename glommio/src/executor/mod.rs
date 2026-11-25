@@ -1459,7 +1459,9 @@ pub struct LocalExecutorConfig {
 #[derive(Debug)]
 pub struct LocalExecutor {
     context: ExecutorContext,
-    stall_detector: RefCell<Option<StallDetector>>,
+    /// Shared so a queue run can hold the detector without borrowing this
+    /// cell, which a task replaces through [`LocalExecutor::detect_stalls`].
+    stall_detector: RefCell<Option<Rc<StallDetector>>>,
 }
 
 /// What a pass over the task queues left behind.
@@ -1553,7 +1555,7 @@ impl LocalExecutor {
             stall_detector: RefCell::new(
                 config
                     .detect_stalls
-                    .map(|x| StallDetector::new(id, x))
+                    .map(|x| StallDetector::new(id, x).map(Rc::new))
                     .transpose()?,
             ),
         })
@@ -1574,7 +1576,7 @@ impl LocalExecutor {
     ) -> Result<()> {
         self.stall_detector.replace(
             handler
-                .map(|x| StallDetector::new(self.context.id, x))
+                .map(|x| StallDetector::new(self.context.id, x).map(Rc::new))
                 .transpose()?,
         );
         Ok(())
@@ -1721,7 +1723,7 @@ impl LocalExecutor {
         };
 
         let (runtime, tasks_executed_this_loop) = {
-            let detector = self.stall_detector.borrow();
+            let detector = self.stall_detector.borrow().clone();
             let guard = detector.as_ref().map(|x| {
                 let queue = queue.borrow_mut();
                 x.enter_task_queue(
@@ -4964,5 +4966,17 @@ mod test {
         #[cfg(all(nightly, feature = "native-tls"))]
 
         assert!(unsafe { LOCAL_EX.is_null() });
+    }
+
+    #[test]
+    fn a_task_can_toggle_stall_detection_on_its_own_executor() {
+        let ex = LocalExecutor::default();
+        ex.run(async {
+            ex.detect_stalls(Some(Box::new(stall::DefaultStallDetectionHandler {})))
+                .unwrap();
+            crate::executor().yield_task_queue_now().await;
+            ex.detect_stalls(None).unwrap();
+            crate::executor().yield_task_queue_now().await;
+        });
     }
 }

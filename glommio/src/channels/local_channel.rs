@@ -10,6 +10,7 @@ use crate::{
 use futures_lite::{stream::Stream, Future};
 use std::{
     cell::{Cell, RefCell},
+    panic::AssertUnwindSafe,
     pin::Pin,
     rc::Rc,
     task::{Context, Poll, Waker},
@@ -601,15 +602,20 @@ fn wake_first(ws: &mut Option<LinkedList<WaiterAdapter>>) -> Option<Waker> {
 /// time. Each is unlinked before it is woken, and woken only once the state
 /// is no longer borrowed, so a waker that polls its future on the spot finds
 /// the channel usable and its waiter out of the list.
+///
+/// A waker that panics does not stop the drain: the first panic is passed on
+/// once the list is empty, so no waiter is left linked to a channel that is
+/// going away.
 fn wake_up_all<T>(
     state: &RefCell<State<T>>,
     waiters: fn(&mut State<T>) -> &mut Option<LinkedList<WaiterAdapter>>,
 ) {
+    let mut panicked = None;
     loop {
         let waker = {
             let mut state = state.borrow_mut();
             let Some(node) = waiters(&mut state).as_mut().and_then(|ws| ws.pop_front()) else {
-                return;
+                break;
             };
             let node = unsafe { node.as_ref() };
             node.waker
@@ -617,7 +623,12 @@ fn wake_up_all<T>(
                 .take()
                 .expect("Future can not be queued without waker")
         };
-        waker.wake();
+        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| waker.wake())) {
+            panicked.get_or_insert(payload);
+        }
+    }
+    if let Some(payload) = panicked {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -1250,6 +1261,35 @@ mod test {
             drop(receiver);
 
             assert_eq!(refused.get(), Some(true), "the sender never saw the receiver go");
+        }
+
+        /// A waker that panics when the sender goes leaves the waiter behind
+        /// it woken and out of the list, and the panic reaches the caller.
+        /// Forked, since a waiter left linked failed the channel's own check
+        /// during the unwind and aborted the process.
+        #[test]
+        fn a_panicking_waker_does_not_strand_the_waiters_behind_it() {
+            struct Panics;
+            impl Wake for Panics {
+                fn wake(self: Arc<Self>) {
+                    panic!("this waker panics");
+                }
+            }
+            let (sender, receiver) = new_unbounded::<u32>();
+            let panics = Waker::from(Arc::new(Panics));
+            let (woken, waker) = flagged();
+            let mut first = Box::pin(receiver.recv());
+            let mut behind = Box::pin(receiver.recv());
+            assert!(first.as_mut().poll(&mut Context::from_waker(&panics)).is_pending());
+            assert!(behind.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+
+            let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(sender)));
+
+            assert!(dropped.is_err(), "the waker's panic was swallowed");
+            assert!(woken.0.load(Ordering::Relaxed), "the second receiver was never woken");
+            let mut cx = Context::from_waker(&waker);
+            assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(None));
+            assert_eq!(behind.as_mut().poll(&mut cx), Poll::Ready(None));
         }
     }
 }

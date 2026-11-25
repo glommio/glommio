@@ -454,6 +454,17 @@ impl<T: 'static> DeadlineQueue<T> {
                         trace!("the caller stopped waiting for its result");
                     }
                 }
+                let removal = crate::spawn_local_into(
+                    async move {
+                        if let Err(err) = crate::executor().remove_task_queue(tq) {
+                            trace!("the deadline queue kept its task queue: {err}");
+                        }
+                    },
+                    TaskQueueHandle::default(),
+                );
+                if let Ok(removal) = removal {
+                    removal.detach();
+                }
             }},
             tq,
         )
@@ -525,6 +536,9 @@ impl<T: 'static> DeadlineQueue<T> {
     }
 
     /// Returns the TaskQueueHandle associated with this controller
+    ///
+    /// The task queue is removed once this controller is dropped and the
+    /// action in flight, if any, has finished.
     pub fn task_queue(&self) -> TaskQueueHandle {
         self.tq
     }
@@ -618,6 +632,33 @@ mod test {
         }
     }
 
+    /// Records that its action ran to completion rather than being dropped.
+    struct Finishes(Rc<Cell<bool>>);
+
+    impl DeadlineSource for Finishes {
+        type Output = u32;
+
+        fn expected_duration(&self) -> Duration {
+            Duration::from_secs(1)
+        }
+
+        fn action(self: Rc<Self>) -> Pin<Box<dyn Future<Output = u32> + 'static>> {
+            Box::pin(async move {
+                crate::timer::sleep(Duration::from_millis(20)).await;
+                self.0.set(true);
+                0
+            })
+        }
+
+        fn total_units(&self) -> u64 {
+            1
+        }
+
+        fn processed_units(&self) -> u64 {
+            0
+        }
+    }
+
     #[test]
     fn an_item_due_at_once_raises_the_shares() {
         let queue = InnerQueue::<u32>::new(Duration::from_millis(250));
@@ -652,6 +693,60 @@ mod test {
                 .push_work(Rc::new(Due(Duration::from_secs(1))))
                 .await
                 .expect("an empty queue refused an earlier deadline");
+        });
+    }
+
+    #[test]
+    fn a_dropped_queue_releases_its_task_queue() {
+        test_executor!(async move {
+            let queue = DeadlineQueue::<u32>::new("released", Duration::from_millis(250));
+            queue
+                .push_work(Rc::new(Due(Duration::from_secs(1))))
+                .await
+                .unwrap();
+            let tq = queue.task_queue();
+            let controller = Rc::downgrade(&queue.queue);
+            drop(queue);
+            for _ in 0..100 {
+                if controller.upgrade().is_none() {
+                    break;
+                }
+                crate::timer::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                controller.upgrade().is_none(),
+                "the controller outlived its queue"
+            );
+            assert!(crate::executor().task_queue_stats(tq).is_err());
+        });
+    }
+
+    #[test]
+    fn a_dropped_queue_finishes_the_action_in_flight() {
+        test_executor!(async move {
+            let queue = DeadlineQueue::<u32>::new("in flight", Duration::from_millis(250));
+            let done = Rc::new(Cell::new(false));
+            let abandoned = crate::timer::timeout(Duration::from_millis(5), async {
+                Ok(queue.push_work(Rc::new(Finishes(done.clone()))).await)
+            })
+            .await;
+            assert!(abandoned.is_err());
+            let controller = Rc::downgrade(&queue.queue);
+            drop(queue);
+            for _ in 0..100 {
+                if controller.upgrade().is_none() {
+                    break;
+                }
+                crate::timer::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(
+                done.get(),
+                "dropping the queue cancelled the action in flight"
+            );
+            assert!(
+                controller.upgrade().is_none(),
+                "the controller outlived its queue"
+            );
         });
     }
 

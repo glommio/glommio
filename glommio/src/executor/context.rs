@@ -2,6 +2,7 @@
 
 use std::{
     cell::RefCell,
+    collections::hash_map::Entry,
     future::Future,
     rc::{Rc, Weak},
 };
@@ -162,6 +163,32 @@ impl ExecutorContext {
             .available_executors
             .insert(index, tq);
         TaskQueueHandle { index }
+    }
+
+    /// The removed queue is dropped after the queues are released: a dynamic
+    /// shares manager it owns may run destructors that reach the executor.
+    pub(super) fn remove_task_queue(&self, handle: TaskQueueHandle) -> Result<()> {
+        let removed = {
+            let mut queues = self.queues.borrow_mut();
+            if queues
+                .active_executing
+                .as_ref()
+                .is_some_and(|queue| queue.borrow().stats.index == handle)
+            {
+                return Err(GlommioError::queue_still_active(handle.index));
+            }
+
+            let queue_entry = queues.available_executors.entry(handle.index);
+            let Entry::Occupied(entry) = queue_entry else {
+                return Err(GlommioError::queue_not_found(handle.index));
+            };
+            if entry.get().borrow().is_active() {
+                return Err(GlommioError::queue_still_active(handle.index));
+            }
+            entry.remove()
+        };
+        drop(removed);
+        Ok(())
     }
 
     pub(super) fn get_queue(&self, handle: &TaskQueueHandle) -> Option<Rc<RefCell<TaskQueue>>> {

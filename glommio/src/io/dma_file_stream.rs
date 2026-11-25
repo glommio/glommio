@@ -831,7 +831,9 @@ impl DmaStreamWriterFlushState {
 #[derive(Debug)]
 struct DmaStreamWriterState {
     buffer_size: usize,
-    waker: Option<Waker>,
+    /// Tasks waiting for a close to finish, woken only once it has, so that
+    /// the buffer writes the close waits on do not wake them early.
+    close_waiters: Vec<Waker>,
     file_status: FileStatus,
     error: Option<io::Error>,
     flush_state: DmaStreamWriterFlushState,
@@ -844,10 +846,12 @@ struct DmaStreamWriterState {
     /// A flush failed, so nothing from its position on can reach the file and
     /// every later operation must fail too, after the first has reported why.
     write_failed: bool,
-    /// Callers waiting for the flushed position to reach a target, woken
-    /// each time a buffer write finishes. A caller cannot always wait on
+    /// Tasks waiting on a buffer write, woken each time one finishes: writes
+    /// waiting for a block or a free buffer, and flushes waiting for the
+    /// flushed position to reach a target. A caller cannot always wait on
     /// the writes themselves: a write's handle can be awaited only once, and
-    /// a concurrent flush or close may hold it.
+    /// a concurrent flush or close may hold it. Each waiter has a place of
+    /// its own, since a writer shared by reference can have several.
     flush_waiters: Vec<Waker>,
 }
 
@@ -875,9 +879,20 @@ macro_rules! ensure_not_closed {
     };
 }
 
+/// Adds `waker` to `waiters` unless a waker for the same task is there.
+fn register_waiter(waiters: &mut Vec<Waker>, waker: &Waker) {
+    if !waiters.iter().any(|w| w.will_wake(waker)) {
+        waiters.push(waker.clone());
+    }
+}
+
 impl DmaStreamWriterState {
-    fn add_waker(&mut self, waker: Waker) {
-        self.waker = Some(waker);
+    fn wait_for_flush(&mut self, cx: &Context<'_>) {
+        register_waiter(&mut self.flush_waiters, cx.waker());
+    }
+
+    fn wait_for_close(&mut self, cx: &Context<'_>) {
+        register_waiter(&mut self.close_waiters, cx.waker());
     }
 
     /// Ready once everything up to `target` is written, or once the stream
@@ -886,9 +901,7 @@ impl DmaStreamWriterState {
         if self.flushed_pos() >= target || self.error.is_some() || self.write_failed {
             return Poll::Ready(());
         }
-        if !self.flush_waiters.iter().any(|w| w.will_wake(cx.waker())) {
-            self.flush_waiters.push(cx.waker().clone());
-        }
+        self.wait_for_flush(cx);
         Poll::Pending
     }
 
@@ -924,10 +937,9 @@ impl DmaStreamWriterState {
             defer! {
                 let mut state = state.borrow_mut();
                 state.file_status = FileStatus::Finished;
-                if let Some(waker) = state.waker.take() {
-                    drop(state);
-                    waker.wake();
-                }
+                let waiters = std::mem::take(&mut state.close_waiters);
+                drop(state);
+                waiters.into_iter().for_each(Waker::wake);
             }
 
             for flush in pending.drain(..) {
@@ -1045,8 +1057,6 @@ impl DmaStreamWriterState {
         true
     }
 
-    /// When the file that is closing registers a waker, we don't want to wake
-    /// it now.
     fn flush_one_buffer(&mut self, buffer: DmaBuffer, state: Rc<RefCell<Self>>, file: Rc<DmaFile>) {
         let aligned_pos = self.aligned_pos;
         let flush_pos = self.current_pos();
@@ -1073,12 +1083,8 @@ impl DmaStreamWriterState {
                 state.flush_state.on_complete(flush_pos);
             }
             let waiters = std::mem::take(&mut state.flush_waiters);
-            let waker = match state.file_status {
-                FileStatus::Open => state.waker.take(),
-                _ => None,
-            };
             drop(state);
-            waiters.into_iter().chain(waker).for_each(Waker::wake);
+            waiters.into_iter().for_each(Waker::wake);
         })
         .detach();
         self.flush_state.on_start(flush_pos, handle);
@@ -1149,7 +1155,7 @@ impl DmaStreamWriter {
             write_behind: builder.write_behind,
             sync_on_close: builder.sync_on_close,
             current_buffer: None,
-            waker: None,
+            close_waiters: Vec::new(),
             flush_state: DmaStreamWriterFlushState::new(builder.write_behind),
             error: None,
             file_status: FileStatus::Open,
@@ -1421,17 +1427,15 @@ impl DmaStreamWriter {
         match state.file_status {
             FileStatus::Open => {
                 let file = ensure_not_closed!(self.file.clone());
-                let displaced = state.waker.take();
-                state.add_waker(cx.waker().clone());
+                let waiting = std::mem::take(&mut state.flush_waiters);
+                state.wait_for_close(cx);
                 state.initiate_close(self.state.clone(), file, false);
                 drop(state);
-                if let Some(waker) = displaced {
-                    waker.wake();
-                }
+                waiting.into_iter().for_each(Waker::wake);
                 Poll::Pending
             }
             FileStatus::Closing => {
-                state.add_waker(cx.waker().clone());
+                state.wait_for_close(cx);
                 Poll::Pending
             }
             FileStatus::Finished => {
@@ -1488,7 +1492,7 @@ impl AsyncWrite for &DmaStreamWriter {
             return Poll::Ready(err);
         }
         if !buf.is_empty() && state.partial_flush_in_flight() {
-            state.add_waker(cx.waker().clone());
+            state.wait_for_flush(cx);
             return Poll::Pending;
         }
 
@@ -1528,7 +1532,7 @@ impl AsyncWrite for &DmaStreamWriter {
         }
 
         if written == 0 && !buf.is_empty() {
-            state.add_waker(cx.waker().clone());
+            state.wait_for_flush(cx);
             Poll::Pending
         } else {
             Poll::Ready(Ok(written))
@@ -1552,7 +1556,7 @@ impl AsyncWrite for &DmaStreamWriter {
         if !matches!(state.file_status, FileStatus::Open) {
             return already_closed!();
         }
-        state.add_waker(cx.waker().clone());
+        state.wait_for_flush(cx);
         state.flush_padded(self.state.clone(), self.file.borrow().clone().unwrap());
         Poll::Pending
     }
@@ -1561,18 +1565,16 @@ impl AsyncWrite for &DmaStreamWriter {
         let mut state = self.state.borrow_mut();
         match state.file_status {
             FileStatus::Open => {
-                let displaced = state.waker.take();
-                state.add_waker(cx.waker().clone());
+                let waiting = std::mem::take(&mut state.flush_waiters);
+                state.wait_for_close(cx);
                 let file = self.file.borrow_mut().take();
                 state.initiate_close(self.state.clone(), file.unwrap(), true);
                 drop(state);
-                if let Some(waker) = displaced {
-                    waker.wake();
-                }
+                waiting.into_iter().for_each(Waker::wake);
                 Poll::Pending
             }
             FileStatus::Closing => {
-                state.add_waker(cx.waker().clone());
+                state.wait_for_close(cx);
                 Poll::Pending
             }
             FileStatus::Finished => {
@@ -2750,6 +2752,109 @@ mod test {
         }
     );
 
+    file_stream_write_test!(
+        two_writers_waiting_on_one_block_both_wake,
+        path,
+        _k,
+        filename,
+        file,
+        {
+            let writer = Rc::new(
+                DmaStreamWriterBuilder::new(file)
+                    .with_buffer_size(4096)
+                    .build(),
+            );
+            (&*writer).write_all(&[1u8; 10]).await.unwrap();
+            {
+                let mut w = &*writer;
+                let mut flush = Box::pin(w.flush());
+                assert!(futures_lite::future::poll_once(&mut flush).await.is_none());
+            }
+            let first = crate::spawn_local(enclose! { (writer) async move {
+                (&*writer).write_all(&[2u8; 5]).await
+            }});
+            let second = crate::spawn_local(enclose! { (writer) async move {
+                (&*writer).write_all(&[2u8; 5]).await
+            }});
+            crate::executor().yield_task_queue_now().await;
+            assert_eq!(
+                writer.current_flushed_pos(),
+                0,
+                "the flush finished too early"
+            );
+
+            crate::timer::timeout(Duration::from_secs(1), async move {
+                second.await.unwrap();
+                first.await.unwrap();
+                Ok(())
+            })
+            .await
+            .expect("a writer waiting beside another was never woken");
+            (&*writer).close().await.unwrap();
+            assert_eq!(file_size(&filename), 20);
+        }
+    );
+
+    file_stream_write_test!(two_flushes_at_once_both_finish, path, _k, filename, file, {
+        let writer = Rc::new(
+            DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build(),
+        );
+        (&*writer).write_all(&[1u8; 10]).await.unwrap();
+        let first = crate::spawn_local(enclose! { (writer) async move {
+            (&*writer).flush().await
+        }});
+        let second = crate::spawn_local(enclose! { (writer) async move {
+            (&*writer).flush().await
+        }});
+        crate::executor().yield_task_queue_now().await;
+        assert_eq!(
+            writer.current_flushed_pos(),
+            0,
+            "the flush finished too early"
+        );
+
+        crate::timer::timeout(Duration::from_secs(1), async move {
+            second.await.unwrap();
+            first.await.unwrap();
+            Ok(())
+        })
+        .await
+        .expect("a flush waiting beside another was never woken");
+        (&*writer).close().await.unwrap();
+        assert_eq!(file_size(&filename), 10);
+    });
+
+    file_stream_write_test!(two_closes_at_once_both_finish, path, _k, filename, file, {
+        let writer = Rc::new(
+            DmaStreamWriterBuilder::new(file)
+                .with_buffer_size(4096)
+                .build(),
+        );
+        (&*writer).write_all(&[1u8; 10]).await.unwrap();
+        let first = crate::spawn_local(enclose! { (writer) async move {
+            (&*writer).close().await
+        }});
+        let second = crate::spawn_local(enclose! { (writer) async move {
+            (&*writer).close().await
+        }});
+        crate::executor().yield_task_queue_now().await;
+        assert!(
+            !matches!(writer.state.borrow().file_status, FileStatus::Finished),
+            "the close finished too early"
+        );
+
+        crate::timer::timeout(Duration::from_secs(1), async move {
+            let results = [second.await, first.await];
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+            Ok(())
+        })
+        .await
+        .expect("a close waiting beside another was never woken");
+        assert_eq!(file_size(&filename), 10);
+    });
+
     thread_local! {
         static WOKEN_STATE: RefCell<Option<Rc<RefCell<DmaStreamWriterState>>>> =
             const { RefCell::new(None) };
@@ -2771,7 +2876,7 @@ mod test {
     }
 
     file_stream_write_test!(
-        close_wakes_a_displaced_waiter_outside_the_borrow,
+        close_wakes_a_waiting_writer_outside_the_borrow,
         path,
         _k,
         filename,

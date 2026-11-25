@@ -245,6 +245,9 @@ impl<'a, T> Waiter<'a, T> {
 
     fn remove_from_waiting_queue(node: Pin<&mut WaiterNode>, rw: &mut State) {
         if node.link.is_linked() {
+            if node.kind == WaiterKind::Writer {
+                rw.queued_writers -= 1;
+            }
             let mut cursor = unsafe {
                 rw.waiters_queue
                     .cursor_mut_from_ptr(node.get_unchecked_mut())
@@ -910,6 +913,9 @@ impl<T> RwLock<T> {
         let mut cursor = rw.waiters_queue.front_mut();
         while !cursor.is_null() {
             let node = unsafe { cursor.remove().unwrap().as_ref() };
+            if node.kind == WaiterKind::Writer {
+                rw.queued_writers -= 1;
+            }
             let waker = node.waker.borrow_mut().take();
             node.woken.set(true);
             wakers.push(waker.expect("Future was linked in waiting list without an a waker"));
@@ -1161,6 +1167,83 @@ mod test {
                 "a waiter was never woken by close"
             );
         }
+    }
+
+    /// The writer count the lock keeps, beside the number of writers
+    /// actually linked in its queue. The two must agree.
+    fn queued_writers<T>(rw: &RwLock<T>) -> (u32, u32) {
+        let state = rw.state.borrow();
+        let linked = state
+            .waiters_queue
+            .iter()
+            .filter(|node| node.kind == WaiterKind::Writer)
+            .count();
+        (state.queued_writers, linked as u32)
+    }
+
+    /// Guards against a writer dropped while queued still being counted
+    /// as queued.
+    #[test]
+    fn a_cancelled_queued_writer_is_no_longer_counted() {
+        let rw = RwLock::new(());
+        let _reading = rw.try_read().unwrap();
+        let mut writer = Box::pin(rw.write());
+        assert!(!ready(writer.as_mut()));
+        assert_eq!(queued_writers(&rw), (1, 1));
+        drop(writer);
+        assert_eq!(queued_writers(&rw), (0, 0));
+    }
+
+    /// Guards against a queued writer that takes the lock before it is
+    /// woken, as a spurious poll from `select!` or `join!` lets it, still
+    /// being counted as queued.
+    #[test]
+    fn a_queued_writer_that_takes_the_lock_unwoken_is_no_longer_counted() {
+        let rw = RwLock::new(());
+        let writing = rw.try_write().unwrap();
+        let mut first = Box::pin(rw.write());
+        let mut second = Box::pin(rw.write());
+        assert!(!ready(first.as_mut()));
+        assert!(!ready(second.as_mut()));
+        drop(writing);
+        assert_eq!(queued_writers(&rw), (1, 1));
+        assert!(ready(second.as_mut()));
+        drop(first);
+        assert_eq!(queued_writers(&rw), (0, 0));
+    }
+
+    /// Guards against the writers a close unlinks still being counted as
+    /// queued.
+    #[test]
+    fn a_writer_queued_at_close_is_no_longer_counted() {
+        let rw = RwLock::new(());
+        let writing = rw.try_write().unwrap();
+        let mut first = Box::pin(rw.write());
+        let mut second = Box::pin(rw.write());
+        assert!(!ready(first.as_mut()));
+        assert!(!ready(second.as_mut()));
+        drop(writing);
+        rw.close().unwrap();
+        assert_eq!(queued_writers(&rw), (0, 0));
+    }
+
+    /// Guards against counting a writer out twice: once when a release
+    /// wakes and unlinks it, and again when it is dropped before it runs.
+    #[test]
+    fn a_woken_writer_dropped_before_it_runs_is_counted_out_once() {
+        let rw = RwLock::new(());
+        let reading = rw.try_read().unwrap();
+        let mut first = Box::pin(rw.write());
+        let mut second = Box::pin(rw.write());
+        assert!(!ready(first.as_mut()));
+        assert!(!ready(second.as_mut()));
+        assert_eq!(queued_writers(&rw), (2, 2));
+        drop(reading);
+        assert_eq!(queued_writers(&rw), (1, 1));
+        drop(first);
+        assert_eq!(queued_writers(&rw), (0, 0));
+        drop(second);
+        assert_eq!(queued_writers(&rw), (0, 0));
     }
 
     #[test]

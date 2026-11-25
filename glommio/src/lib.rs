@@ -212,16 +212,23 @@
 //!
 //! ## Before using Glommio
 //!
-//! Please note an executor checks the `memlock` resource limit (the soft
-//! `RLIMIT_MEMLOCK`) when it is built, and refuses to start if the limit is
-//! below 512 KiB. The error is an I/O error whose message reads
-//! `MemLockLimit(<limit>/<minimum>)`, both in bytes.
+//! The `memlock` resource limit (the soft `RLIMIT_MEMLOCK`) matters to
+//! Glommio in two ways.
+//!
+//! Kernels before 5.12 charge the rings themselves to the limit, and refuse
+//! to build one once it is spent. If that happens while the limit is below
+//! 512 KiB, the executor fails to start with a
+//! [`GlommioError::ReactorError`] holding
+//! [`ReactorErrorKind::MemLockLimit`], which carries the limit and 512 KiB,
+//! both in bytes.
 //! [`LocalExecutorBuilder::make`] returns it, an executor started with
 //! [`LocalExecutorBuilder::spawn`] returns it from
 //! [`ExecutorJoinHandle::join`], and [`LocalExecutor::default`] panics with it.
+//! From 5.12 the rings are charged to the memory cgroup instead, and an
+//! executor starts whatever the limit.
 //!
-//! Passing that check is not enough for full performance. Each executor
-//! registers its I/O memory ([`LocalExecutorBuilder::io_memory`], 10 MiB by
+//! On every kernel the limit decides performance. Each executor registers
+//! its I/O memory ([`LocalExecutorBuilder::io_memory`], 10 MiB by
 //! default) as fixed buffers with three of its rings, and the kernel charges
 //! each registration to the same limit, counted per user across all of the
 //! user's processes. If a registration does not fit, Glommio logs a warning

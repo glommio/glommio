@@ -17,6 +17,7 @@ struct ForeignWakePause {
 thread_local! {
     static FOREIGN_WAKE_PAUSE: RefCell<Option<ForeignWakePause>> = const { RefCell::new(None) };
     static SUBMIT_FAILURE: Cell<Option<(&'static str, i32)>> = const { Cell::new(None) };
+    static RING_SETUP_FAILURE: Cell<Option<i32>> = const { Cell::new(None) };
     static FILE_OPS: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
 }
 
@@ -97,6 +98,21 @@ pub(crate) fn take_submit_failure(ring: &str) -> Option<io::Error> {
         }
         _ => None,
     })
+}
+
+/// Fails this thread's next ring setup with `errno`: the support probe if
+/// it has not passed yet in this process, otherwise the next sleepable ring.
+pub(crate) fn fail_next_ring_setup(errno: i32) {
+    assert!(RING_SETUP_FAILURE
+        .with(|f| f.replace(Some(errno)))
+        .is_none());
+}
+
+/// Takes the failure armed for the next ring setup, if any.
+pub(crate) fn take_ring_setup_failure() -> Option<io::Error> {
+    RING_SETUP_FAILURE
+        .with(|f| f.take())
+        .map(io::Error::from_raw_os_error)
 }
 
 const FS_XFLAG_NODUMP: u32 = 0x00000080;

@@ -46,24 +46,24 @@ is not guaranteed to build on Rust versions earlier than the minimum supported v
 Glommio requires a kernel with a recent enough `io_uring` support, at least current enough to run discovery probes. The
 minimum version at this time is 5.8.
 
-Please also note Glommio requires at least 512 KiB of locked memory for `io_uring` to work. You can increase the
-`memlock` resource limit (rlimit) as follows:
+Please also note the locked memory limit (`memlock`). Kernels before 5.12 charge each `io_uring` to it, and an executor
+needs about 512 KiB of it to start there. On every kernel, each executor registers its I/O memory (10 MiB by
+default) with three of its rings, charged to the same limit; when that does not fit, I/O works without fixed buffers,
+more slowly. See [Before using Glommio](https://docs.rs/glommio/latest/glommio/#before-using-glommio) for the details.
+You can increase the `memlock` resource limit (rlimit) as follows:
 
 ```sh
 $ vi /etc/security/limits.conf
-*    hard    memlock        512
-*    soft    memlock        512
+*    hard    memlock        unlimited
+*    soft    memlock        unlimited
 ```
-
-> Please note that 512 KiB is the minimum needed to spawn a single executor. Spawning multiple executors may require you
-> to raise the limit accordingly.
 
 To make the new limits effective, you need to log in to the machine again. You can verify that the limits are updated by
 running the following:
 
 ```sh
 $ ulimit -l
-512
+unlimited
 ```
 
 ## Version Compatibility

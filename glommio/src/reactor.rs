@@ -166,7 +166,7 @@ impl Reactor {
         record_io_latencies: bool,
         blocking_thread: BlockingThreadPool,
         recv_buffers: crate::executor::RecvBuffers,
-    ) -> io::Result<Reactor> {
+    ) -> crate::Result<Reactor, ()> {
         let sys = sys::Reactor::new(
             notifier,
             io_memory,

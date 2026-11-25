@@ -393,6 +393,10 @@ fn pool_descriptor(fd: RawFd) -> io::Result<OwnedFd> {
 
 /// Checks the kernel implements every opcode glommio submits.
 fn check_supported_operations(ops: &[(&'static str, u8)]) -> Result<(), UringUnsupported> {
+    #[cfg(test)]
+    if let Some(err) = sys::test_support::take_ring_setup_failure() {
+        return Err(UringUnsupported::SetupFailed(err));
+    }
     let ring = io_uring::IoUring::new(1).map_err(UringUnsupported::SetupFailed)?;
 
     let mut probe = io_uring::Probe::new();
@@ -436,6 +440,9 @@ fn is_transient(err: &UringUnsupported) -> bool {
 /// Cached once per process, but only a definitive answer: a probe that failed
 /// for want of a descriptor is tried again.
 ///
+/// A probe refused for memory keeps that kind rather than `Unsupported`, so
+/// the reactor can tell a spent memlock limit apart.
+///
 /// A poisoned lock here carries no state worth protecting: the value behind
 /// it is a cached verdict, and a panicking prober leaves it untouched.
 pub(crate) fn check_uring_support() -> io::Result<()> {
@@ -453,6 +460,9 @@ pub(crate) fn check_uring_support() -> io::Result<()> {
             *cached = Some(Ok(()));
             Ok(())
         }
+        Err(UringUnsupported::SetupFailed(err)) if err.kind() == io::ErrorKind::OutOfMemory => Err(
+            io::Error::new(err.kind(), UringUnsupported::SetupFailed(err).to_string()),
+        ),
         Err(err) => {
             let reason = err.to_string();
             if !is_transient(&err) {
@@ -1622,6 +1632,10 @@ impl SleepableRing {
         cooperative: bool,
     ) -> io::Result<Self> {
         check_uring_support()?;
+        #[cfg(test)]
+        if let Some(err) = sys::test_support::take_ring_setup_failure() {
+            return Err(err);
+        }
         let (ring, cooperative) = match cooperative {
             true => match IoUring::builder()
                 .setup_single_issuer()
@@ -2188,6 +2202,30 @@ impl PreemptObservation {
     }
 }
 
+/// The memlock limit below which a ring refused for memory is blamed on the
+/// limit.
+const MIN_MEMLOCK_LIMIT: u64 = 512 * 1024;
+
+/// Names a low memlock limit as the cause of a ring refused for memory.
+///
+/// Kernels before 5.12 charge the rings themselves to `RLIMIT_MEMLOCK` and
+/// refuse one with a bare `ENOMEM` once it is spent. Later kernels charge
+/// the memory cgroup instead, so the limit is consulted only once setup has
+/// failed, and never stops an executor that could start.
+fn ring_setup_error(err: io::Error) -> GlommioError<()> {
+    if err.kind() == io::ErrorKind::OutOfMemory {
+        if let Ok((limit, _)) = Resource::MEMLOCK.get() {
+            if limit < MIN_MEMLOCK_LIMIT {
+                return GlommioError::ReactorError(ReactorErrorKind::MemLockLimit(
+                    limit,
+                    MIN_MEMLOCK_LIMIT,
+                ));
+            }
+        }
+    }
+    err.into()
+}
+
 impl Reactor {
     /// Creates a new reactor.
     ///
@@ -2202,15 +2240,6 @@ impl Reactor {
         blocking_thread: BlockingThreadPool,
         recv_buffers: crate::executor::RecvBuffers,
     ) -> crate::Result<Reactor, ()> {
-        const MIN_MEMLOCK_LIMIT: u64 = 512 * 1024;
-        let (memlock_limit, _) = Resource::MEMLOCK.get()?;
-        if memlock_limit < MIN_MEMLOCK_LIMIT {
-            return Err(GlommioError::ReactorError(ReactorErrorKind::MemLockLimit(
-                memlock_limit,
-                MIN_MEMLOCK_LIMIT,
-            )));
-        }
-
         let source_map = Rc::new(RefCell::new(SourceMap::default()));
         io_memory = std::cmp::max(align_up(io_memory, 4096), 65536);
 
@@ -2229,15 +2258,18 @@ impl Reactor {
             allocator.clone(),
             source_map.clone(),
             false,
-        )?;
-        let mut poll_ring = PollRing::new(ring_depth, allocator.clone(), source_map.clone())?;
+        )
+        .map_err(ring_setup_error)?;
+        let mut poll_ring = PollRing::new(ring_depth, allocator.clone(), source_map.clone())
+            .map_err(ring_setup_error)?;
         let mut latency_ring = SleepableRing::new(
             ring_depth,
             "latency",
             allocator.clone(),
             source_map.clone(),
             false,
-        )?;
+        )
+        .map_err(ring_setup_error)?;
         let socket_ring = if recv_buffers.count() > 0 {
             let mut socket_ring = SleepableRing::new(
                 ring_depth,
@@ -2245,7 +2277,8 @@ impl Reactor {
                 allocator.clone(),
                 source_map.clone(),
                 true,
-            )?;
+            )
+            .map_err(ring_setup_error)?;
             match ProvidedBuffers::register(
                 &socket_ring.ring,
                 recv_buffers.count(),
@@ -3446,6 +3479,8 @@ impl Drop for Reactor {
 #[cfg(test)]
 mod tests {
     use crate::PoolPlacement;
+    use futures_lite::{AsyncReadExt, AsyncWriteExt};
+    use rusty_fork::rusty_fork_test;
     use std::time::Instant;
 
     use super::*;
@@ -4690,5 +4725,89 @@ mod tests {
         });
 
         ring.submit_one_event(&mut queue.submissions);
+    }
+
+    /// Sets this process's soft memlock limit, leaving the hard limit alone.
+    fn set_soft_memlock_limit(soft: u64) {
+        let (_, hard) = Resource::MEMLOCK.get().unwrap();
+        assert!(
+            soft <= hard,
+            "the hard memlock limit {hard} is below {soft}"
+        );
+        Resource::MEMLOCK.set(soft, hard).unwrap();
+    }
+
+    /// Builds an executor and runs a task on it, so a build that returns is
+    /// known to work.
+    fn build_and_run_an_executor() -> crate::Result<(), ()> {
+        let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound).make()?;
+        assert_eq!(ex.run(async { crate::spawn_local(async { 7 }).await }), 7);
+        Ok(())
+    }
+
+    /// Asserts the build failed on a memlock limit of 64 KiB, and said so.
+    fn assert_memlock_limit_reported(built: crate::Result<(), ()>) {
+        match built {
+            Err(GlommioError::ReactorError(ReactorErrorKind::MemLockLimit(limit, min))) => {
+                assert_eq!((limit, min), (64 * 1024, 512 * 1024));
+            }
+            other => panic!("expected MemLockLimit, got {other:?}"),
+        }
+    }
+
+    rusty_fork_test! {
+        /// 64 KiB is a common default soft limit. Kernels from 5.12 charge
+        /// the rings to the memory cgroup, so nothing stops an executor
+        /// there. Forked, since the limit is per process.
+        #[test]
+        fn an_executor_starts_under_a_64_kib_memlock_limit() {
+            set_soft_memlock_limit(64 * 1024);
+            let ex = crate::LocalExecutorBuilder::new(crate::Placement::Unbound)
+                .make()
+                .unwrap();
+            let echoed = ex.run(async {
+                let (mut a, mut b) = crate::net::UnixStream::pair().unwrap();
+                a.write_all(b"ping").await.unwrap();
+                let mut buf = [0u8; 4];
+                b.read_exact(&mut buf).await.unwrap();
+                buf
+            });
+            assert_eq!(&echoed, b"ping");
+        }
+
+        /// A kernel before 5.12 refuses a ring with a bare `ENOMEM` once the
+        /// memlock limit is spent. Under a low limit the caller is told
+        /// which limit, whichever ring was refused.
+        #[test]
+        fn a_ring_refused_for_memory_under_a_low_memlock_limit_reports_the_limit() {
+            build_and_run_an_executor().unwrap();
+            set_soft_memlock_limit(64 * 1024);
+            sys::test_support::fail_next_ring_setup(libc::ENOMEM);
+            assert_memlock_limit_reported(build_and_run_an_executor());
+        }
+
+        /// The support probe builds the first ring of the process, so on
+        /// such a kernel it is the one refused when the limit is near zero.
+        #[test]
+        fn a_probe_refused_for_memory_under_a_low_memlock_limit_reports_the_limit() {
+            set_soft_memlock_limit(64 * 1024);
+            sys::test_support::fail_next_ring_setup(libc::ENOMEM);
+            assert_memlock_limit_reported(build_and_run_an_executor());
+        }
+
+        /// From 512 KiB up the limit is not what ran out, and the `ENOMEM`
+        /// is reported as it came.
+        #[test]
+        fn a_ring_refused_for_memory_at_512_kib_of_memlock_stays_an_io_error() {
+            build_and_run_an_executor().unwrap();
+            set_soft_memlock_limit(512 * 1024);
+            sys::test_support::fail_next_ring_setup(libc::ENOMEM);
+            match build_and_run_an_executor() {
+                Err(GlommioError::IoError(err)) => {
+                    assert_eq!(err.raw_os_error(), Some(libc::ENOMEM), "{err}");
+                }
+                other => panic!("expected the ENOMEM, got {other:?}"),
+            }
+        }
     }
 }

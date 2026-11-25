@@ -47,7 +47,14 @@ pub struct Fsxattr {
 }
 
 const FS_SETXATTR_MAGIC: u8 = b'X';
+const FS_GETXATTR_TYPE_MODE: u8 = 31;
 const FS_SETXATTR_TYPE_MODE: u8 = 32;
+ioctl_read!(
+    get_fsxattr,
+    FS_SETXATTR_MAGIC,
+    FS_GETXATTR_TYPE_MODE,
+    Fsxattr
+);
 ioctl_write_ptr!(
     set_fsxattr,
     FS_SETXATTR_MAGIC,
@@ -55,15 +62,21 @@ ioctl_write_ptr!(
     Fsxattr
 );
 
+/// The file's current extended attributes, which a set replaces wholesale.
+fn fs_xattr(fd: RawFd) -> nix::Result<Fsxattr> {
+    let mut attr = MaybeUninit::<Fsxattr>::uninit();
+    unsafe {
+        get_fsxattr(fd, attr.as_mut_ptr())?;
+        Ok(attr.assume_init())
+    }
+}
+
+/// Changes only the extent size hint. The set replaces every attribute, so
+/// the others are read first and written back as they were.
 pub(crate) fn fs_hint_extentsize(fd: RawFd, size: usize) -> nix::Result<i32> {
-    let attr = Fsxattr {
-        fsx_xflags: FS_XFLAG_EXTSIZE,
-        fsx_extsize: size as u32,
-        fsx_nextents: 0,
-        fsx_projid: 0,
-        fsx_cowextsize: 0,
-        fsx_pad: 0,
-    };
+    let mut attr = fs_xattr(fd)?;
+    attr.fsx_xflags |= FS_XFLAG_EXTSIZE;
+    attr.fsx_extsize = size as u32;
     unsafe { set_fsxattr(fd, &attr) }
 }
 

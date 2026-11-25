@@ -4,6 +4,7 @@
 use std::{
     cell::{Cell, RefCell},
     io,
+    os::unix::io::RawFd,
     sync::mpsc::{Receiver, Sender},
     time::Duration,
 };
@@ -96,6 +97,23 @@ pub(crate) fn take_submit_failure(ring: &str) -> Option<io::Error> {
         }
         _ => None,
     })
+}
+
+const FS_XFLAG_NODUMP: u32 = 0x00000080;
+
+/// Sets the NODUMP flag and the project id through the same attributes an
+/// extent size hint writes, leaving the rest as they were.
+pub(crate) fn mark_nodump_in_project(fd: RawFd, projid: u32) -> nix::Result<()> {
+    let mut attr = super::fs_xattr(fd)?;
+    attr.fsx_xflags |= FS_XFLAG_NODUMP;
+    attr.fsx_projid = projid;
+    unsafe { super::set_fsxattr(fd, &attr) }.map(drop)
+}
+
+/// Whether the file is marked NODUMP, and its project id.
+pub(crate) fn nodump_and_project(fd: RawFd) -> nix::Result<(bool, u32)> {
+    let attr = super::fs_xattr(fd)?;
+    Ok((attr.fsx_xflags & FS_XFLAG_NODUMP != 0, attr.fsx_projid))
 }
 
 mod tests {

@@ -1213,6 +1213,21 @@ pub(crate) mod test {
         std::assert!(path.join("testfile").exists());
     });
 
+    dma_file_test!(an_extent_size_hint_keeps_the_other_attributes, path, _k, {
+        let file = DmaFile::create(path.join("testfile")).await.unwrap();
+        let fd = file.as_raw_fd();
+        let supported = crate::sys::test_support::mark_nodump_in_project(fd, 7).is_ok()
+            && file.hint_extent_size(1 << 20).await.is_ok();
+        if supported {
+            let (nodump, projid) = crate::sys::test_support::nodump_and_project(fd).unwrap();
+            assert!(nodump, "the extent size hint cleared NODUMP");
+            assert_eq!(projid, 7, "the extent size hint reset the project id");
+        } else {
+            eprintln!("{path:?} has no extent size hints, nothing to check");
+        }
+        file.close().await.unwrap();
+    });
+
     dma_file_test!(file_open, path, _k, {
         let new_file = DmaFile::create(path.join("testfile"))
             .await

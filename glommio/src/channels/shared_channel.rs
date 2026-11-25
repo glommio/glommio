@@ -509,10 +509,19 @@ impl<T: Send + Sized> Stream for ConnectedReceiver<T> {
 }
 
 impl<T: Send + Sized> Drop for SharedSender<T> {
+    /// Disconnects a half that never connected, and wakes a peer waiting
+    /// in `connect()` for it.
+    ///
+    /// The light barrier orders the disconnect before the look at the
+    /// peer's id, and pairs with the heavy one a connecting peer parks
+    /// behind: either its park drain sees the disconnect, or this sees its
+    /// id and notifies it. Without it both can miss, and the peer's connect
+    /// parks for good.
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
             // Never connected, we must connect ourselves.
             if !state.buffer.disconnect() {
+                sys::light_membarrier();
                 let id = state.buffer.peer_id();
                 if let Some(notifier) = sys::get_sleep_notifier_for(id) {
                     notifier.notify(false);
@@ -523,10 +532,19 @@ impl<T: Send + Sized> Drop for SharedSender<T> {
 }
 
 impl<T: Send + Sized> Drop for SharedReceiver<T> {
+    /// Disconnects a half that never connected, and wakes a peer waiting
+    /// in `connect()` for it.
+    ///
+    /// The light barrier orders the disconnect before the look at the
+    /// peer's id, and pairs with the heavy one a connecting peer parks
+    /// behind: either its park drain sees the disconnect, or this sees its
+    /// id and notifies it. Without it both can miss, and the peer's connect
+    /// parks for good.
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
             // Never connected, we must connect ourselves.
             if !state.buffer.disconnect() {
+                sys::light_membarrier();
                 let id = state.buffer.peer_id();
                 if let Some(notifier) = sys::get_sleep_notifier_for(id) {
                     notifier.notify(false);

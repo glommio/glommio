@@ -158,6 +158,7 @@ mod loom_tests;
 mod membarrier;
 mod sync;
 pub(crate) use membarrier::initialize_strategy as initialize_membarrier_strategy;
+pub(crate) use membarrier::light as light_membarrier;
 pub(crate) mod source;
 pub(crate) mod sysfs;
 mod uring;

@@ -275,3 +275,51 @@ fn a_connect_is_not_left_waiting_for_a_peer_that_connected() {
         other.join().unwrap();
     });
 }
+
+/// P7: a half dropped without connecting, racing its peer's `connect()`,
+/// never leaves that connect parked with nothing to wake it.
+///
+/// The drop marks itself disconnected, then looks for the peer's id and
+/// notifies the peer's executor only if it is set. The light barrier
+/// between the two pairs with the heavy one the connecting side parks
+/// behind: either the park drain sees the disconnect, or the drop sees the
+/// connecting side's id and notifies it.
+#[test]
+fn a_connect_is_not_left_waiting_for_a_peer_dropped_unconnected() {
+    loom::model(|| {
+        let notifier = new_sleep_notifier().unwrap();
+        let ids = Arc::new([LoomUsize::new(0), LoomUsize::new(0)]);
+
+        let mut dropper = Some({
+            let (notifier, ids) = (notifier.clone(), ids.clone());
+            thread::spawn(move || {
+                ids[1].swap(usize::MAX, Ordering::Release);
+                super::membarrier::light();
+                if ids[0].load(Ordering::Acquire) != 0 {
+                    notifier.notify(false);
+                }
+            })
+        });
+
+        let peer_gone = || ids[1].load(Ordering::Acquire) != 0;
+        ids[0].store(notifier.id(), Ordering::Release);
+        if !peer_gone() {
+            notifier
+                .sleep_unless_woken(
+                    || peer_gone() as usize,
+                    || {
+                        dropper.take().unwrap().join().unwrap();
+                        assert!(
+                            notifier.signals() > 0,
+                            "a connect parked with its peer dropped and nothing to wake it"
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        if let Some(dropper) = dropper {
+            dropper.join().unwrap();
+        }
+    });
+}

@@ -2698,12 +2698,14 @@ impl Reactor {
             _ => panic!("Unexpected source for copy_file_range operation"),
         };
 
+        let offset =
+            |off: u64| i64::try_from(off).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL));
         let op = pool_descriptor(fd_in).and_then(|fd_in| {
             Ok(BlockingThreadOp::CopyFileRange(
                 fd_in,
-                (off_in).try_into().unwrap(),
+                offset(off_in)?,
                 pool_descriptor(source.raw())?,
-                pos.try_into().unwrap(),
+                offset(pos)?,
                 len,
             ))
         });

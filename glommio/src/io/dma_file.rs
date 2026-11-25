@@ -2370,6 +2370,30 @@ pub(crate) mod test {
         assert_eq!(original_write_buffer.as_slice(), &read[..]);
     });
 
+    dma_file_test!(copy_file_range_past_i64_max_is_invalid_input, path, _k, {
+        let src = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .tmpfile(true)
+            .dma_open(&path)
+            .await
+            .unwrap();
+        let dst = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .tmpfile(true)
+            .dma_open(&path)
+            .await
+            .unwrap();
+
+        let past_in = dst.copy_file_range_aligned(&src, u64::MAX, 4096, 0).await;
+        assert_eq!(past_in.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        let past_out = dst.copy_file_range_aligned(&src, 0, 4096, u64::MAX).await;
+        assert_eq!(past_out.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+    });
+
     dma_file_test!(zero_copy_between_files, path, _k, {
         let file1 = OpenOptions::new()
             .create_new(true)

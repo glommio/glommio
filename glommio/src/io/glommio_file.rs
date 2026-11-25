@@ -207,33 +207,49 @@ impl AsFd for GlommioFile {
 }
 
 impl GlommioFile {
-    /// Opens `path` relative to `dir`.
+    /// Opens `path`, relative to the descriptor of `dir` when one is given.
+    ///
+    /// The file records the path it was found at, made absolute so a later
+    /// working directory change cannot move it. Under `dir` that is the
+    /// directory's recorded path joined with `path`, or none if the directory
+    /// has none.
     ///
     /// An `O_TMPFILE` file is left without a path: the one given names its
     /// parent directory, not the file, which has no name to rename or remove.
     pub(crate) async fn open_at(
-        dir: RawFd,
+        dir: Option<&GlommioFile>,
         path: &Path,
         flags: libc::c_int,
         mode: libc::mode_t,
     ) -> io::Result<GlommioFile> {
         let reactor = crate::executor().reactor();
-        let path = if dir == -1 && path.is_relative() {
-            let mut pbuf = std::fs::canonicalize(".")?;
-            pbuf.push(path);
-            pbuf
-        } else {
-            path.to_owned()
+        let absolute = |path: PathBuf| -> io::Result<PathBuf> {
+            if path.is_relative() {
+                Ok(std::fs::canonicalize(".")?.join(path))
+            } else {
+                Ok(path)
+            }
         };
-
-        let source = reactor.open_at(dir, &path, flags, mode);
+        let (source, recorded) = match dir {
+            None => {
+                let path = absolute(path.to_owned())?;
+                (reactor.open_at(-1, &path, flags, mode), Some(path))
+            }
+            Some(dir) => {
+                let recorded = dir.path().map(|dir| absolute(dir.join(path))).transpose()?;
+                (
+                    reactor.open_at(dir.as_raw_fd(), path, flags, mode),
+                    recorded,
+                )
+            }
+        };
         let fd = source.collect_fd().await?;
         let unnamed = flags & libc::O_TMPFILE == libc::O_TMPFILE;
 
         let mut file = GlommioFile {
             file: Some(Arc::new(unsafe { OwnedFd::from_raw_fd(fd as _) })),
             lock_state: Some(Arc::new(Default::default())),
-            path: RefCell::new((!unnamed).then_some(path)),
+            path: RefCell::new(recorded.filter(|_| !unnamed)),
             inode: 0,
             dev_major: 0,
             dev_minor: 0,
@@ -450,6 +466,14 @@ impl GlommioFile {
     pub(crate) fn with_path(self, path: Option<PathBuf>) -> GlommioFile {
         self.path.replace(path);
         self
+    }
+
+    /// The path `path` names relative to `dir`, for error reports.
+    pub(crate) fn named_under(dir: Option<&GlommioFile>, path: &Path) -> PathBuf {
+        match dir.and_then(GlommioFile::path) {
+            Some(dir) => dir.join(path),
+            None => path.to_owned(),
+        }
     }
 
     pub(crate) fn path_required(&self, op: &'static str) -> Result<Ref<'_, Path>> {
@@ -788,7 +812,7 @@ pub(crate) mod test {
         test_executor!(async move {
             let dir = make_tmp_test_directory("a_cancelled_close_still_closes_the_file");
             let path = std::fs::canonicalize(&dir.path).unwrap().join("file");
-            let file = GlommioFile::open_at(-1, &path, libc::O_CREAT | libc::O_RDWR, 0o644)
+            let file = GlommioFile::open_at(None, &path, libc::O_CREAT | libc::O_RDWR, 0o644)
                 .await
                 .unwrap();
             assert_eq!(open_fds_on(&path), 1);
@@ -811,7 +835,7 @@ pub(crate) mod test {
         let opened = path.clone();
         crate::LocalExecutorBuilder::default()
             .spawn(move || async move {
-                let file = GlommioFile::open_at(-1, &opened, libc::O_CREAT | libc::O_RDWR, 0o644)
+                let file = GlommioFile::open_at(None, &opened, libc::O_CREAT | libc::O_RDWR, 0o644)
                     .await
                     .unwrap();
                 let close = file.close();
@@ -833,7 +857,7 @@ pub(crate) mod test {
             let path = std::fs::canonicalize(&dir.path).unwrap().join("file");
             std::fs::write(&path, b"hello").unwrap();
             {
-                let open = GlommioFile::open_at(-1, &path, libc::O_RDONLY, 0);
+                let open = GlommioFile::open_at(None, &path, libc::O_RDONLY, 0);
                 futures_lite::pin!(open);
                 assert!(futures_lite::future::poll_once(&mut open).await.is_none());
                 sleep(Duration::from_millis(20)).await;
@@ -852,7 +876,7 @@ pub(crate) mod test {
             let path = dir.path.clone();
 
             let file = path.join("file");
-            let gf = GlommioFile::open_at(-1, &file, libc::O_CREAT, 644)
+            let gf = GlommioFile::open_at(None, &file, libc::O_CREAT, 644)
                 .await
                 .unwrap();
             let gf_fd = gf.path.borrow().as_ref().cloned().unwrap();
@@ -886,7 +910,7 @@ pub(crate) mod test {
         let file = dir.path.join("file");
         let ex = crate::LocalExecutorBuilder::default().make().unwrap();
         let path = ex.run(async move {
-            let gf = GlommioFile::open_at(-1, &file, libc::O_CREAT, 644)
+            let gf = GlommioFile::open_at(None, &file, libc::O_CREAT, 644)
                 .await
                 .unwrap();
             let path = gf.path.borrow().as_ref().cloned().unwrap();

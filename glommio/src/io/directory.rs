@@ -4,7 +4,7 @@
 //! This product includes software developed at [Datadog](https://www.datadoghq.com/). Copyright 2020 Datadog, Inc.
 //!
 use crate::{
-    io::{dma_file::DmaFile, glommio_file::GlommioFile},
+    io::{dma_file::DmaFile, glommio_file::GlommioFile, open_options::OpenOptions},
     sys, GlommioError,
 };
 use std::{
@@ -72,8 +72,13 @@ impl Directory {
             .into());
         };
 
-        let path = self.file.path_required("open file")?.join(path.as_ref());
-        DmaFile::open(path).await
+        DmaFile::open_with_options(
+            Some(&self.file),
+            path.as_ref(),
+            "Opening",
+            OpenOptions::new().read(true),
+        )
+        .await
     }
 
     /// Similar to create() in the standard library, but returns a DMA file
@@ -113,8 +118,13 @@ impl Directory {
             .into());
         }
 
-        let path = self.file.path_required("create file")?.join(path.as_ref());
-        DmaFile::create(path).await
+        DmaFile::open_with_options(
+            Some(&self.file),
+            path.as_ref(),
+            "Creating",
+            OpenOptions::new().write(true).create(true).truncate(true),
+        )
+        .await
     }
 
     /// Returns an iterator to the contents of this directory
@@ -192,6 +202,73 @@ mod test {
             let created = Directory::create(relative_to_cwd(&dir)).await;
             let _ = std::fs::remove_dir(&dir);
             created.expect("create() with a relative path failed");
+        });
+    }
+
+    /// Files are opened and created in the directory the handle holds, not in
+    /// whatever its path names by the time they are asked for.
+    #[test]
+    fn files_go_through_the_directory_handle_after_its_path_is_replaced() {
+        test_executor!(async move {
+            let base =
+                std::env::temp_dir().join(format!("glommio-dir-swap-{}", std::process::id()));
+            let (original, moved) = (base.join("original"), base.join("moved"));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&original).unwrap();
+            std::fs::write(original.join("existing"), b"opened").unwrap();
+
+            let dir = Directory::open(&original).await.unwrap();
+            std::fs::rename(&original, &moved).unwrap();
+            std::fs::create_dir(&original).unwrap();
+            std::fs::write(original.join("existing"), b"replacement").unwrap();
+
+            let created = dir.create_file("created").await.unwrap();
+            created.close().await.unwrap();
+            let opened = dir.open_file("existing").await.unwrap();
+            let opened_inode = opened.inode();
+            opened.close().await.unwrap();
+
+            let created_in_moved = moved.join("created").exists();
+            let created_in_replacement = original.join("created").exists();
+            let moved_inode = std::os::unix::fs::MetadataExt::ino(
+                &std::fs::metadata(moved.join("existing")).unwrap(),
+            );
+            std::fs::remove_dir_all(&base).unwrap();
+
+            assert!(
+                created_in_moved,
+                "the file was not created in the opened directory"
+            );
+            assert!(
+                !created_in_replacement,
+                "the file was created in the replacement"
+            );
+            assert_eq!(
+                opened_inode, moved_inode,
+                "the replacement's file was opened"
+            );
+        });
+    }
+
+    /// A file under a directory opened by a relative path still records an
+    /// absolute path, so renaming it later does not depend on the working
+    /// directory.
+    #[test]
+    fn a_file_under_a_relatively_opened_directory_records_an_absolute_path() {
+        test_executor!(async move {
+            let base =
+                std::env::temp_dir().join(format!("glommio-rel-file-{}", std::process::id()));
+            std::fs::create_dir_all(&base).unwrap();
+            let dir = Directory::open(relative_to_cwd(&base)).await.unwrap();
+            let file = dir.create_file("created").await.unwrap();
+            let recorded = file.path().map(|p| p.to_path_buf());
+            file.close().await.unwrap();
+            let names_the_file = recorded.as_ref().is_some_and(|p| p.exists());
+            std::fs::remove_dir_all(&base).unwrap();
+
+            let recorded = recorded.expect("the file recorded no path");
+            assert!(recorded.is_absolute(), "recorded {recorded:?}");
+            assert!(names_the_file, "recorded {recorded:?}");
         });
     }
 }

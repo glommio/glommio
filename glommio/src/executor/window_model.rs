@@ -4,13 +4,15 @@
 //!
 //! A pure state machine, compiled only for tests, that restates step by
 //! step what the executor does around preemption: `run`, `run_task_queues`,
-//! `run_one_task_queue`, `finish_task_queue_run`, the window in `Preempted`
+//! `run_one_task_queue`, `finish_task_queue_run` with the charge
+//! `account_vruntime` makes, the window in `Preempted`
 //! (`preempted_inline`, `preempted_last`, `hold`, `close_window`,
 //! `take_from_back`), `activation_vruntime` and `maybe_activate`, and in
 //! `context.rs` and `multitask.rs` `schedule`, `requeue`,
 //! `end_preempted_window`, `spawn_internal`, `with_cleanup` and the
 //! scheduler's wake path, with the raw task's `do_wake`, `cancel` and `run`
-//! in `task/raw.rs`, the heap order of task queues, and the order of
+//! in `task/raw.rs`, the heap order of task queues (`impl Ord for
+//! TaskQueue` and `push_runnable`), and the order of
 //! `react`, whose timer wakers run before the rings are drained. It
 //! does not drive the executor. It explores every interleaving of the events
 //! below up to a bound, breadth first with visited states deduplicated, so
@@ -23,8 +25,8 @@
 //! preempt timer fires at any point, including after a slice is picked and
 //! before its first poll; a reactor pass wakes parked tasks in any order, or
 //! runs a waker that spawns, cancels or removes a queue, before the rings
-//! are drained, with a preemption still pending, or after; a vruntime tie is
-//! broken either way; a shares callback, a poll, a waker or a task a waker
+//! are drained, with a preemption still pending, or after; under the earlier
+//! designs, a vruntime tie is broken either way; a shares callback, a poll, a waker or a task a waker
 //! polls inline panics; `run` returns or is called again; a handle is
 //! dropped between runs; the executor is dropped. A picked slice beginning
 //! and a pass draining its rings are free: they do not count against the
@@ -45,7 +47,8 @@
 //!   every task of W in its queue, or in a queue that was idle and charged no
 //!   more than P's queue was once its slice was charged, ties included.
 //! - `BoundTie`: the same, reported apart when the task of P was polled
-//!   first only because its queue won a vruntime tie with the late task's.
+//!   first only because its queue won a vruntime tie with the late task's:
+//!   by entering the heap first under the current rule, or either way.
 //! - `BoundAfterWindow` and `BoundAfterWindowTie`: the same, reported apart
 //!   when the task of P was woken again only after its window, so the window
 //!   had no say in it: by a strict reversal of vruntimes, or by a tie.
@@ -103,10 +106,31 @@
 //!   The main future is abstract: `run` may return wherever it is polled.
 //! - `need_preempt` is set only by the timer and cleared only by `react`; a
 //!   reactor pass delivers its wakes in any order, and the park's own pass is
-//!   folded into the next one.
+//!   folded into the next one. The idle spin pass, `spin_poll_io`, drains the
+//!   rings before its timer wakers run, so in the code `need_preempt` reads
+//!   false there while the model keeps it set. Nothing in a pass reads it
+//!   but an inline poll, and an inline poll outside a slice opens no window;
+//!   the spin pass is followed by a `react` pass that drains before any
+//!   queue runs, or by the park, which ends the window. So no `Bound` or
+//!   `Fifo` violation depends on it.
+//! - Join handles are left out. Cancelling a task whose handle a parked task
+//!   awaits schedules it and wakes that task in one call; in the model that
+//!   is a cancel and then a wake of the parked task, or a cancel and then a
+//!   yield when the awaiting task is the one cancelling. Every search that
+//!   allows cancels allows both, one right after the other, so every such
+//!   trace is in the search one event longer: that can push a `Bound` or
+//!   `Fifo` violation past the bound, but hides none within it.
 //! - Vruntime is coarse: a preempted slice charges three times the queue's
-//!   weight, a short one once, an empty one nothing; ties go either way;
-//!   overflow and dynamic shares are left out.
+//!   weight, a short one once, an empty one nothing; overflow and dynamic
+//!   shares are left out. The code charges an empty slice the little time it
+//!   took, so where the model has an empty slice tie, the code has the
+//!   queue strictly behind.
+//! - Ties go to the queue that entered the heap first, as in the code; the
+//!   order queues entered is kept as ranks among those in the heap, and an
+//!   initial state is searched in every order its runnable queues could
+//!   have entered. The earlier designs, which ran on a heap that broke ties
+//!   in no particular order, and `Rule::TiesEitherWay`, are searched with
+//!   ties going either way.
 //! - A finished task frees its address at once, the worst case for reuse.
 //!   Cancelling a running task, `spawn_into` another queue, foreign wakes,
 //!   `yield_if_needed`, queue creation and multiple executors are left out.
@@ -288,6 +312,24 @@ enum Rule {
     /// instead. One that stays runnable, its task having yielded, keeps its
     /// bare charge and ties with a woken queue charged the same.
     NoSliceEndStep,
+    /// The current rule as it was before queues of equal vruntime ran in the
+    /// order they entered the heap: the heap breaks a tie either way.
+    TiesEitherWay,
+    /// The current rule with a tie going to the queue that entered the heap
+    /// last.
+    LastEnteredFirst,
+}
+
+/// How the heap of runnable queues breaks a vruntime tie.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ties {
+    /// Either way: the search takes both.
+    EitherWay,
+    /// To the queue that entered the heap first, as `impl Ord for TaskQueue`
+    /// does.
+    FirstEntered,
+    /// To the queue that entered it last.
+    LastEntered,
 }
 
 /// A property the model checks.
@@ -298,7 +340,8 @@ enum Property {
     OutsideRun,
     Bound,
     /// As `Bound`, but the preempted task's queue was picked over a late
-    /// task's queue on a vruntime tie, which the heap may break either way.
+    /// task's queue on a vruntime tie: it entered the heap first, or, under
+    /// a rule that breaks ties either way, the heap picked it.
     BoundTie,
     /// As `Bound`, but the preempted task was woken again only after its
     /// window ended, so the window had no say in where its queue went.
@@ -388,6 +431,10 @@ struct Queue {
     active: bool,
     in_heap: bool,
     v: u8,
+    /// `TaskQueue::entry`, as a rank among the queues in the heap: lower
+    /// entered it earlier. Zero outside the heap, and for every queue under a
+    /// rule that breaks ties either way.
+    entry: u8,
     /// Vruntime charged per unit of runtime: the reciprocal of its shares,
     /// relative to the other queues.
     weight: u8,
@@ -402,6 +449,7 @@ impl Queue {
             active: false,
             in_heap: false,
             v,
+            entry: 0,
             weight: 1,
         }
     }
@@ -842,6 +890,9 @@ struct Bounds {
     task_wakes: bool,
     /// Whether a polled task may yield, waking itself.
     yields: bool,
+    /// Whether the preempt timer may fire between a slice being picked and
+    /// its first poll, ending a slice that the model charges nothing.
+    early_preempt: bool,
     /// Whether to keep exploring from a state reached by a violation, to see
     /// what it leads to.
     continue_past: bool,
@@ -928,9 +979,13 @@ fn initial(queue_v: &[u8], seeds: &[Seed], inside_run: bool, budget: Budget) -> 
             closed: false,
         };
         if seed.queued {
+            let entered = queues.iter().filter(|q| q.in_heap).count() as u8;
             let q = &mut queues[seed.home as usize];
             q.push_back(t as u8);
             q.active = true;
+            if !q.in_heap {
+                q.entry = entered;
+            }
             q.in_heap = true;
             ghost.fifo_push(seed.home, t as u8);
         }
@@ -970,15 +1025,17 @@ fn initial(queue_v: &[u8], seeds: &[Seed], inside_run: bool, budget: Budget) -> 
         budget,
         ghost,
     };
-    canonicalize(&mut s);
+    canonicalize(&mut s, true);
     s
 }
 
 /// Clears what no longer matters and shifts vruntimes so the least is zero,
 /// so that states differing only there are visited once. Every vruntime
 /// operation is a comparison, a min, a clamp or a small addition, all of
-/// which commute with the shift.
-fn canonicalize(s: &mut State) {
+/// which commute with the shift. Heap entries are only ever compared, so
+/// they are kept as ranks among the queues in the heap, or cleared when
+/// `entries` is false, under a rule that breaks ties either way.
+fn canonicalize(s: &mut State, entries: bool) {
     if !s.in_slice {
         s.cur = 0;
         s.least = 0;
@@ -1019,6 +1076,15 @@ fn canonicalize(s: &mut State) {
         if !q.exists {
             *q = Queue::new(false, 0);
         }
+    }
+    let ranks = s.queues.map(|q| {
+        s.queues
+            .iter()
+            .filter(|o| o.in_heap && o.entry < q.entry)
+            .count() as u8
+    });
+    for (q, rank) in s.queues.iter_mut().zip(ranks) {
+        q.entry = if entries && q.in_heap { rank } else { 0 };
     }
     let mut m = s.default_v;
     for q in s.queues.iter().filter(|q| q.exists) {
@@ -1156,8 +1222,24 @@ impl Exec<'_> {
             let queue = &mut self.s.queues[qi];
             queue.v = v;
             queue.active = true;
-            queue.in_heap = true;
+            self.push_runnable(qi);
         }
+    }
+
+    /// `ExecutorQueues::push_runnable`: the queue enters the heap behind
+    /// every queue there.
+    fn push_runnable(&mut self, q: usize) {
+        let entry = self
+            .s
+            .queues
+            .iter()
+            .filter(|queue| queue.in_heap)
+            .map(|queue| queue.entry + 1)
+            .max()
+            .unwrap_or(0);
+        let queue = &mut self.s.queues[q];
+        queue.entry = entry;
+        queue.in_heap = true;
     }
 
     /// The `Placement` property for a queue activated at `v`.
@@ -1591,7 +1673,10 @@ impl Exec<'_> {
         displaced
     }
 
-    /// `LocalExecutor::finish_task_queue_run`.
+    /// `LocalExecutor::finish_task_queue_run`, with the charge of
+    /// `TaskQueue::account_vruntime`, which leaves the queue active only while
+    /// it has runnables. Its overflow, and the reset that follows, are left
+    /// out.
     fn finish(&mut self, preempted: bool, unwinding: bool) {
         let q = self.s.cur;
         let qi = q as usize;
@@ -1651,7 +1736,7 @@ impl Exec<'_> {
             }
         }
         if need_repush {
-            self.s.queues[qi].in_heap = true;
+            self.push_runnable(qi);
         }
         let own = accounted;
         self.s.default_v = self
@@ -1740,7 +1825,8 @@ impl Exec<'_> {
         (best, mask)
     }
 
-    /// One turn of `run_task_queues`; false if it stops on a tie.
+    /// One turn of `run_task_queues`; false if it stops on a tie the rule
+    /// leaves to either side.
     fn round_step(&mut self) -> bool {
         let (_, mask) = self.min_candidates();
         if self.s.preempt {
@@ -1768,7 +1854,18 @@ impl Exec<'_> {
                 self.start_slice(mask.trailing_zeros() as u8);
                 true
             }
-            _ => false,
+            _ => {
+                let entry = |q: &u8| self.s.queues[*q as usize].entry;
+                let q = match self.m.ties() {
+                    Ties::EitherWay => return false,
+                    Ties::FirstEntered => bits(mask).min_by_key(entry),
+                    Ties::LastEntered => bits(mask).max_by_key(entry),
+                };
+                let q = q.expect("a tie has candidates");
+                self.start_slice(q);
+                self.s.tied = mask & !bit(q);
+                true
+            }
         }
     }
 
@@ -2233,6 +2330,46 @@ impl Model {
         Self { rule, bounds }
     }
 
+    /// How the rule breaks a vruntime tie. The earlier designs ran on a heap
+    /// that broke ties either way, and they are checked as they ran.
+    fn ties(&self) -> Ties {
+        match self.rule {
+            Rule::Current => Ties::FirstEntered,
+            Rule::LastEnteredFirst => Ties::LastEntered,
+            _ => Ties::EitherWay,
+        }
+    }
+
+    /// The initial states as the rule sees them: under a rule that breaks
+    /// ties by heap entry, each in every order its runnable queues could have
+    /// entered the heap, since an initial state stands for any history.
+    fn entry_orders(&self, inits: &[State]) -> Vec<State> {
+        let mut out = Vec::new();
+        for init in inits {
+            if self.ties() == Ties::EitherWay {
+                let mut s = init.clone();
+                canonicalize(&mut s, false);
+                out.push(s);
+                continue;
+            }
+            let heap: Vec<usize> = (0..NQ).filter(|q| init.queues[*q].in_heap).collect();
+            let k = heap.len();
+            for code in 0..k.pow(k as u32) {
+                let ranks: Vec<usize> = (0..k).map(|i| code / k.pow(i as u32) % k).collect();
+                if (0..k).any(|r| !ranks.contains(&r)) {
+                    continue;
+                }
+                let mut s = init.clone();
+                for (q, rank) in heap.iter().zip(&ranks) {
+                    s.queues[*q].entry = *rank as u8;
+                }
+                canonicalize(&mut s, true);
+                out.push(s);
+            }
+        }
+        out
+    }
+
     /// Whether the slice end that `need_preempt` caused charges the queue one
     /// step past the slice, as the current rule does and the designs that
     /// placed the preempted queue by other means did not.
@@ -2379,7 +2516,7 @@ impl Model {
             }
             Pc::SliceStart => {
                 ev.push(Ev::Begin);
-                if !s.preempt {
+                if !s.preempt && self.bounds.early_preempt {
                     ev.push(Ev::Timer);
                 }
                 if s.budget.panics > 0 {
@@ -2442,7 +2579,7 @@ impl Model {
         x.apply(ev);
         x.settle();
         x.check();
-        canonicalize(&mut x.s);
+        canonicalize(&mut x.s, self.ties() != Ties::EitherWay);
         (x.s, x.viol, x.notes)
     }
 
@@ -2450,6 +2587,7 @@ impl Model {
     /// timer.
     fn picture(s: &State) -> String {
         let mut out = String::new();
+        let ranked = s.queues.iter().any(|queue| queue.entry > 0);
         for (q, queue) in s.queues.iter().enumerate() {
             if !queue.exists {
                 continue;
@@ -2463,6 +2601,9 @@ impl Model {
                 " idle"
             };
             let _ = write!(out, "q{q}[{}] v{}{mark} ", items.join(" "), queue.v);
+            if ranked && queue.in_heap {
+                let _ = write!(out, "entered {} ", queue.entry + 1);
+            }
         }
         if let Some(w) = s.window {
             let show = |h: Option<Held>| match h {
@@ -2543,15 +2684,19 @@ impl Model {
         lines
     }
 
-    /// Breadth first over every event sequence up to the bound, so that the
-    /// first violation of each property found is one of the shortest.
+    /// Breadth first over every event sequence up to the bound. A violation
+    /// is kept with the events it took, and replaced by one that took fewer:
+    /// within a level, a free event reaches a violation at the level's cost
+    /// after a paid one may have reached it at one more. So the trace kept
+    /// for each property is one of the shortest.
     fn explore(&self, inits: &[State]) -> Report {
+        let inits = self.entry_orders(inits);
         let started = Instant::now();
         let mut seen = Seen::default();
         let mut nodes: Vec<(u32, Option<Ev>)> = Vec::new();
         let mut roots: Vec<usize> = Vec::new();
         let mut frontier: Vec<(State, u32, u128)> = Vec::new();
-        let mut found: BTreeMap<Property, (Violation, u32, Ev)> = BTreeMap::new();
+        let mut found: BTreeMap<Property, (Violation, u32, Ev, u8)> = BTreeMap::new();
         let mut notes: BTreeMap<Note, (u32, Ev)> = BTreeMap::new();
         let mut transitions = 0usize;
         let mut cheaper = 0usize;
@@ -2601,13 +2746,15 @@ impl Model {
                             .or_insert((idx, ev));
                     }
                     let violated = !viol.is_empty();
+                    let cost = if ev.is_free() { level } else { level + 1 } as u8;
                     for v in viol {
-                        found.entry(v.property).or_insert((v, idx, ev));
+                        if found.get(&v.property).is_none_or(|kept| cost < kept.3) {
+                            found.insert(v.property, (v, idx, ev, cost));
+                        }
                     }
                     if violated && !self.bounds.continue_past {
                         continue;
                     }
-                    let cost = if ev.is_free() { level } else { level + 1 } as u8;
                     let fp2 = fingerprint(&s2);
                     let known = seen.get(&fp2).copied();
                     if known.is_some_and(|best| best <= cost) {
@@ -2660,7 +2807,7 @@ impl Model {
             elapsed: started.elapsed(),
             found: found
                 .into_iter()
-                .map(|(p, (v, idx, ev))| (p, (v, trace(idx, ev))))
+                .map(|(p, (v, idx, ev, _))| (p, (v, trace(idx, ev))))
                 .collect(),
             notes: notes
                 .into_iter()
@@ -2683,21 +2830,23 @@ const SOURCES: [(&str, &str); 4] = [
 /// with, and the fingerprint of its source with layout and docs stripped.
 /// `mirrored_code_is_unchanged` fails when any of them changes.
 const MIRRORED: &[(&str, &str, u64)] = &[
-    ("mod.rs", "impl Ord for TaskQueue {", 0x14a06031a6195825),
+    ("mod.rs", "fn account_vruntime(", 0x1d605a39500b0b33),
+    ("mod.rs", "impl Ord for TaskQueue {", 0xf179e133f428dbaa),
     ("mod.rs", "struct Held {", 0x42c70e03b6beb9e3),
     ("mod.rs", "struct Preempted {", 0x7e738adafadfe413),
     ("mod.rs", "impl Preempted {", 0x22a14af581d732b3),
-    ("mod.rs", "struct ExecutorQueues {", 0x85dc834c794463c0),
+    ("mod.rs", "struct ExecutorQueues {", 0xe2163e29b10e2a21),
     ("mod.rs", "fn take_from_back(", 0x67a9a075df2f2f82),
     ("mod.rs", "fn preempted_inline(", 0x659550d6696aad80),
     ("mod.rs", "fn preempted_last(", 0x3e1893d3a36eba17),
     ("mod.rs", "fn close_window(", 0xd4f1f318e1f4ce02),
     ("mod.rs", "fn hold(", 0x595f37c5c85e6609),
     ("mod.rs", "fn activation_vruntime(", 0xd7c963cdb438af51),
-    ("mod.rs", "fn maybe_activate(", 0x49fa7deb303b478c),
+    ("mod.rs", "fn maybe_activate(", 0xf06078b191bf2078),
+    ("mod.rs", "fn push_runnable(", 0x2ae660fc8bfd81a5),
     ("mod.rs", "fn run_task_queues(", 0x2bb66f39a7fd05ae),
     ("mod.rs", "fn run_one_task_queue(", 0xf426337dbccdb8f7),
-    ("mod.rs", "fn finish_task_queue_run(", 0xfd65f70f46630194),
+    ("mod.rs", "fn finish_task_queue_run(", 0x36cc21375aceae5c),
     ("mod.rs", "pub fn run<T>(", 0xe42fa887fcd45e87),
     (
         "context.rs",
@@ -3058,6 +3207,7 @@ mod tests {
             inline_depth,
             task_wakes: true,
             yields: true,
+            early_preempt: true,
             continue_past: false,
         }
     }
@@ -3544,13 +3694,7 @@ mod tests {
             reactivation_bounds(),
             &placement_inits_with(0),
         );
-        assert!(
-            report.found.keys().all(|p| matches!(
-                p,
-                Property::BoundAfterWindow | Property::BoundAfterWindowTie
-            )),
-            "{report}"
-        );
+        assert_after_window_only(&report);
     }
 
     /// The current rule over two and three queues, everything allowed. The
@@ -3559,13 +3703,49 @@ mod tests {
     /// window. After it, a preempted task woken only then is placed as usual,
     /// just behind the least vruntime, which closing the window lowered to a
     /// queue it placed at the earliest mark. A queue it placed at the usual
-    /// mark can then sit level with it, a tie, or behind it, a strict
-    /// reversal: from seed `[4, 0, 7]`, the queue charged 7 is placed at the
-    /// usual mark, the one charged 0 at the earliest, and the preempted task,
-    /// woken by the latter's task, lands ahead of the former.
+    /// mark can then sit behind it, a strict reversal: from seed `[4, 0, 7]`,
+    /// the queue charged 7 is placed at the usual mark, the one charged 0 at
+    /// the earliest, and the preempted task, woken by the latter's task,
+    /// lands ahead of the former. Level with it, the queue placed at the
+    /// usual mark entered the heap first and wins the tie.
+    ///
+    /// A tie remains only where a slice of that queue is preempted before
+    /// its first poll: the model charges such a slice nothing, and the queue
+    /// goes back into the heap behind the preempted one. The code charges
+    /// the time the slice took, which makes that a strict reversal too.
     #[test]
     fn current_rule_three_queues() {
         let report = search_from(Rule::Current, three_queue_bounds(), &placement_inits());
+        assert_after_window_only(&report);
+        assert!(
+            report.found.contains_key(&Property::BoundAfterWindow),
+            "{report}"
+        );
+    }
+
+    /// The current rule over two and three queues with no slice preempted
+    /// before its first poll: no tie at all, after the window or in it.
+    #[test]
+    fn current_rule_three_queues_without_empty_slices() {
+        let bounds = Bounds {
+            early_preempt: false,
+            ..three_queue_bounds()
+        };
+        let report = search_from(Rule::Current, bounds, &placement_inits());
+        let found: Vec<_> = report.found.keys().copied().collect();
+        assert_eq!(found, [Property::BoundAfterWindow], "{report}");
+    }
+
+    /// Before queues of equal vruntime ran in the order they entered the
+    /// heap, the heap could also run the preempted task ahead of a queue
+    /// placed level with it at the usual mark.
+    #[test]
+    fn ties_either_way_three_queues() {
+        let report = search_from(
+            Rule::TiesEitherWay,
+            three_queue_bounds(),
+            &placement_inits(),
+        );
         let found: Vec<_> = report.found.keys().copied().collect();
         assert_eq!(
             found,
@@ -3576,13 +3756,36 @@ mod tests {
         assert!(last_event(t).contains("wins a vruntime tie"), "{report}");
     }
 
+    /// Ties that go to the queue that entered the heap last run the preempted
+    /// task, reactivated after the window, ahead of the queue placed level
+    /// with it.
+    #[test]
+    fn finds_the_after_window_tie_when_the_last_entered_wins() {
+        let bounds = Bounds {
+            early_preempt: false,
+            ..three_queue_bounds()
+        };
+        let report = search_from(Rule::LastEnteredFirst, bounds, &placement_inits());
+        trace(&report, Property::BoundAfterWindowTie);
+    }
+
     /// The current rule with a queue whose slices cost it ten times as much:
-    /// the same two outcomes after the window, and nothing else. The tie
-    /// takes nine events; the strict reversal takes thirteen, past the debug
-    /// bound.
+    /// a reversal after the window, and nothing else.
     #[test]
     fn current_rule_low_share_queue() {
         let report = search_from(Rule::Current, three_queue_bounds(), &low_share_inits());
+        assert_after_window_only(&report);
+    }
+
+    /// The same before ties went by heap entry. The tie takes nine events;
+    /// the strict reversal takes thirteen, past the debug bound.
+    #[test]
+    fn ties_either_way_low_share_queue() {
+        let report = search_from(
+            Rule::TiesEitherWay,
+            three_queue_bounds(),
+            &low_share_inits(),
+        );
         assert!(
             report.found.contains_key(&Property::BoundAfterWindowTie),
             "{report}"
@@ -3594,6 +3797,26 @@ mod tests {
             )),
             "{report}"
         );
+    }
+
+    /// Fails on any violation but the two after the window, which it has no
+    /// say in, and on a tie there that a slice preempted before its first
+    /// poll did not bring about.
+    fn assert_after_window_only(report: &Report) {
+        assert!(
+            report.found.keys().all(|p| matches!(
+                p,
+                Property::BoundAfterWindow | Property::BoundAfterWindowTie
+            )),
+            "{report}"
+        );
+        if let Some((_, t)) = report.found.get(&Property::BoundAfterWindowTie) {
+            assert!(
+                t.iter()
+                    .any(|l| l.contains("slice start] the preempt timer fires")),
+                "{report}"
+            );
+        }
     }
 
     /// Fails on any violation but the one nested inline polls are known to

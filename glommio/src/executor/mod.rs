@@ -473,6 +473,8 @@ impl TaskQueue {
     /// The scaling is done in 128 bits: at one share the product passes
     /// `u64::MAX` once a single run exceeds about 73 minutes, though the
     /// shifted result still fits. A delta too large to fit even then saturates.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn account_vruntime(&mut self, delta: Duration) -> Option<u64> {
         let delta_scaled =
             (u128::from(self.stats.reciprocal_shares).saturating_mul(delta.as_nanos()) >> 12)

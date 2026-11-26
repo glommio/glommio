@@ -56,6 +56,11 @@ pub(crate) type Runnable = task_impl::Task;
 pub(crate) struct Task<T>(Option<JoinHandle<T>>);
 
 impl<T> Task<T> {
+    /// Whether the task has finished or been cancelled.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.0.as_ref().is_some_and(JoinHandle::is_finished)
+    }
+
     /// Detaches the task to let it keep running in the background.
     pub(crate) fn detach(mut self) -> JoinHandle<T> {
         self.0.take().unwrap()
@@ -131,7 +136,10 @@ impl Scheduler {
                 index: runnable.task_queue_index(),
             }) {
                 Some(queue) if !runnable.is_cancelled() => context.schedule(queue, runnable),
-                queue => context.with_cleanup(queue, || drop(runnable)),
+                queue => {
+                    context.forget_preempted(&runnable);
+                    context.with_cleanup(queue, || drop(runnable))
+                }
             }
         }
     }
@@ -178,15 +186,29 @@ impl Scheduler {
         )
     }
 
+    /// Spawns a task without running or scheduling it, handing back its
+    /// runnable, for tests that drive the scheduler's queues by hand.
+    #[cfg(test)]
+    pub(crate) fn spawn_unscheduled<T>(
+        self: Rc<Self>,
+        registry: &TaskRegistry,
+        tq: Rc<RefCell<TaskQueue>>,
+        future: impl Future<Output = T>,
+    ) -> (Runnable, JoinHandle<T>) {
+        self.spawn(registry, tq, future)
+    }
+
+    /// Spawns a task and polls it once, returning the task and its address.
     pub(crate) fn spawn_and_run<T>(
         self: Rc<Self>,
         registry: &TaskRegistry,
         tq: Rc<RefCell<TaskQueue>>,
         future: impl Future<Output = T>,
-    ) -> Task<T> {
+    ) -> (Task<T>, usize) {
         let (runnable, handle) = self.spawn(registry, tq, future);
+        let address = runnable.raw_task.as_ptr().addr();
         runnable.run();
-        Task(Some(handle))
+        (Task(Some(handle)), address)
     }
 
     pub(crate) fn spawn_and_schedule<T>(

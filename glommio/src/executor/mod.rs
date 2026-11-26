@@ -46,6 +46,7 @@ use futures_lite::pin;
 use latch::{Latch, LatchState};
 use log::warn;
 pub use placement::{CpuSet, Placement, PoolPlacement};
+use smallvec::SmallVec;
 use std::{
     cell::RefCell,
     collections::{BinaryHeap, VecDeque},
@@ -619,6 +620,101 @@ impl TaskQueueStats {
     }
 }
 
+/// A task the window a preempted slice opens holds back: its address, and
+/// its runnable while it is held.
+#[derive(Debug)]
+struct Held {
+    /// The task's address. It identifies the task's runnable when it is
+    /// queued again and is never dereferenced.
+    task: usize,
+    /// The task's runnable, held back from its queue until the window ends.
+    runnable: Option<multitask::Runnable>,
+}
+
+/// The window a slice that `need_preempt` ended opens: the tasks whose polls
+/// were under way when the preempt timer fired, held back so that the tasks
+/// woken until the window ends go ahead of them.
+///
+/// A queue runs its tasks in the order they were woken. Such a task is woken
+/// in the same reactor pass as the tasks whose wakes came during its slice,
+/// or queued itself before that pass, so without the window it could run a
+/// whole further slice ahead of tasks that have already waited one.
+///
+/// Those are the task the run loop polled last, and every task polled inline
+/// by `spawn_local` during whose first poll the timer fired. The timer is
+/// sampled around every inline poll, so only polls under way when it fired
+/// see it fire: a chain of tasks each spawned in the poll of the one before,
+/// as long as `spawn_local` calls nest within that first poll, never longer
+/// for a deeper queue or a heavier load.
+///
+/// Opened when the slice ends, or earlier, as soon as an inline poll during
+/// which the timer fired returns, and kept until the next round of task
+/// queues starts, the executor parks, or `run` returns, whichever comes
+/// first.
+///
+/// While it is open the rest of the slice can run and the reactor runs wakers,
+/// and either can spawn. A task polled inline is remembered only if its first
+/// poll did not finish it, and it is held, or matched and held when woken,
+/// until the window ends, so its address stays its own. The last task can have
+/// finished, though, and a task spawned in the reactor pass can then be
+/// allocated at its address and be held back in its place. That is tolerated:
+/// at most one live task has the address, a held runnable keeps its own address
+/// alive so no other task can take it, and the cost falls on that one task. It
+/// can wait longer than the pass: one taken for the last task is queued after
+/// those polled inline, so it waits one slice per inline task released ahead of
+/// it, which is one slice unless inline polls nest.
+#[derive(Debug)]
+struct Preempted {
+    /// The tasks polled inline during whose polls the preempt timer fired,
+    /// innermost first: the order their polls returned and they queued
+    /// themselves.
+    inline: SmallVec<[Held; 2]>,
+    /// The task the run loop polled last, once the slice has ended.
+    last: Option<Held>,
+}
+
+impl Preempted {
+    fn new() -> Self {
+        Self {
+            inline: SmallVec::new(),
+            last: None,
+        }
+    }
+
+    /// The slot for the task at `task`, if the window remembers it.
+    fn slot(&mut self, task: usize) -> Option<&mut Option<multitask::Runnable>> {
+        self.inline
+            .iter_mut()
+            .chain(self.last.as_mut())
+            .find(|held| held.task == task)
+            .map(|held| &mut held.runnable)
+    }
+
+    /// Forgets the task at `task` if nothing of it is held, as it is about to
+    /// be destroyed, so that a task allocated at its address later is not
+    /// taken for it.
+    fn forget(&mut self, task: usize) {
+        self.inline
+            .retain(|held| held.task != task || held.runnable.is_some());
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|held| held.task == task && held.runnable.is_none())
+        {
+            self.last = None;
+        }
+    }
+
+    /// Whether a runnable of the queue at `index` is held.
+    fn holds_for(&self, index: usize) -> bool {
+        self.inline
+            .iter()
+            .chain(self.last.as_ref())
+            .filter_map(|held| held.runnable.as_ref())
+            .any(|runnable| runnable.task_queue_index() == index)
+    }
+}
+
 #[derive(Debug)]
 struct ExecutorQueues {
     active_executors: BinaryHeap<Rc<RefCell<TaskQueue>>>,
@@ -626,6 +722,11 @@ struct ExecutorQueues {
     active_executing: Option<Rc<RefCell<TaskQueue>>>,
     executor_index: usize,
     default_vruntime: u64,
+    preempted: Option<Preempted>,
+    /// Whether a task queue's slice is running. Only then can a window open:
+    /// the executor also polls tasks while it cleans up between runs and when
+    /// it shuts down, with `active_executing` set but no slice spent.
+    in_slice: bool,
     preempt_timer_duration: Duration,
     default_preempt_timer_duration: Duration,
     spin_before_park: Option<Duration>,
@@ -642,6 +743,8 @@ impl ExecutorQueues {
             active_executing: None,
             executor_index: 1,
             default_vruntime: 0,
+            preempted: None,
+            in_slice: false,
             preempt_timer_duration,
             default_preempt_timer_duration: preempt_timer_duration,
             spin_before_park,
@@ -667,6 +770,91 @@ impl ExecutorQueues {
             })
             .min()
             .unwrap_or(self.default_preempt_timer_duration)
+    }
+
+    /// Takes the task at `task` from the back of `queue`, which is where a
+    /// task that woke itself during its poll is when the poll returns: it is
+    /// queued then, after anything it woke. A task that is not at the back
+    /// did not queue itself, and its wake, if any, comes through `schedule`.
+    fn take_from_back(queue: &Rc<RefCell<TaskQueue>>, task: usize) -> Option<multitask::Runnable> {
+        let mut state = queue.borrow_mut();
+        if state
+            .runnables
+            .back()
+            .is_some_and(|runnable| runnable.raw_task.as_ptr().addr() == task)
+        {
+            state.runnables.pop_back()
+        } else {
+            None
+        }
+    }
+
+    /// Remembers a task polled inline by `spawn_local` during whose poll the
+    /// preempt timer fired, and holds it if it woke itself, before its
+    /// spawner queues anything after it. When inline polls nest, each one
+    /// under way when the timer fired gets here as it returns, innermost
+    /// first.
+    ///
+    /// Only within a slice: tasks polled inline while the executor cleans up
+    /// between runs or shuts down spent no slice, and no run would end the
+    /// window.
+    #[cold]
+    fn preempted_inline(&mut self, task: usize) {
+        if !self.in_slice {
+            return;
+        }
+        let Some(queue) = self.active_executing.clone() else {
+            return;
+        };
+        let preempted = self.preempted.get_or_insert_with(Preempted::new);
+        let runnable = Self::take_from_back(&queue, task);
+        preempted.inline.push(Held { task, runnable });
+    }
+
+    /// Remembers `task`, the task the run loop polled last in a slice of
+    /// `queue` that `need_preempt` ended, and holds it if it yielded.
+    ///
+    /// Returns a runnable held already for a last task, which a window that
+    /// ends before the next round cannot have; the caller queues it once the
+    /// queues are no longer borrowed rather than dropping it here, where its
+    /// destructor would run user code under the borrow.
+    fn preempted_last(
+        &mut self,
+        queue: &Rc<RefCell<TaskQueue>>,
+        task: usize,
+    ) -> Option<multitask::Runnable> {
+        let runnable = Self::take_from_back(queue, task);
+        let preempted = self.preempted.get_or_insert_with(Preempted::new);
+        preempted
+            .last
+            .replace(Held { task, runnable })
+            .and_then(|held| held.runnable)
+    }
+
+    /// Holds `runnable` if the open window remembers its task, activating its
+    /// queue as a wake would so the executor does not go idle while it is
+    /// held, and hands it back otherwise.
+    ///
+    /// Returns a runnable the slot held already, which cannot happen while a
+    /// task is queued at most once; the caller queues it once the queues are
+    /// no longer borrowed rather than dropping it here.
+    #[cold]
+    fn hold(
+        &mut self,
+        queue: &Rc<RefCell<TaskQueue>>,
+        runnable: multitask::Runnable,
+    ) -> std::result::Result<Option<multitask::Runnable>, multitask::Runnable> {
+        let task = runnable.raw_task.as_ptr().addr();
+        let displaced = match self
+            .preempted
+            .as_mut()
+            .and_then(|preempted| preempted.slot(task))
+        {
+            Some(slot) => slot.replace(runnable),
+            None => return Err(runnable),
+        };
+        self.maybe_activate(queue.clone());
+        Ok(displaced)
     }
 
     fn maybe_activate(&mut self, queue: Rc<RefCell<TaskQueue>>) {
@@ -1727,6 +1915,7 @@ impl LocalExecutor {
     /// is not the same as having nothing to run, and the caller parks on the
     /// answer.
     fn run_task_queues(&self) -> TaskQueueRun {
+        self.context.end_preempted_window();
         loop {
             self.context.reactor.sys.install_eventfd();
             if self.need_preempt() {
@@ -1747,6 +1936,14 @@ impl LocalExecutor {
     /// Computes the smallest vruntime out of all the active task queues. This
     /// value is used to set the vruntime of deactivated task queues when they
     /// are woken up.
+    ///
+    /// The guard that ends the run is armed before anything else runs: a
+    /// queue's shares manager and the stall detector are user code, and a
+    /// panic in either must not leave the run marked as under way. The run is
+    /// ended before the stall detector's guard is dropped, since dropping that
+    /// guard reports a stall through user code that can take a while, and the
+    /// queue must not be charged for it. A run that unwinds drops the stall
+    /// guard first.
     fn run_one_task_queue(&self) -> bool {
         let mut tq = self.context.queues.borrow_mut();
         let candidate = tq.active_executors.pop();
@@ -1758,21 +1955,24 @@ impl LocalExecutor {
 
         let queue = candidate.unwrap();
         tq.active_executing = Some(queue.clone());
+        tq.in_slice = true;
         drop(tq);
 
-        let time = {
-            let now = Instant::now();
-            let mut queue_ref = queue.borrow_mut();
-            queue_ref.prepare_to_run(now);
+        let time = Instant::now();
+        let mut run = scopeguard::guard((queue, 0, None), |(queue, tasks_executed, preempted)| {
+            self.finish_task_queue_run(queue, time.elapsed(), tasks_executed, preempted)
+        });
+        {
+            let mut queue_ref = run.0.borrow_mut();
+            queue_ref.prepare_to_run(time);
             self.context
                 .reactor
                 .inform_io_requirements(queue_ref.io_requirements);
-            now
-        };
+        }
 
         let detector = self.stall_detector.borrow().clone();
         let _stall_guard = detector.as_ref().map(|x| {
-            let queue = queue.borrow_mut();
+            let queue = run.0.borrow_mut();
             x.enter_task_queue(
                 queue.stats.index,
                 queue.name.clone(),
@@ -1780,24 +1980,27 @@ impl LocalExecutor {
                 self.preempt_timer_duration(),
             )
         });
-
-        let mut run = scopeguard::guard((queue, 0), |(queue, tasks_executed)| {
-            self.finish_task_queue_run(queue, time.elapsed(), tasks_executed)
-        });
+        let mut last = None;
         loop {
+            if self.need_preempt() {
+                run.2 = Some(last);
+                break;
+            }
             let mut queue_ref = run.0.borrow_mut();
-            if self.need_preempt() || queue_ref.yielded() {
+            if queue_ref.yielded() {
                 break;
             }
 
             if let Some(r) = queue_ref.get_task() {
                 drop(queue_ref);
+                last = Some(r.raw_task.as_ptr().addr());
                 r.run();
                 run.1 += 1;
             } else {
                 break;
             }
         }
+        drop(run);
         true
     }
 
@@ -1806,13 +2009,31 @@ impl LocalExecutor {
     /// Runs on unwind as well: a panicking task leaves its queue active, and a
     /// queue left active outside the heap is never pushed again, so the
     /// executor would park forever on its next `run`.
+    ///
+    /// `preempted` is set if `need_preempt` ended the run, to the address of
+    /// the task that was running, or to `None` if it ended the run before any
+    /// task was polled.
+    /// The task polled last is remembered alongside any task a window opened
+    /// earlier in the run already remembers, from a task's inline first poll.
+    /// A queue whose only runnable is held stays runnable, so that it keeps
+    /// the vruntime it was charged.
+    ///
+    /// Only a run that `need_preempt` ended can have a window open when it
+    /// returns normally: a window opens during a run only when the timer fires
+    /// in an inline poll, by a task or by cleanup as the run is set up, nothing
+    /// polls the rings while tasks run, and so the run loop ends the run on
+    /// `need_preempt` at its next check, which can come before it polls any
+    /// task. A run that unwinds can end before that check, though, so whether
+    /// the window holds the queue's only runnable is asked however the run
+    /// ended.
     fn finish_task_queue_run(
         &self,
         queue: Rc<RefCell<TaskQueue>>,
         runtime: Duration,
         tasks_executed_this_loop: u64,
+        preempted: Option<Option<usize>>,
     ) {
-        let (need_repush, vruntime) = {
+        let (mut need_repush, vruntime) = {
             let mut state = queue.borrow_mut();
             let last_vruntime = state.account_vruntime(runtime);
             (state.is_active(), last_vruntime)
@@ -1820,6 +2041,25 @@ impl LocalExecutor {
 
         let mut tq = self.context.queues.borrow_mut();
         tq.active_executing = None;
+        tq.in_slice = false;
+        let displaced = match preempted {
+            Some(Some(last)) => tq.preempted_last(&queue, last),
+            Some(None) => None,
+            None => {
+                debug_assert!(
+                    tq.preempted.is_none() || std::thread::panicking(),
+                    "a window opened in a slice that need_preempt did not end"
+                );
+                None
+            }
+        };
+        if !need_repush && tq.preempted.is_some() {
+            let index = queue.borrow().index();
+            if tq.preempted.as_ref().is_some_and(|p| p.holds_for(index)) {
+                queue.borrow_mut().active = true;
+                need_repush = true;
+            }
+        }
         tq.stats.executor_runtime += runtime;
         tq.stats.tasks_executed += tasks_executed_this_loop;
         let vruntime = match vruntime {
@@ -1844,6 +2084,10 @@ impl LocalExecutor {
             .peek()
             .map(|x| x.borrow().vruntime)
             .unwrap_or(vruntime);
+        drop(tq);
+        if let Some(displaced) = displaced {
+            self.context.requeue(displaced);
+        }
     }
 
     /// Runs the executor until the given future completes.
@@ -1868,6 +2112,7 @@ impl LocalExecutor {
     /// upon cancellation or panic, so in case of panic this just propagates.
     pub fn run<T>(&self, future: impl Future<Output = T>) -> T {
         let run = |this: &Self| {
+            let _window = scopeguard::guard((), |()| this.context.end_preempted_window());
             let cx = &mut Context::from_waker(Waker::noop());
 
             let spin_before_park = self.spin_before_park().unwrap_or_default();
@@ -1903,6 +2148,13 @@ impl LocalExecutor {
                     } else {
                         while !this.context.reactor.spin_poll_io().unwrap() {
                             if pre_time.elapsed() > spin_before_park {
+                                this.context.end_preempted_window();
+                                #[cfg(test)]
+                                if let Some(hook) =
+                                    BEFORE_PARK.with(|hook| hook.borrow_mut().take())
+                                {
+                                    hook();
+                                }
                                 debug_assert!(
                                     this.context.queues.borrow().active_executors.is_empty(),
                                     "parking with {} runnable task queues: nothing will wake us",
@@ -3432,6 +3684,13 @@ impl ExecutorProxy {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once, just before the executor parks, by a test that needs to act
+    /// at that moment.
+    static BEFORE_PARK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -5381,5 +5640,1947 @@ mod test {
             worst < BOUND,
             "the latency queue waited {worst:?} for the CPU, its promise is 5ms"
         );
+    }
+
+    /// How the busy task in the preemption order tests ends a slice.
+    #[derive(Clone, Copy, Debug)]
+    enum SliceEnd {
+        /// Awaits a nop, which completes as it is submitted.
+        Nop,
+        /// Calls `yield_if_needed`, which requeues the task as it yields.
+        Yield,
+        /// Spawns a task, which is polled at once and wakes itself, and then
+        /// yields: the slice was spent before the spawn.
+        SpawnThenYield,
+        /// Yields, having done its work in tasks it spawned, each polled at
+        /// once and spinning for 200 us before it finishes, so that the
+        /// preempt timer fires during one of them.
+        YieldAfterInlineWork,
+        /// Parks on a timer registered as the slice began, which is due by the
+        /// time it ends. A timer already due when awaited completes at once,
+        /// without a reactor pass.
+        DueTimer,
+    }
+
+    /// What the woken task in the preemption order tests waits on.
+    #[derive(Clone, Copy, Debug)]
+    enum Wake {
+        /// A 1 ms timer, which comes due during the busy task's slice.
+        Timer,
+        /// A nop, which completes in the first poll after the slice.
+        Nop,
+    }
+
+    /// Awaits a nop through the ring.
+    async fn nop() {
+        crate::executor()
+            .reactor()
+            .nop()
+            .collect_rw()
+            .await
+            .expect("a nop cannot fail");
+    }
+
+    /// Registers a timer that wakes the current task, so that a reactor pass
+    /// fires it rather than the next poll completing it, however long the
+    /// thread is away before it is polled.
+    async fn registered_timer() -> Timer {
+        let waker = poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+        timer_waking(&waker, Duration::from_micros(100))
+    }
+
+    /// Returns pending once without arranging a wake, so the task runs again
+    /// only when something it registered with earlier wakes it.
+    async fn park_once() {
+        let mut parked = false;
+        poll_fn(|_| {
+            if parked {
+                Poll::Ready(())
+            } else {
+                parked = true;
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    thread_local! {
+        /// The timer [`SpawnOnWake`] keeps armed, while one is wanted.
+        static SPAWNING: RefCell<Option<Timer>> = const { RefCell::new(None) };
+    }
+
+    /// A waker that spawns a task, which is polled inline at once and wakes
+    /// itself, so that it is still pending when that poll returns, and arms a
+    /// timer to be woken again in a millisecond.
+    ///
+    /// The reactor wakes timers before it reaps the preempt timer's
+    /// completion, so in the pass after a preempted slice the inline poll
+    /// returns with `need_preempt` still set.
+    struct SpawnOnWake;
+
+    impl std::task::Wake for SpawnOnWake {
+        fn wake(self: std::sync::Arc<Self>) {
+            if SPAWNING.with(|spawning| spawning.borrow().is_none()) {
+                return;
+            }
+            crate::spawn_local(async { crate::executor().yield_now().await }).detach();
+            arm_spawning_timer(self);
+        }
+    }
+
+    /// Arms a 1 ms timer that wakes `waker`.
+    fn arm_spawning_timer(waker: std::sync::Arc<SpawnOnWake>) {
+        let timer = timer_waking(&Waker::from(waker), Duration::from_millis(1));
+        let previous = SPAWNING.with(|spawning| spawning.borrow_mut().replace(timer));
+        drop(previous);
+    }
+
+    /// A timer that wakes `waker` after `after`, registered with the reactor
+    /// however long the thread is away between creating and polling it.
+    ///
+    /// A timer polled once its deadline has passed completes without
+    /// registering its waker, so this one is polled with no deadline, which
+    /// parks the waker, and then reset, which registers the parked waker
+    /// whatever the deadline.
+    fn timer_waking(waker: &Waker, after: Duration) -> Timer {
+        let mut timer = Timer::new(Duration::MAX);
+        assert!(Pin::new(&mut timer)
+            .poll(&mut Context::from_waker(waker))
+            .is_pending());
+        timer.reset(after);
+        timer
+    }
+
+    /// Asserts that a task woken during another task's preempted slice runs
+    /// before that task's next slice.
+    ///
+    /// `busy` spins until the preempt timer fires and then ends its slice as
+    /// `end` says. `woken` waits on `wake` in a loop. Each wait completes
+    /// during, or right after, one of `busy`'s slices, so `woken` should run
+    /// when that slice ends. If `busy` is queued ahead of it instead, `busy`
+    /// takes another whole slice first.
+    ///
+    /// With `queues` set to 2 the tasks run in two queues of equal shares,
+    /// otherwise both run in the default queue.
+    ///
+    /// `busy` counts the slices it ends and `woken` records the most that
+    /// ended between two of its polls, which must be one. Counting slices
+    /// rather than timing the gap keeps a thread the system descheduled from
+    /// reading as a second slice; the longest gap is reported alongside, and
+    /// it is two preempt periods when the order is wrong. A slice counts only
+    /// if `busy` spun for half a period or more: the preempt timer keeps its
+    /// own period rather than restarting with each round, so it can fire while
+    /// `woken` runs and end a slice of `busy` that has barely begun, and a
+    /// slice through which the thread was descheduled does not count either.
+    /// `woken` measures on every iteration, so the bound cannot hold
+    /// vacuously, and goes on until `busy` has ended as many counted slices
+    /// as there are gaps, measuring at most four times as many gaps, so a run
+    /// in which `busy` never spun, and `woken` was never kept waiting, fails
+    /// as well.
+    fn assert_a_woken_task_waits_one_slice(end: SliceEnd, wake: Wake, queues: usize) {
+        assert_a_woken_task_waits_one_slice_with(end, wake, queues, false)
+    }
+
+    /// As [`assert_a_woken_task_waits_one_slice`], and with `spawning`, a
+    /// waker run by every reactor pass spawns a task that is polled inline
+    /// while `need_preempt` is still set after a preempted slice.
+    fn assert_a_woken_task_waits_one_slice_with(
+        end: SliceEnd,
+        wake: Wake,
+        queues: usize,
+        spawning: bool,
+    ) {
+        const PERIOD: Duration = Duration::from_millis(20);
+        const GAPS: usize = 10;
+        const LIMIT: Duration = Duration::from_secs(10);
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(PERIOD)
+            .make()
+            .unwrap();
+        let (most, worst, measured, slices) = ex.run(async move {
+            let (busy_queue, woken_queue) = match queues {
+                1 => (TaskQueueHandle::default(), TaskQueueHandle::default()),
+                2 => (
+                    crate::executor().create_task_queue(
+                        Shares::default(),
+                        Latency::NotImportant,
+                        "busy",
+                    ),
+                    crate::executor().create_task_queue(
+                        Shares::default(),
+                        Latency::NotImportant,
+                        "woken",
+                    ),
+                ),
+                _ => unreachable!("the tests run one queue or two"),
+            };
+            let done = Rc::new(Cell::new(false));
+            let slices = Rc::new(Cell::new(0usize));
+            let busy = crate::spawn_local_into(
+                enclose! { (done, slices) async move {
+                    let start = Instant::now();
+                    let mut spun = Instant::now();
+                    let mut _due = match end {
+                        SliceEnd::DueTimer => Some(registered_timer().await),
+                        _ => None,
+                    };
+                    while !done.get() {
+                        assert!(start.elapsed() < LIMIT, "the busy task was never preempted");
+                        if let SliceEnd::YieldAfterInlineWork = end {
+                            crate::spawn_local(async {
+                                let work = Instant::now();
+                                while work.elapsed() < Duration::from_micros(200) {}
+                            })
+                            .detach();
+                        }
+                        if crate::executor().need_preempt() {
+                            if spun.elapsed() >= PERIOD / 2 {
+                                slices.set(slices.get() + 1);
+                            }
+                            match end {
+                                SliceEnd::Nop => nop().await,
+                                SliceEnd::Yield => crate::yield_if_needed().await,
+                                SliceEnd::YieldAfterInlineWork => crate::yield_if_needed().await,
+                                SliceEnd::SpawnThenYield => {
+                                    crate::spawn_local(async {
+                                        crate::executor().yield_now().await;
+                                    })
+                                    .detach();
+                                    crate::yield_if_needed().await;
+                                }
+                                SliceEnd::DueTimer => {
+                                    park_once().await;
+                                    _due = Some(registered_timer().await);
+                                }
+                            }
+                            spun = Instant::now();
+                        }
+                    }
+                }},
+                busy_queue,
+            )
+            .unwrap();
+            let woken = crate::spawn_local_into(
+                enclose! { (slices) async move {
+                    let wait = || async move {
+                        match wake {
+                            Wake::Timer => {
+                                Timer::new(Duration::from_millis(1)).await;
+                            }
+                            Wake::Nop => nop().await,
+                        }
+                    };
+                    wait().await;
+                    let mut most = 0usize;
+                    let mut worst = Duration::ZERO;
+                    let mut measured = 0usize;
+                    let mut last = (slices.get(), Instant::now());
+                    while (measured < GAPS || slices.get() < GAPS) && measured < GAPS * 4 {
+                        wait().await;
+                        let now = (slices.get(), Instant::now());
+                        most = most.max(now.0 - last.0);
+                        worst = worst.max(now.1 - last.1);
+                        measured += 1;
+                        last = now;
+                    }
+                    done.set(true);
+                    (most, worst, measured)
+                }},
+                woken_queue,
+            )
+            .unwrap();
+            if spawning {
+                arm_spawning_timer(std::sync::Arc::new(SpawnOnWake));
+            }
+            let (most, worst, measured) = woken.await;
+            let armed = SPAWNING.with(|spawning| spawning.borrow_mut().take());
+            drop(armed);
+            busy.await;
+            (most, worst, measured, slices.get())
+        });
+        assert!(
+            measured >= GAPS,
+            "the woken task measured {measured} of {GAPS} gaps"
+        );
+        assert!(
+            slices >= GAPS,
+            "the busy task ran {slices} slices for {GAPS} gaps, so it never held the woken task back"
+        );
+        assert!(
+            most <= 1,
+            "with the busy task ending its slices on {end:?} and the woken task waiting on \
+             {wake:?} in {queues} queue(s), the busy task ran {most} slices in a row, and the \
+             woken task waited up to {worst:?} for the CPU with a {PERIOD:?} preempt timer"
+        );
+    }
+
+    /// The executor forgets the preempted task when `run` returns, and
+    /// queues it if it was held.
+    ///
+    /// A task spawned after `run` returns can be allocated where a task that
+    /// finished in the last slice was, so a record kept past `run` could take
+    /// it for that task. The first `run` ends with the slice its own future
+    /// spent until preempted; the second ends with one `busy` spent, which
+    /// is held as it yields.
+    #[test]
+    fn run_forgets_the_preempted_task_when_it_returns() {
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_millis(5))
+            .make()
+            .unwrap();
+        ex.run(async { while !crate::executor().need_preempt() {} });
+        assert!(
+            ex.context.queues.borrow().preempted.is_none(),
+            "the task that spent the last slice is still remembered"
+        );
+
+        let (ex, _, _) = run_ending_with_a_held_task();
+        assert!(
+            ex.context.queues.borrow().preempted.is_none(),
+            "the held task is still remembered"
+        );
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        assert_eq!(
+            queue.borrow().runnables.len(),
+            1,
+            "the held task was not queued"
+        );
+    }
+
+    /// A preempted task that wakes itself and then another task is queued
+    /// after that task.
+    ///
+    /// A task woken while it runs is queued when its poll returns, after
+    /// anything it woke. So a task that yielded is always the last runnable
+    /// pushed before its slice is accounted, and looking at the back of its
+    /// queue finds it whenever it is there: holding it back needs no scan and
+    /// has no case to fall back from. This test fails if that stops being
+    /// true. `busy` spins until preempted, wakes itself and then `woken`, and
+    /// notes how many slices it has ended; `woken` runs before its next one.
+    #[test]
+    fn a_preempted_task_is_queued_after_a_task_it_woke_after_itself() {
+        const WAKES: usize = 5;
+        const LIMIT: Duration = Duration::from_secs(10);
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_millis(10))
+            .make()
+            .unwrap();
+        let lags = ex.run(async {
+            let slices = Rc::new(Cell::new(0usize));
+            let woke_at = Rc::new(Cell::new(0usize));
+            let parked: Rc<RefCell<Option<Waker>>> = Rc::new(RefCell::new(None));
+            let done = Rc::new(Cell::new(false));
+            let busy = crate::spawn_local_into(
+                enclose! { (slices, woke_at, parked, done) async move {
+                    let start = Instant::now();
+                    while !done.get() {
+                        assert!(start.elapsed() < LIMIT, "the busy task was never preempted");
+                        if crate::executor().need_preempt() {
+                            slices.set(slices.get() + 1);
+                            let mut yielded = false;
+                            poll_fn(|cx| {
+                                if yielded {
+                                    return Poll::Ready(());
+                                }
+                                yielded = true;
+                                cx.waker().wake_by_ref();
+                                if let Some(waker) = parked.borrow_mut().take() {
+                                    woke_at.set(slices.get());
+                                    waker.wake();
+                                }
+                                Poll::Pending
+                            })
+                            .await;
+                        }
+                    }
+                }},
+                TaskQueueHandle::default(),
+            )
+            .unwrap();
+            let mut lags = Vec::new();
+            for _ in 0..WAKES {
+                let mut waiting = false;
+                poll_fn(|cx| {
+                    if waiting {
+                        return Poll::Ready(());
+                    }
+                    waiting = true;
+                    *parked.borrow_mut() = Some(cx.waker().clone());
+                    Poll::Pending
+                })
+                .await;
+                lags.push(slices.get() - woke_at.get());
+            }
+            done.set(true);
+            busy.await;
+            lags
+        });
+        assert_eq!(
+            lags, [0; WAKES],
+            "slices the busy task ended before the task it woke ran"
+        );
+    }
+
+    /// The busy task for the tests of a task held when `run` returns.
+    ///
+    /// It spins until preempted and yields, forever, counting its slices, and
+    /// counts in `dropped` when its future is dropped.
+    fn spawn_held_task(slices: Rc<Cell<usize>>, dropped: Rc<Cell<usize>>) {
+        struct Dropped(Rc<Cell<usize>>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        crate::spawn_local_into(
+            async move {
+                let _dropped = Dropped(dropped);
+                loop {
+                    if crate::executor().need_preempt() {
+                        slices.set(slices.get() + 1);
+                        crate::yield_if_needed().await;
+                    }
+                }
+            },
+            TaskQueueHandle::default(),
+        )
+        .unwrap()
+        .detach();
+    }
+
+    /// An executor whose last `run` ended with `busy`, from `spawn_held_task`,
+    /// held, and `busy`'s slice and drop counts.
+    ///
+    /// `run`'s future spawns `busy` and returns, `busy` spends the rest of the
+    /// round, and its slice ends in preemption with the task the only one in
+    /// its queue, so it is held. If the preempt timer fires before `busy` is
+    /// first polled, the round ends without it, so a run in which `busy`
+    /// ended no slice is made again on a new executor.
+    fn run_ending_with_a_held_task() -> (LocalExecutor, Rc<Cell<usize>>, Rc<Cell<usize>>) {
+        for _ in 0..10 {
+            let slices = Rc::new(Cell::new(0usize));
+            let dropped = Rc::new(Cell::new(0usize));
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            ex.run(enclose! { (slices, dropped) async move {
+                spawn_held_task(slices, dropped);
+            }});
+            if slices.get() == 1 {
+                return (ex, slices, dropped);
+            }
+        }
+        panic!("the busy task never ended a slice before a run returned");
+    }
+
+    /// A task held back when `run` returns is queued again, so the next `run`
+    /// runs it.
+    ///
+    /// The first `run`'s future spawns `busy` and returns, `busy` spends the
+    /// rest of the round, and its slice ends in preemption with the task the
+    /// only one in its queue, so it is held. Then `run` returns.
+    #[test]
+    fn a_task_held_when_run_returns_runs_in_the_next_run() {
+        const LIMIT: Duration = Duration::from_secs(10);
+
+        let (ex, slices, dropped) = run_ending_with_a_held_task();
+        ex.run(enclose! { (slices) async move {
+            let start = Instant::now();
+            while slices.get() < 3 && start.elapsed() < LIMIT {
+                Timer::new(Duration::from_millis(1)).await;
+            }
+        }});
+        assert!(
+            slices.get() >= 3,
+            "the held task ran {} slices in all",
+            slices.get()
+        );
+        drop(ex);
+        assert_eq!(
+            dropped.get(),
+            1,
+            "the held task was dropped {} times",
+            dropped.get()
+        );
+    }
+
+    /// A task held back when `run` returns is dropped with the executor, once.
+    #[test]
+    fn a_task_held_when_run_returns_is_dropped_with_the_executor() {
+        let (ex, _, dropped) = run_ending_with_a_held_task();
+        drop(ex);
+        assert_eq!(
+            dropped.get(),
+            1,
+            "the held task was dropped {} times",
+            dropped.get()
+        );
+    }
+
+    /// A preempted task that is the only one runnable is not lost while it is
+    /// held, whether the executor finds its wake before going idle or parks
+    /// straight after the slice.
+    ///
+    /// `busy` spins until preempted and then waits on a nop, which completes
+    /// in the first poll after the slice, or on a 20 ms timer, which the
+    /// executor parks for. The executor runs on its own thread so that a lost
+    /// wake fails the test rather than hanging it.
+    #[test]
+    fn a_lone_preempted_task_is_not_lost() {
+        const SLICES: usize = 5;
+
+        for wake in [Wake::Nop, Wake::Timer] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let _thread = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .spawn(move || async move {
+                    for _ in 0..SLICES {
+                        while !crate::executor().need_preempt() {}
+                        match wake {
+                            Wake::Nop => nop().await,
+                            Wake::Timer => {
+                                Timer::new(Duration::from_millis(20)).await;
+                            }
+                        }
+                    }
+                    sender.send(()).unwrap();
+                })
+                .unwrap();
+            assert!(
+                receiver.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "a task waiting on {wake:?} after its slice was never run again"
+            );
+        }
+    }
+
+    thread_local! {
+        /// The wakers `parked_until_woken` leaves, by slot, for
+        /// [`WakeParked`] to wake in order.
+        static PARKED: RefCell<Vec<Option<Waker>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// A waker that wakes every task parked with `parked_until_woken`, in slot
+    /// order, from wherever it is itself woken.
+    struct WakeParked;
+
+    impl std::task::Wake for WakeParked {
+        fn wake(self: std::sync::Arc<Self>) {
+            let wakers: Vec<Waker> = PARKED.with(|parked| {
+                parked
+                    .borrow_mut()
+                    .iter_mut()
+                    .filter_map(Option::take)
+                    .collect()
+            });
+            for waker in wakers {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Leaves this task's waker in `slot` and waits until it is woken.
+    async fn parked_until_woken(slot: usize) {
+        let mut parked = false;
+        poll_fn(|cx| {
+            if parked {
+                Poll::Ready(())
+            } else {
+                parked = true;
+                PARKED.with(|wakers| wakers.borrow_mut()[slot] = Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    thread_local! {
+        /// The timer [`BEFORE_PARK`] arms in the park order test.
+        static PARK_TIMER: RefCell<Option<Timer>> = const { RefCell::new(None) };
+    }
+
+    /// The window a preempted slice opens ends before the executor parks, so
+    /// the tasks woken after a park run in the order they were woken.
+    ///
+    /// `other` parks, then `preempted` spins until preempted and parks too.
+    /// Nothing is runnable then, and just before the executor parks a hook
+    /// arms a 1 ms timer polled with [`WakeParked`], which wakes `preempted`
+    /// and then `other` in the pass after the park. Were `preempted` still
+    /// remembered, it would be held behind `other`. The executor runs on its
+    /// own thread so that a lost wake fails the test rather than hanging it.
+    #[test]
+    fn tasks_woken_after_a_park_run_in_the_order_they_were_woken() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _thread = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_millis(5))
+            .spawn(move || async move {
+                PARKED.with(|parked| *parked.borrow_mut() = vec![None, None]);
+                BEFORE_PARK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(|| {
+                        let waker = Waker::from(std::sync::Arc::new(WakeParked));
+                        let timer = timer_waking(&waker, Duration::from_millis(1));
+                        PARK_TIMER.with(|armed| *armed.borrow_mut() = Some(timer));
+                    }));
+                });
+                let order = Rc::new(RefCell::new(Vec::new()));
+                let other = crate::spawn_local_into(
+                    enclose! { (order) async move {
+                        parked_until_woken(1).await;
+                        order.borrow_mut().push("other");
+                    }},
+                    TaskQueueHandle::default(),
+                )
+                .unwrap();
+                let preempted = crate::spawn_local_into(
+                    enclose! { (order) async move {
+                        while !crate::executor().need_preempt() {}
+                        parked_until_woken(0).await;
+                        order.borrow_mut().push("preempted");
+                    }},
+                    TaskQueueHandle::default(),
+                )
+                .unwrap();
+                preempted.await;
+                other.await;
+                let order = order.borrow().clone();
+                sender.send(order).unwrap();
+            })
+            .unwrap();
+        let order = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a task woken after the park never ran");
+        assert_eq!(order, ["preempted", "other"]);
+    }
+
+    /// A window that remembers the task at `task` as the inline one, holding
+    /// nothing yet.
+    fn window(task: usize) -> Preempted {
+        let mut window = Preempted::new();
+        window.inline.push(Held {
+            task,
+            runnable: None,
+        });
+        window
+    }
+
+    /// A runnable for a task in `queue` that nothing has scheduled, its
+    /// address, and a flag its future sets when it is dropped.
+    fn unscheduled_in(
+        ex: &LocalExecutor,
+        queue: Rc<RefCell<TaskQueue>>,
+    ) -> (multitask::Runnable, usize, Rc<Cell<bool>>) {
+        struct Dropped(Rc<Cell<bool>>);
+
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let guard = Dropped(dropped.clone());
+        let scheduler = queue.borrow().scheduler.clone();
+        let (runnable, handle) =
+            scheduler.spawn_unscheduled(ex.task_registry(), queue, async move {
+                drop(guard);
+            });
+        drop(handle);
+        let address = runnable.raw_task.as_ptr().addr();
+        (runnable, address, dropped)
+    }
+
+    /// A runnable for a task in the default queue that nothing has scheduled,
+    /// its address, and a flag its future sets when it is dropped.
+    fn unscheduled(ex: &LocalExecutor) -> (multitask::Runnable, usize, Rc<Cell<bool>>) {
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        unscheduled_in(ex, queue)
+    }
+
+    /// The addresses of the tasks queued in `queue`, in order.
+    fn queued(queue: &Rc<RefCell<TaskQueue>>) -> Vec<usize> {
+        queue
+            .borrow()
+            .runnables
+            .iter()
+            .map(|runnable| runnable.raw_task.as_ptr().addr())
+            .collect()
+    }
+
+    /// Holding a runnable activates its queue, so an executor with nothing
+    /// else to run does not go idle while it is held, and the end of the
+    /// window queues it.
+    #[test]
+    fn holding_a_task_activates_its_queue() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        let (runnable, address, _) = unscheduled(&ex);
+        assert!(!queue.borrow().is_active());
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.preempted = Some(window(address));
+            assert!(matches!(queues.hold(&queue, runnable), Ok(None)));
+        }
+        assert!(queue.borrow().is_active());
+        assert!(queue.borrow().runnables.is_empty());
+        ex.context.end_preempted_window();
+        assert_eq!(queue.borrow().runnables.len(), 1);
+    }
+
+    /// A queue whose only runnable is held at the end of its slice stays
+    /// runnable, so it keeps the vruntime it was charged rather than being
+    /// placed afresh when the runnable is queued again. The run ends on
+    /// `need_preempt`, as one in which a window opened always does.
+    #[test]
+    fn a_queue_whose_only_task_is_held_stays_runnable() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        let (runnable, address, _) = unscheduled(&ex);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.preempted = Some(window(address));
+            assert!(matches!(queues.hold(&queue, runnable), Ok(None)));
+            queues.active_executors.clear();
+            queues.active_executing = Some(queue.clone());
+        }
+        ex.finish_task_queue_run(queue.clone(), Duration::from_millis(1), 1, Some(Some(1)));
+        assert!(queue.borrow().is_active(), "the queue went idle");
+        assert_eq!(
+            ex.context.queues.borrow().active_executors.len(),
+            1,
+            "the queue was not returned to the scheduler"
+        );
+        ex.context.end_preempted_window();
+        assert_eq!(queue.borrow().runnables.len(), 1);
+    }
+
+    /// A queue whose only runnable is held stays runnable when its run unwinds
+    /// before the run loop sees the preempt timer.
+    ///
+    /// A task polled inline during whose poll the timer fired is held as the
+    /// poll returns, and its spawner can then panic, so the run ends with no
+    /// task recorded as the one that spent it.
+    #[test]
+    fn a_queue_whose_only_task_is_held_stays_runnable_when_its_run_unwinds() {
+        struct FinishOnDrop<'a>(&'a LocalExecutor, Rc<RefCell<TaskQueue>>);
+
+        impl Drop for FinishOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .finish_task_queue_run(self.1.clone(), Duration::from_millis(1), 1, None);
+            }
+        }
+
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        let (runnable, address, _) = unscheduled(&ex);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.preempted = Some(window(address));
+            assert!(matches!(queues.hold(&queue, runnable), Ok(None)));
+            queues.active_executors.clear();
+            queues.active_executing = Some(queue.clone());
+        }
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _finish = FinishOnDrop(&ex, queue.clone());
+            panic!("the run unwinds");
+        }));
+        assert!(unwound.is_err());
+        assert!(queue.borrow().is_active(), "the queue went idle");
+        assert_eq!(
+            ex.context.queues.borrow().active_executors.len(),
+            1,
+            "the queue was not returned to the scheduler"
+        );
+        ex.context.end_preempted_window();
+        assert_eq!(queue.borrow().runnables.len(), 1);
+    }
+
+    /// A runnable held for another queue does not keep a finishing queue with
+    /// nothing to run in the scheduler.
+    #[test]
+    fn a_task_held_for_another_queue_does_not_keep_the_finishing_one_runnable() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        let other = ex
+            .context
+            .create_task_queue(Shares::default(), Latency::NotImportant, "other");
+        let other = ex.context.get_queue(&other).unwrap();
+        let (runnable, address, _) = unscheduled_in(&ex, other.clone());
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.preempted = Some(window(address));
+            assert!(matches!(queues.hold(&other, runnable), Ok(None)));
+            queues.active_executing = Some(queue.clone());
+        }
+        queue.borrow_mut().active = true;
+        ex.finish_task_queue_run(queue.clone(), Duration::from_millis(1), 1, Some(Some(1)));
+        assert!(
+            !queue.borrow().is_active(),
+            "the finishing queue was kept runnable for another queue's task"
+        );
+        ex.context.end_preempted_window();
+        assert_eq!(queued(&other), [address]);
+    }
+
+    /// The end of a window queues the tasks it held in the order they were
+    /// queued: the tasks polled inline first, innermost first, then the task
+    /// the run loop polled last.
+    #[test]
+    fn held_tasks_are_queued_in_the_order_they_were_queued() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        let (inner, inner_address, _) = unscheduled(&ex);
+        let (outer, outer_address, _) = unscheduled(&ex);
+        let (last, last_address, _) = unscheduled(&ex);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            let mut window = window(inner_address);
+            window.inline.push(Held {
+                task: outer_address,
+                runnable: None,
+            });
+            window.last = Some(Held {
+                task: last_address,
+                runnable: None,
+            });
+            queues.preempted = Some(window);
+            assert!(matches!(queues.hold(&queue, last), Ok(None)));
+            assert!(matches!(queues.hold(&queue, outer), Ok(None)));
+            assert!(matches!(queues.hold(&queue, inner), Ok(None)));
+        }
+        ex.context.end_preempted_window();
+        assert_eq!(queued(&queue), [inner_address, outer_address, last_address]);
+    }
+
+    /// A runnable held for the last task is queued, not dropped, if another
+    /// takes its slot.
+    ///
+    /// A window ends before the next round, so a second slice end cannot
+    /// reach the same window, and a task is queued at most once, so a hold
+    /// cannot meet its own runnable. Dropping a runnable runs user code,
+    /// though, and here the queues are borrowed, so the displaced one goes
+    /// back to its queue once they are not.
+    #[test]
+    fn a_held_task_displaced_from_the_slot_is_queued_not_dropped() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        let (first, first_address, first_dropped) = unscheduled(&ex);
+        let (second, second_address, _) = unscheduled(&ex);
+        queue.borrow_mut().runnables.push_back(first);
+        let displaced = ex
+            .context
+            .queues
+            .borrow_mut()
+            .preempted_last(&queue, first_address);
+        assert!(displaced.is_none());
+        queue.borrow_mut().runnables.push_back(second);
+        let displaced = ex
+            .context
+            .queues
+            .borrow_mut()
+            .preempted_last(&queue, second_address)
+            .expect("the first task was not displaced");
+        ex.context.requeue(displaced);
+        assert_eq!(queued(&queue), [first_address]);
+        assert!(!first_dropped.get(), "the displaced task was dropped");
+        ex.context.end_preempted_window();
+        assert_eq!(queued(&queue), [first_address, second_address]);
+    }
+
+    rusty_fork_test! {
+        /// A held runnable whose queue is gone is cancelled with no borrow
+        /// held: cancelling wakes the task awaiting it, whose schedule
+        /// borrows the queues, and under a borrow the process aborts. So
+        /// this runs in a process of its own.
+        #[test]
+        fn a_held_task_whose_queue_is_gone_is_cancelled_with_no_borrow_held() {
+            let ex = LocalExecutor::default();
+            let context = &ex.context;
+            ex.run(async {
+                let handle = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::NotImportant,
+                    "gone",
+                );
+                let queue = context.get_queue(&handle).unwrap();
+                let scheduler = queue.borrow().scheduler.clone();
+                let (runnable, join) =
+                    scheduler.spawn_unscheduled(&context.tasks, queue.clone(), async {});
+                drop(queue);
+                let awaiter = crate::spawn_local(join);
+                crate::executor().remove_task_queue(handle).unwrap();
+                context.requeue(runnable);
+                assert!(awaiter.await.is_none(), "the task was not cancelled");
+            });
+        }
+    }
+
+    /// What the spawner in the inline poll tests does after the spawn.
+    #[derive(Clone, Copy, Debug)]
+    enum AfterInline {
+        /// Goes on to await the spawned task.
+        Awaits,
+        /// Yields first, since the preempt timer has fired, so that both
+        /// tasks are queued when the slice ends.
+        Yields,
+        /// Spawns a second task, which wakes itself once and so is queued
+        /// behind the first.
+        SpawnsAnother,
+    }
+
+    /// Asserts that a task woken during a slice spent in the inline first poll
+    /// of a spawned task runs before that task's next slice.
+    ///
+    /// `spawner` spawns `busy` with `spawn_local`, which polls it inside
+    /// `spawner`'s own poll. `busy` spins until preempted, yields, notes that it
+    /// runs again, spins a second slice and finishes. Before `busy`, `spawner`
+    /// spawns `woken`, which waits on a 1 ms timer that comes due during
+    /// `busy`'s first slice and then notes whether `busy` has run again: it
+    /// must not have. After the spawn `spawner` does what `after` says.
+    ///
+    /// A slice counts only if `busy` spun for half a period or more, and each
+    /// round is measured only if its first slice counted, so a round in which
+    /// the timer fired before `busy` began proves nothing either way; most
+    /// rounds must be measured.
+    fn assert_a_woken_task_runs_before_an_inline_poll_s_next_slice(after: AfterInline) {
+        const PERIOD: Duration = Duration::from_millis(20);
+        const ROUNDS: usize = 10;
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(PERIOD)
+            .make()
+            .unwrap();
+        let seen = ex.run(async move {
+            crate::spawn_local_into(
+                async move {
+                    let mut seen = Vec::new();
+                    for _ in 0..ROUNDS {
+                        let slices = Rc::new(Cell::new(0usize));
+                        let resumed = Rc::new(Cell::new(false));
+                        let woken = crate::spawn_local(enclose! { (resumed) async move {
+                            Timer::new(Duration::from_millis(1)).await;
+                            resumed.get()
+                        }});
+                        let busy = crate::spawn_local(enclose! { (slices, resumed) async move {
+                            for slice in 0..2 {
+                                resumed.set(slice > 0);
+                                let spun = Instant::now();
+                                while !crate::executor().need_preempt() {}
+                                if spun.elapsed() >= PERIOD / 2 {
+                                    slices.set(slices.get() + 1);
+                                }
+                                crate::yield_if_needed().await;
+                            }
+                        }});
+                        let measured = slices.get() == 1;
+                        match after {
+                            AfterInline::Awaits => {}
+                            AfterInline::Yields => crate::yield_if_needed().await,
+                            AfterInline::SpawnsAnother => {
+                                crate::spawn_local(async {
+                                    crate::executor().yield_now().await;
+                                })
+                                .detach();
+                            }
+                        }
+                        let ran_after = woken.await;
+                        busy.await;
+                        if measured {
+                            seen.push(ran_after);
+                        }
+                    }
+                    seen
+                },
+                TaskQueueHandle::default(),
+            )
+            .unwrap()
+            .await
+        });
+        assert!(
+            seen.len() >= ROUNDS / 2,
+            "only {} of {ROUNDS} rounds began with a whole slice",
+            seen.len()
+        );
+        assert!(
+            seen.iter().all(|&resumed| !resumed),
+            "the inline task ran again before the woken task in these measured rounds: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_a_task_preempted_in_its_inline_first_poll() {
+        assert_a_woken_task_runs_before_an_inline_poll_s_next_slice(AfterInline::Awaits);
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_an_inline_task_whose_spawner_also_yielded() {
+        assert_a_woken_task_runs_before_an_inline_poll_s_next_slice(AfterInline::Yields);
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_an_inline_task_queued_before_another_spawned_task() {
+        assert_a_woken_task_runs_before_an_inline_poll_s_next_slice(AfterInline::SpawnsAnother);
+    }
+
+    /// Spins until the preempt timer fires and adds a slice to `slices` if it
+    /// spun for half a period or more.
+    fn spin_a_slice(slices: &Cell<usize>, period: Duration) {
+        let spun = Instant::now();
+        while !crate::executor().need_preempt() {}
+        if spun.elapsed() >= period / 2 {
+            slices.set(slices.get() + 1);
+        }
+    }
+
+    /// A task at `level` of a chain of `depth` tasks, each spawning the next
+    /// with `spawn_local`, so that each is polled inside the poll of the one
+    /// before it.
+    ///
+    /// The innermost spins until preempted. Every task yields then, the
+    /// innermost first as the polls return, and every one notes its level in
+    /// `order` and spins a whole slice when it runs again.
+    fn nested_inline(
+        level: usize,
+        depth: usize,
+        slices: Rc<Cell<usize>>,
+        order: Rc<RefCell<Vec<usize>>>,
+        period: Duration,
+    ) -> Pin<Box<dyn Future<Output = ()>>> {
+        Box::pin(async move {
+            if level < depth {
+                let child = crate::spawn_local(nested_inline(
+                    level + 1,
+                    depth,
+                    slices.clone(),
+                    order.clone(),
+                    period,
+                ));
+                crate::yield_if_needed().await;
+                order.borrow_mut().push(level);
+                spin_a_slice(&slices, period);
+                child.await;
+            } else {
+                spin_a_slice(&slices, period);
+                crate::yield_if_needed().await;
+                order.borrow_mut().push(level);
+                spin_a_slice(&slices, period);
+            }
+        })
+    }
+
+    /// Asserts that a task woken during a slice spent in the innermost of a
+    /// chain of `depth` inline first polls runs before any task of the chain
+    /// runs again.
+    ///
+    /// `spawner` spawns `woken`, which waits on a 1 ms timer, and then the
+    /// first task of the chain, and yields. Every task of the chain had a poll
+    /// under way when the timer fired, so every one goes behind `woken`. Each
+    /// notes its level when it runs again, and `woken` notes 0 when it runs,
+    /// so the order they ran in starts with 0. A round is measured only if the
+    /// innermost's first slice counted, so that the timer fired during the
+    /// chain's polls and `woken`'s timer was due as the slice ended.
+    fn assert_a_woken_task_runs_before_a_chain_of_inline_polls(depth: usize) {
+        const PERIOD: Duration = Duration::from_millis(20);
+        const ROUNDS: usize = 10;
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(PERIOD)
+            .make()
+            .unwrap();
+        let seen = ex.run(async move {
+            crate::spawn_local_into(
+                async move {
+                    let mut seen = Vec::new();
+                    for _ in 0..ROUNDS {
+                        let slices = Rc::new(Cell::new(0usize));
+                        let order = Rc::new(RefCell::new(Vec::new()));
+                        let woken = crate::spawn_local(enclose! { (order) async move {
+                            Timer::new(Duration::from_millis(1)).await;
+                            order.borrow_mut().push(0);
+                        }});
+                        let chain = crate::spawn_local(nested_inline(
+                            1,
+                            depth,
+                            slices.clone(),
+                            order.clone(),
+                            PERIOD,
+                        ));
+                        let measured = slices.get() == 1;
+                        crate::yield_if_needed().await;
+                        woken.await;
+                        chain.await;
+                        if measured {
+                            seen.push(order.take());
+                        }
+                    }
+                    seen
+                },
+                TaskQueueHandle::default(),
+            )
+            .unwrap()
+            .await
+        });
+        assert!(
+            seen.len() >= ROUNDS / 2,
+            "only {} of {ROUNDS} rounds began with a whole slice",
+            seen.len()
+        );
+        assert!(
+            seen.iter()
+                .all(|order| order.first() == Some(&0) && order.len() == depth + 1),
+            "with a chain of {depth} inline polls, the woken task, 0, and the tasks of the \
+             chain, by level, ran again in these orders: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_two_nested_inline_tasks() {
+        assert_a_woken_task_runs_before_a_chain_of_inline_polls(2);
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_three_nested_inline_tasks() {
+        assert_a_woken_task_runs_before_a_chain_of_inline_polls(3);
+    }
+
+    /// A task spawned outside any slice, by a destructor the executor runs
+    /// between runs, opens no window even if the preempt timer fires during
+    /// its first poll, and is queued as it wakes itself.
+    ///
+    /// Dropping a parked task between runs drops its future there and then,
+    /// and the future's destructor spawns `child`, which spins until the
+    /// preempt timer fires and yields. Whether the timer fires during that
+    /// poll depends on when the last run armed it, so a run in which it was
+    /// already pending is tried again.
+    #[test]
+    fn a_task_spawned_by_a_destructor_between_runs_opens_no_window() {
+        struct SpawnOnDrop(Rc<Cell<bool>>);
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let fired = self.0.clone();
+                crate::spawn_local(async move {
+                    let reactor = crate::executor().reactor();
+                    let pending = reactor.need_preempt();
+                    let start = Instant::now();
+                    while !reactor.need_preempt() && start.elapsed() < Duration::from_millis(500) {}
+                    fired.set(!pending && reactor.need_preempt());
+                    crate::executor().yield_now().await;
+                })
+                .detach();
+            }
+        }
+
+        for _ in 0..10 {
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            ex.run(async {});
+            let fired = Rc::new(Cell::new(false));
+            let guard = SpawnOnDrop(fired.clone());
+            let parked = ex.spawn(async move {
+                let _guard = guard;
+                futures::future::pending::<()>().await;
+            });
+            drop(parked);
+            if !fired.get() {
+                continue;
+            }
+            assert!(
+                ex.context.queues.borrow().preempted.is_none(),
+                "a window opened outside any slice"
+            );
+            let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+            assert_eq!(
+                queue.borrow().runnables.len(),
+                1,
+                "the child was not queued"
+            );
+            return;
+        }
+        panic!("the preempt timer never fired during the child's first poll");
+    }
+
+    /// A task spawned after the preempt timer fired is queued in its turn, not
+    /// held back as if it had spent the slice.
+    ///
+    /// `busy` spins until preempted, spawns `child`, which wakes itself once,
+    /// arms a timer that wakes `woken` in the next reactor pass, and yields.
+    /// `woken` is woken after `child` was queued, however the thread was
+    /// delayed before then, and `child` runs first.
+    #[test]
+    fn a_task_spawned_after_the_preempt_timer_fired_keeps_its_place() {
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_millis(20))
+            .make()
+            .unwrap();
+        let order = ex.run(async {
+            PARKED.with(|parked| *parked.borrow_mut() = vec![None]);
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let woken = crate::spawn_local_into(
+                enclose! { (order) async move {
+                    parked_until_woken(0).await;
+                    order.borrow_mut().push("woken");
+                }},
+                TaskQueueHandle::default(),
+            )
+            .unwrap();
+            let busy = crate::spawn_local_into(
+                enclose! { (order) async move {
+                    while !crate::executor().need_preempt() {}
+                    crate::spawn_local(enclose! { (order) async move {
+                        crate::executor().yield_now().await;
+                        order.borrow_mut().push("child");
+                    }})
+                    .detach();
+                    let waker = Waker::from(std::sync::Arc::new(WakeParked));
+                    let _wakes_woken = timer_waking(&waker, Duration::ZERO);
+                    crate::yield_if_needed().await;
+                    order.borrow_mut().push("busy");
+                }},
+                TaskQueueHandle::default(),
+            )
+            .unwrap();
+            woken.await;
+            busy.await;
+            Rc::try_unwrap(order).unwrap().into_inner()
+        });
+        assert_eq!(order, ["child", "woken", "busy"]);
+    }
+
+    /// Calls `f` with the running executor's queues, however the build keeps
+    /// the pointer to the running executor.
+    ///
+    /// With native thread locals the pointer is read directly, which is sound
+    /// within a run: `ExecutorContext::enter` installs a pointer to the context
+    /// it borrows for the duration of its call and restores the previous one
+    /// when the call returns or unwinds, and the context is borrowed here only
+    /// for the synchronous call to `f`, inside that span.
+    fn with_running_queues<R>(f: impl FnOnce(&ExecutorQueues) -> R) -> R {
+        #[cfg(any(not(nightly), not(feature = "native-tls")))]
+        return LOCAL_EX.with(|ex| f(&ex.queues.borrow()));
+
+        #[cfg(all(nightly, feature = "native-tls"))]
+        return unsafe {
+            f(&LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .queues
+                .borrow())
+        };
+    }
+
+    /// A stall handler that is slow to report runs once the run is accounted,
+    /// so the queue is charged for its task and not for the report, and the
+    /// run is no longer marked as under way while it reports.
+    ///
+    /// The handler reports every run longer than 1 ms past its budget, notes
+    /// the queue of each report, sleeps 100 ms, and counts the reports it made
+    /// with the run still marked as under way. The detector reports a run only
+    /// if its helper thread's signal landed while the run was under way, which
+    /// a busy machine can delay past the end of the run, so the spinning task
+    /// runs again until a report for its queue arrives.
+    #[test]
+    fn a_slow_stall_report_is_not_charged_to_the_queue() {
+        #[derive(Debug)]
+        struct SlowHandler(Arc<Mutex<Vec<TaskQueueHandle>>>, Arc<AtomicUsize>);
+
+        impl stall::StallDetectionHandler for SlowHandler {
+            fn threshold(&self, _queue: TaskQueueHandle, _max: Duration) -> Option<Duration> {
+                Some(Duration::from_millis(1))
+            }
+
+            fn stall(&self, detection: stall::StallDetection<'_>) {
+                self.0.lock().unwrap().push(detection.queue_handle);
+                if with_running_queues(|queues| queues.in_slice) {
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let in_slice = Arc::new(AtomicUsize::new(0));
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_millis(5))
+            .detect_stalls(Some(Box::new(SlowHandler(
+                reports.clone(),
+                in_slice.clone(),
+            ))))
+            .make()
+            .unwrap();
+        let (queue, spun, charged) = ex.run(enclose! { (reports) async move {
+            let queue = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "spins",
+            );
+            let mut spun = Duration::ZERO;
+            for _ in 0..20 {
+                spun += crate::spawn_local_into(
+                    async {
+                        let start = Instant::now();
+                        while start.elapsed() < Duration::from_millis(30) {}
+                        start.elapsed()
+                    },
+                    queue,
+                )
+                .unwrap()
+                .await;
+                if reports.lock().unwrap().contains(&queue) {
+                    break;
+                }
+            }
+            Timer::new(Duration::from_millis(5)).await;
+            let charged = crate::executor().task_queue_stats(queue).unwrap().runtime();
+            (queue, spun, charged)
+        }});
+        assert!(
+            reports.lock().unwrap().contains(&queue),
+            "the stall handler never reported the spinning queue"
+        );
+        assert!(
+            charged < spun + Duration::from_millis(50),
+            "the queue spun {spun:?} and was charged {charged:?}"
+        );
+        assert_eq!(
+            in_slice.load(Ordering::Relaxed),
+            0,
+            "the stall handler reported with the run still marked as under way"
+        );
+    }
+
+    /// A window that cleanup opens as a slice is set up, before the slice
+    /// polls any task, holds the task cleanup polled inline, and the run that
+    /// the preempt timer then ends at its first check keeps it.
+    ///
+    /// The shares manager of `dynamic` drops `other`, another executor, as the
+    /// slice is set up. A task of `other` owns through `slot` the handle of a
+    /// task parked in `cleanup`, a queue of this executor, so this executor
+    /// drops the parked task in cleanup, and its destructor spawns a task that
+    /// spins until the preempt timer fires and wakes itself. A try in which
+    /// the timer had fired before that task began proves nothing and is made
+    /// again.
+    #[test]
+    fn a_window_cleanup_opens_as_a_slice_is_set_up_is_kept() {
+        struct SpawnOnDrop(Rc<Cell<bool>>);
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let crossed = self.0.clone();
+                crate::spawn_local(async move {
+                    let before = crate::executor().need_preempt();
+                    while !crate::executor().need_preempt() {}
+                    crossed.set(!before);
+                    crate::executor().yield_now().await;
+                })
+                .detach();
+            }
+        }
+
+        type Window = Option<Vec<usize>>;
+
+        struct DropsOnAdjustment(
+            Rc<RefCell<Option<LocalExecutor>>>,
+            Rc<RefCell<Option<Window>>>,
+        );
+
+        impl SharesManager for DropsOnAdjustment {
+            fn shares(&self) -> usize {
+                1000
+            }
+
+            fn adjustment_period(&self) -> Duration {
+                let other = self.0.borrow_mut().take();
+                if let Some(other) = other {
+                    drop(other);
+                    let window = with_running_queues(|queues| {
+                        queues.preempted.as_ref().map(|preempted| {
+                            preempted
+                                .inline
+                                .iter()
+                                .filter_map(|held| held.runnable.as_ref())
+                                .map(|runnable| runnable.task_queue_index())
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                    *self.1.borrow_mut() = Some(window);
+                }
+                Duration::from_secs(1)
+            }
+        }
+
+        for _ in 0..10 {
+            let slot: Rc<RefCell<Option<crate::Task<()>>>> = Rc::new(RefCell::new(None));
+            let other = LocalExecutor::default();
+            other.run(enclose! { (slot) async move {
+                crate::spawn_local(async move {
+                    let _slot = slot;
+                    Timer::new(Duration::from_secs(3600)).await;
+                })
+                .detach();
+            }});
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            let crossed = Rc::new(Cell::new(false));
+            let window = Rc::new(RefCell::new(None));
+            let armed = Rc::new(RefCell::new(None));
+            let cleanup = ex.run(enclose! { (crossed, window, armed) async move {
+                let cleanup = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::NotImportant,
+                    "cleanup",
+                );
+                let started = Rc::new(Cell::new(false));
+                let parked = crate::spawn_local_into(
+                    enclose! { (started) async move {
+                        let _spawns = SpawnOnDrop(crossed);
+                        started.set(true);
+                        std::future::pending::<()>().await;
+                    }},
+                    cleanup,
+                )
+                .unwrap();
+                while !started.get() {
+                    crate::executor().yield_now().await;
+                }
+                *slot.borrow_mut() = Some(parked);
+                drop(slot);
+                let dynamic = crate::executor().create_task_queue(
+                    Shares::Dynamic(Rc::new(DropsOnAdjustment(armed.clone(), window))),
+                    Latency::NotImportant,
+                    "dynamic",
+                );
+                *armed.borrow_mut() = Some(other);
+                crate::spawn_local_into(async {}, dynamic).unwrap().await;
+                cleanup.index
+            }});
+            if !crossed.get() {
+                continue;
+            }
+            assert_eq!(window.take(), Some(Some(vec![cleanup])));
+            return;
+        }
+        panic!("the preempt timer had always fired before the task cleanup spawned began");
+    }
+
+    /// A task a window remembers, woken after its queue was removed, is sent
+    /// to cleanup and run there, not held, so the executor does not park with
+    /// it queued, and the window forgets it.
+    ///
+    /// Cleanup during a slice of the default queue spawns `child` in
+    /// `removed`, as in [`a_window_opened_by_cleanup_during_a_slice_belongs_to_the_slice`],
+    /// and `child` spins until the preempt timer fires and parks without
+    /// waking itself, so the window remembers it and holds nothing. The
+    /// default queue's task then removes `removed`, wakes `child`, whose
+    /// runnable is cancelled and sent to cleanup, and awaits `child`. The
+    /// executor runs on its own thread, so that a park with the cleanup queued
+    /// shows as a timeout rather than a test that never ends. A try in which
+    /// the timer had fired before `child` began proves nothing and is made
+    /// again.
+    #[test]
+    fn a_task_a_window_remembers_woken_in_a_removed_queue_is_cleaned_up() {
+        type Shared<T> = Rc<RefCell<Option<T>>>;
+
+        struct SpawnOnDrop(
+            Rc<Cell<bool>>,
+            Shared<Waker>,
+            Shared<crate::task::JoinHandle<()>>,
+        );
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let crossed = self.0.clone();
+                let waker = self.1.clone();
+                let child = crate::spawn_local(async move {
+                    let before = crate::executor().need_preempt();
+                    while !crate::executor().need_preempt() {}
+                    crossed.set(!before);
+                    poll_fn(|cx| {
+                        *waker.borrow_mut() = Some(cx.waker().clone());
+                        Poll::<()>::Pending
+                    })
+                    .await;
+                });
+                *self.2.borrow_mut() = Some(child.detach());
+            }
+        }
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                let slot: Shared<crate::Task<()>> = Rc::new(RefCell::new(None));
+                let other = LocalExecutor::default();
+                other.run(enclose! { (slot) async move {
+                    crate::spawn_local(async move {
+                        let _slot = slot;
+                        Timer::new(Duration::from_secs(3600)).await;
+                    })
+                    .detach();
+                }});
+                let ex = LocalExecutorBuilder::default()
+                    .preempt_timer(Duration::from_millis(5))
+                    .make()
+                    .unwrap();
+                let crossed = Rc::new(Cell::new(false));
+                let cleaned = ex.run(enclose! { (crossed) async move {
+                    let removed = crate::executor().create_task_queue(
+                        Shares::default(),
+                        Latency::NotImportant,
+                        "removed",
+                    );
+                    let waker: Shared<Waker> = Rc::new(RefCell::new(None));
+                    let child: Shared<crate::task::JoinHandle<()>> = Rc::new(RefCell::new(None));
+                    let started = Rc::new(Cell::new(false));
+                    let parked = crate::spawn_local_into(
+                        enclose! { (started, crossed, waker, child) async move {
+                            let _spawns = SpawnOnDrop(crossed, waker, child);
+                            started.set(true);
+                            std::future::pending::<()>().await;
+                        }},
+                        removed,
+                    )
+                    .unwrap();
+                    while !started.get() {
+                        crate::executor().yield_now().await;
+                    }
+                    *slot.borrow_mut() = Some(parked);
+                    drop(slot);
+                    drop(other);
+                    if !crossed.get() {
+                        return None;
+                    }
+                    crate::executor().remove_task_queue(removed).unwrap();
+                    waker.borrow_mut().take().unwrap().wake();
+                    let remembered = with_running_queues(|queues| {
+                        queues
+                            .preempted
+                            .as_ref()
+                            .map_or(0, |preempted| preempted.inline.len())
+                    });
+                    let child = child.borrow_mut().take().unwrap();
+                    Some((child.await.is_none(), remembered))
+                }});
+                match cleaned {
+                    None => continue,
+                    Some(outcome) => {
+                        sender.send(outcome).unwrap();
+                        return;
+                    }
+                }
+            }
+            panic!("the preempt timer had always fired before `child` began");
+        });
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok((cancelled, remembered)) => {
+                assert!(
+                    cancelled,
+                    "the child in the removed queue was not cancelled"
+                );
+                assert_eq!(
+                    remembered, 0,
+                    "the window still remembers the cancelled child"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("the executor parked with the cleanup queued")
+            }
+            Err(error) => panic!("the executor's thread failed: {error}"),
+        }
+    }
+
+    /// A window forgets a task it remembers but holds nothing of once another
+    /// executor's cleanup destroys it, so that a task allocated at its address
+    /// later is not taken for it.
+    ///
+    /// Dropping `spawner`, another executor, during a slice of the default
+    /// queue makes this executor run a destructor in cleanup, which spawns
+    /// `child`, which spins until the preempt timer fires and parks without
+    /// waking itself, so the window remembers it and holds nothing. The
+    /// destructor hands `child`'s only handle to a task of `owner`, another
+    /// executor, and dropping `owner` cancels `child` from `owner`'s context,
+    /// so this executor destroys it in cleanup. A try in which the timer had
+    /// fired before `child` began proves nothing and is made again.
+    #[test]
+    fn a_window_forgets_a_task_another_executor_destroys() {
+        type Shared<T> = Rc<RefCell<Option<T>>>;
+
+        struct SpawnOnDrop(Rc<Cell<bool>>, Shared<crate::task::JoinHandle<()>>);
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let crossed = self.0.clone();
+                let child = crate::spawn_local(async move {
+                    let before = crate::executor().need_preempt();
+                    while !crate::executor().need_preempt() {}
+                    crossed.set(!before);
+                    std::future::pending::<()>().await;
+                });
+                *self.1.borrow_mut() = Some(child.detach());
+            }
+        }
+
+        /// An executor with a task that owns `slot`, and keeps it until the
+        /// executor is dropped.
+        fn owning<T: 'static>(slot: Shared<T>) -> LocalExecutor {
+            let ex = LocalExecutor::default();
+            ex.run(async move {
+                crate::spawn_local(async move {
+                    let _slot = slot;
+                    Timer::new(Duration::from_secs(3600)).await;
+                })
+                .detach();
+            });
+            ex
+        }
+
+        for _ in 0..10 {
+            let parked_slot: Shared<crate::Task<()>> = Rc::new(RefCell::new(None));
+            let child_slot: Shared<crate::task::JoinHandle<()>> = Rc::new(RefCell::new(None));
+            let spawner = owning(parked_slot.clone());
+            let owner = owning(child_slot.clone());
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            let crossed = Rc::new(Cell::new(false));
+            let remembered = ex.run(enclose! { (crossed) async move {
+                let cleanup = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::NotImportant,
+                    "cleanup",
+                );
+                let started = Rc::new(Cell::new(false));
+                let parked = crate::spawn_local_into(
+                    enclose! { (started, crossed, child_slot) async move {
+                        let _spawns = SpawnOnDrop(crossed, child_slot);
+                        started.set(true);
+                        std::future::pending::<()>().await;
+                    }},
+                    cleanup,
+                )
+                .unwrap();
+                drop(child_slot);
+                while !started.get() {
+                    crate::executor().yield_now().await;
+                }
+                *parked_slot.borrow_mut() = Some(parked);
+                drop(parked_slot);
+                let remembered = || {
+                    with_running_queues(|queues| {
+                        queues
+                            .preempted
+                            .as_ref()
+                            .map_or(0, |preempted| preempted.inline.len())
+                    })
+                };
+                drop(spawner);
+                let before = remembered();
+                drop(owner);
+                (before, remembered())
+            }});
+            if !crossed.get() {
+                continue;
+            }
+            assert_eq!(remembered, (1, 0));
+            return;
+        }
+        panic!("the preempt timer had always fired before `child` began");
+    }
+
+    /// A shares manager whose adjustment period panics once `panics` is set.
+    struct PanicsOnAdjustment(Rc<Cell<bool>>);
+
+    impl SharesManager for PanicsOnAdjustment {
+        fn shares(&self) -> usize {
+            1000
+        }
+
+        fn adjustment_period(&self) -> Duration {
+            assert!(!self.0.get(), "the shares manager panicked");
+            Duration::from_secs(1)
+        }
+    }
+
+    /// A panic in user code the executor runs as a slice begins, before any
+    /// task is polled, still ends the slice.
+    ///
+    /// A queue with dynamic shares asks its manager for the adjustment period
+    /// as its slice begins, and this one panics there. The panic leaves `run`,
+    /// and with the slice still marked as running, a task spawned between runs
+    /// by a destructor, during whose first poll the preempt timer fires, would
+    /// open a window that no run ends. Whether the timer fires during that poll
+    /// depends on when the last run armed it, so a try in which it was already
+    /// pending is made again on a new executor.
+    #[test]
+    fn a_panic_as_a_slice_begins_ends_the_slice() {
+        struct SpawnOnDrop(Rc<Cell<bool>>);
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let fired = self.0.clone();
+                crate::spawn_local(async move {
+                    let reactor = crate::executor().reactor();
+                    let pending = reactor.need_preempt();
+                    let start = Instant::now();
+                    while !reactor.need_preempt() && start.elapsed() < Duration::from_millis(500) {}
+                    fired.set(!pending && reactor.need_preempt());
+                    crate::executor().yield_now().await;
+                })
+                .detach();
+            }
+        }
+
+        for _ in 0..10 {
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            let panics = Rc::new(Cell::new(false));
+            let manager = Rc::new(PanicsOnAdjustment(panics.clone()));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ex.run(async {
+                    let queue = crate::executor().create_task_queue(
+                        Shares::Dynamic(manager),
+                        Latency::NotImportant,
+                        "panics",
+                    );
+                    panics.set(true);
+                    crate::spawn_local_into(async {}, queue).unwrap().await;
+                })
+            }));
+            assert!(outcome.is_err(), "the shares manager never panicked");
+            {
+                let queues = ex.context.queues.borrow();
+                assert!(!queues.in_slice, "the slice is still marked as running");
+                assert!(
+                    queues.active_executing.is_none(),
+                    "a queue is still marked as executing"
+                );
+            }
+            let fired = Rc::new(Cell::new(false));
+            let guard = SpawnOnDrop(fired.clone());
+            let parked = ex.spawn(async move {
+                let _guard = guard;
+                futures::future::pending::<()>().await;
+            });
+            drop(parked);
+            if !fired.get() {
+                continue;
+            }
+            assert!(
+                ex.context.queues.borrow().preempted.is_none(),
+                "a window opened outside any slice"
+            );
+            return;
+        }
+        panic!("the preempt timer never fired during the child's first poll");
+    }
+
+    /// A task polled inline whose first poll finished is not remembered, so
+    /// another task allocated where it was keeps its place.
+    ///
+    /// `top` spawns `finished`, which spins until the preempt timer fires and
+    /// finishes, and then three tasks of one type, each of which wakes itself
+    /// once and notes that it ran; the first is usually allocated where
+    /// `finished` was. Then `top` arms a timer that wakes `woken` in the next
+    /// reactor pass and yields, so `woken` is woken after the three were
+    /// queued however the thread was delayed, and the three run first, in the
+    /// order they were spawned, then `woken`, then `top`. Were `finished`
+    /// remembered, the task at its address would be held behind `woken`. A
+    /// try in which the timer had fired before `finished` began proves nothing
+    /// and is made again.
+    #[test]
+    fn a_finished_inline_task_is_not_remembered() {
+        async fn wakes_once(id: u32, order: Rc<RefCell<Vec<String>>>) {
+            crate::executor().yield_now().await;
+            order.borrow_mut().push(format!("c{id}"));
+        }
+
+        for _ in 0..10 {
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            let outcome = ex.run(async {
+                PARKED.with(|parked| *parked.borrow_mut() = vec![None]);
+                let order = Rc::new(RefCell::new(Vec::new()));
+                let woken = crate::spawn_local_into(
+                    enclose! { (order) async move {
+                        parked_until_woken(0).await;
+                        order.borrow_mut().push("woken".to_string());
+                    }},
+                    TaskQueueHandle::default(),
+                )
+                .unwrap();
+                let top = crate::spawn_local_into(
+                    enclose! { (order) async move {
+                        let pending = crate::executor().need_preempt();
+                        crate::spawn_local(async {
+                            while !crate::executor().need_preempt() {}
+                        })
+                        .detach();
+                        let remembered = with_running_queues(|queues| {
+                            queues
+                                .preempted
+                                .as_ref()
+                                .is_some_and(|preempted| !preempted.inline.is_empty())
+                        });
+                        for id in 1..=3 {
+                            crate::spawn_local(wakes_once(id, order.clone())).detach();
+                        }
+                        let waker = Waker::from(std::sync::Arc::new(WakeParked));
+                        let _wakes_woken = timer_waking(&waker, Duration::ZERO);
+                        crate::yield_if_needed().await;
+                        order.borrow_mut().push("top".to_string());
+                        (pending, remembered)
+                    }},
+                    TaskQueueHandle::default(),
+                )
+                .unwrap();
+                woken.await;
+                let (pending, remembered) = top.await;
+                Timer::new(Duration::from_millis(10)).await;
+                (
+                    pending,
+                    remembered,
+                    Rc::try_unwrap(order).unwrap().into_inner(),
+                )
+            });
+            let (pending, remembered, order) = outcome;
+            if pending {
+                continue;
+            }
+            assert!(!remembered, "the finished task was remembered");
+            assert_eq!(order, ["c1", "c2", "c3", "woken", "top"]);
+            return;
+        }
+        panic!("the preempt timer had always fired before the finished task began");
+    }
+
+    /// A task that was preempted goes behind the tasks woken during its slice,
+    /// but not behind every task woken after that.
+    ///
+    /// `busy` spins until preempted and yields. Eight tasks each await a nop
+    /// and then spin for 5 ms, so every reactor pass wakes some of them and
+    /// together they want twice the CPU a slice gives, about eight wakes for
+    /// every slice `busy` gets. If the preempted task went behind every wake
+    /// until the wakes stopped, `busy` would never run again.
+    ///
+    /// The flood awaits first, so `busy` is the first task preempted, and
+    /// `busy` is scheduled rather than spawned with `spawn_local`, which would
+    /// run its first slice inside the task spawning it. Every task stops when
+    /// the run is over, so a `busy` that is starved fails the test rather than
+    /// hanging it.
+    ///
+    /// The bound counts wakes rather than time, so a thread the system
+    /// deschedules does not read as starvation: `busy` must get a slice for
+    /// every sixteen wakes, two rounds of the flood.
+    #[test]
+    fn a_preempted_task_still_gets_slices_under_a_flood_of_wakes() {
+        const PERIOD: Duration = Duration::from_millis(20);
+        const FLOOD: usize = 8;
+        const WAKES_PER_SLICE: usize = 16;
+        const RUN: Duration = Duration::from_secs(1);
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(PERIOD)
+            .make()
+            .unwrap();
+        let (slices, wakes) = ex.run(async {
+            let start = Instant::now();
+            let wakes = Rc::new(Cell::new(0usize));
+            let flood: Vec<_> = (0..FLOOD)
+                .map(|_| {
+                    crate::spawn_local(enclose! { (wakes) async move {
+                        while start.elapsed() < RUN {
+                            nop().await;
+                            wakes.set(wakes.get() + 1);
+                            let start = Instant::now();
+                            while start.elapsed() < Duration::from_millis(5) {}
+                        }
+                    }})
+                })
+                .collect();
+            let busy = crate::spawn_local_into(
+                async move {
+                    let mut slices = 0usize;
+                    while start.elapsed() < RUN {
+                        if crate::executor().need_preempt() {
+                            slices += 1;
+                            crate::yield_if_needed().await;
+                        }
+                    }
+                    slices
+                },
+                TaskQueueHandle::default(),
+            )
+            .unwrap();
+            let slices = busy.await;
+            join_all(flood).await;
+            (slices, wakes.get())
+        });
+        assert!(
+            wakes >= 4 * WAKES_PER_SLICE,
+            "the flood woke {wakes} times in {RUN:?}, too few to crowd anything out"
+        );
+        assert!(
+            slices * WAKES_PER_SLICE >= wakes,
+            "the preempted task got {slices} slices in {RUN:?} under a flood of {wakes} wakes"
+        );
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_io_that_completed_in_the_same_idle_poll() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::Nop, Wake::Timer, 1);
+    }
+
+    /// A task polled inline by a waker the reactor runs is not taken for the
+    /// one that spends the next slice.
+    ///
+    /// After every preempted slice of `busy`, the reactor's pass runs a waker
+    /// that spawns a task while `need_preempt` is still set. Remembered past
+    /// the start of the next round, that task would be taken for the one that
+    /// spent the next slice, and `busy`, which yielded, would not be held.
+    #[test]
+    fn a_task_spawned_by_a_waker_between_slices_is_not_taken_for_the_next() {
+        assert_a_woken_task_waits_one_slice_with(SliceEnd::Yield, Wake::Timer, 1, true);
+    }
+
+    /// A task spawned after the preempt timer fired is not taken for the one
+    /// that spent the slice, which spawned it.
+    #[test]
+    fn a_due_timer_runs_ahead_of_a_task_that_spawned_another_after_it_was_preempted() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::SpawnThenYield, Wake::Timer, 1);
+    }
+
+    /// A task that does its work in tasks it spawns, each polled at once and
+    /// finished, and yields when preempted, goes behind the tasks woken during
+    /// its slice, although the preempt timer fired during one of its children.
+    #[test]
+    fn a_due_timer_runs_ahead_of_a_task_whose_inline_child_finished_when_preempted() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::YieldAfterInlineWork, Wake::Timer, 1);
+    }
+
+    #[test]
+    fn a_due_timer_runs_ahead_of_a_task_that_yielded_when_preempted() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::Yield, Wake::Timer, 1);
+    }
+
+    #[test]
+    fn completed_io_runs_ahead_of_a_task_that_yielded_when_preempted() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::Yield, Wake::Nop, 1);
+    }
+
+    #[test]
+    fn completed_io_runs_ahead_of_a_preempted_task_whose_timer_came_due() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::DueTimer, Wake::Nop, 1);
     }
 }

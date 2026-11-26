@@ -34,6 +34,20 @@ pub struct JoinHandle<R> {
 impl<R> Unpin for JoinHandle<R> {}
 
 impl<R> JoinHandle<R> {
+    /// Whether the task has finished or been cancelled, so that its future
+    /// is never polled again.
+    ///
+    /// The read is sound. The handle holds a counted reference, so the header
+    /// is live. `state` is written only on the thread that owns the task, and
+    /// the handle is neither `Send` nor `Sync`, so this read happens on that
+    /// thread too; other threads touch only the header's atomics and its
+    /// notifier. And it reads that one field through the raw pointer, without
+    /// creating a reference to the header.
+    pub(crate) fn is_finished(&self) -> bool {
+        let header = self.raw_task.as_ptr() as *const Header;
+        unsafe { (*header).state & (COMPLETED | CLOSED) != 0 }
+    }
+
     /// Cancels the task.
     ///
     /// If the task has already completed, calling this method will have no

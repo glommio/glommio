@@ -72,6 +72,8 @@ mod local_context;
 mod multitask;
 mod placement;
 pub mod stall;
+#[cfg(test)]
+mod window_model;
 
 pub(crate) use context::{ExecutorContext, WeakExecutorContext};
 

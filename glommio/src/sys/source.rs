@@ -111,7 +111,7 @@ pub(crate) enum SourceType {
     BlockingFn,
     Invalid,
     CopyFileRange(RawFd, u64, usize),
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     Noop,
 }
 

@@ -867,7 +867,7 @@ impl Reactor {
         source
     }
 
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn nop(&self) -> Source {
         let source = self.new_source(-1, SourceType::Noop, None);
         self.sys.nop(&source);

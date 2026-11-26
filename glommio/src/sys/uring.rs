@@ -2903,7 +2903,7 @@ impl Reactor {
         );
     }
 
-    #[cfg(feature = "bench")]
+    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn nop(&self, source: &Source) {
         queue_request_into_ring(
             &mut *self.ring_for_source(source),

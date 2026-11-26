@@ -73,16 +73,30 @@ impl ExecutorContext {
                 .unwrap_or_else(|| self.cleanup_queue());
             let requirements = queue.borrow().io_requirements;
             let previous_requirements = self.reactor.io_requirements();
-            let previous = self.queues.borrow_mut().active_executing.replace(queue);
+            let (previous, owner) = {
+                let mut queues = self.queues.borrow_mut();
+                let previous = queues.active_executing.replace(queue);
+                let owner = queues.slice_owner;
+                if queues.in_slice && owner.is_none() {
+                    queues.slice_owner = Some(
+                        previous
+                            .as_ref()
+                            .and_then(|queue| queue.try_borrow().ok())
+                            .map_or(usize::MAX, |queue| queue.index()),
+                    );
+                }
+                (previous, owner)
+            };
             self.reactor.inform_io_requirements(requirements);
             defer! {
                 if !was_active && self.tasks.is_shutting_down() {
                     self.finish_shutdown();
                 }
-                let current = std::mem::replace(
-                    &mut self.queues.borrow_mut().active_executing,
-                    previous,
-                );
+                let current = {
+                    let mut queues = self.queues.borrow_mut();
+                    queues.slice_owner = owner;
+                    std::mem::replace(&mut queues.active_executing, previous)
+                };
                 self.reactor.inform_io_requirements(previous_requirements);
                 drop(current);
             }
@@ -110,17 +124,87 @@ impl ExecutorContext {
     }
 
     /// A removed queue must defer destruction until reactor borrows are released.
+    ///
+    /// The cancelled runnable goes to the default queue directly, never to a
+    /// window: a window keeps runnable the queue of the runnable it holds,
+    /// which is the removed queue here, so a held cleanup would leave the
+    /// default queue idle with the cleanup still to run. No borrow is held
+    /// while it is cancelled, since cancelling wakes a task awaiting it, whose
+    /// schedule borrows the queues.
     pub(super) fn schedule_cleanup(&self, runnable: multitask::Runnable) {
+        self.forget_preempted(&runnable);
         runnable.cancel();
         let queue = self.cleanup_queue();
-        self.schedule(queue, runnable);
+        queue.borrow_mut().runnables.push_back(runnable);
+        self.queues.borrow_mut().maybe_activate(queue);
     }
 
     /// Activates the owning executor's queue even while another executor runs.
+    ///
+    /// The task that was running when the last slice was preempted is held
+    /// rather than queued, until the window that slice opened ends.
     #[inline]
     pub(super) fn schedule(&self, queue: Rc<RefCell<TaskQueue>>, runnable: multitask::Runnable) {
+        let mut queues = self.queues.borrow_mut();
+        let runnable = if queues.preempted.is_some() {
+            match queues.hold(&queue, runnable) {
+                Ok(displaced) => {
+                    drop(queues);
+                    if let Some(displaced) = displaced {
+                        self.requeue(displaced);
+                    }
+                    return;
+                }
+                Err(runnable) => runnable,
+            }
+        } else {
+            runnable
+        };
+        queue.borrow_mut().runnables.push_back(runnable);
+        queues.maybe_activate(queue);
+    }
+
+    /// Forgets `runnable`'s task in the open window, if one remembers it and
+    /// holds nothing of it, before the task is destroyed without being held:
+    /// cancelled for cleanup, or dropped in cleanup for another executor. A
+    /// task allocated at its address later is then not taken for it.
+    pub(super) fn forget_preempted(&self, runnable: &multitask::Runnable) {
+        if let Some(preempted) = self.queues.borrow_mut().preempted.as_mut() {
+            preempted.forget(runnable.raw_task.as_ptr().addr());
+        }
+    }
+
+    /// Queues a runnable a window held or displaced at the back of its queue,
+    /// as a wake would, without holding it again. One whose queue is gone goes
+    /// to cleanup.
+    pub(super) fn requeue(&self, runnable: multitask::Runnable) {
+        let Some(queue) = self.get_queue(&TaskQueueHandle {
+            index: runnable.task_queue_index(),
+        }) else {
+            self.schedule_cleanup(runnable);
+            return;
+        };
         queue.borrow_mut().runnables.push_back(runnable);
         self.queues.borrow_mut().maybe_activate(queue);
+    }
+
+    /// Ends the window a preempted slice opened: forgets which tasks were
+    /// running and queues those it held behind the tasks woken in the
+    /// window, the inline tasks first, in the order they were queued.
+    ///
+    /// Called when the next round starts, before the executor parks, and when
+    /// `run` returns, so a held runnable is never left behind for a park,
+    /// another `run`, or shutdown. Each is queued the way a wake would queue
+    /// it, so a queue that is gone sends it to cleanup.
+    pub(super) fn end_preempted_window(&self) {
+        let Some(preempted) = self.queues.borrow_mut().close_window() else {
+            return;
+        };
+        for held in preempted.inline.into_iter().chain(preempted.last) {
+            if let Some(runnable) = held.runnable {
+                self.requeue(runnable);
+            }
+        }
     }
 
     pub(super) fn get_reactor(&self) -> Rc<Reactor> {
@@ -217,6 +301,18 @@ impl ExecutorContext {
         me.yielded = true;
     }
 
+    /// Spawns a task into the running queue and polls it at once, inside the
+    /// poll of the task spawning it.
+    ///
+    /// If the preempt timer fired during that poll, the spawned task, not its
+    /// spawner, spent the slice, and the window a preempted slice opens is
+    /// opened for it there and then, unless the poll finished it: a finished
+    /// task can be neither queued nor woken, and once its handle is gone its
+    /// address can go to a task spawned later in the slice. It was queued as its poll returned if it
+    /// woke itself, so it is at the back of its queue and is held from there,
+    /// before anything its spawner queues after it. The timer is sampled
+    /// before the poll as well, so that a task spawned after it fired is not
+    /// taken for the one that spent the slice.
     pub(super) fn spawn_internal<T>(&self, future: impl Future<Output = T>) -> multitask::Task<T> {
         let tq = self
             .queues
@@ -227,7 +323,12 @@ impl ExecutorContext {
             .unwrap();
 
         let scheduler = tq.borrow().scheduler.clone();
-        scheduler.spawn_and_run(&self.tasks, tq, future)
+        let was_preempting = self.need_preempt();
+        let (task, address) = scheduler.spawn_and_run(&self.tasks, tq, future);
+        if !was_preempting && self.need_preempt() && !task.is_finished() {
+            self.queues.borrow_mut().preempted_inline(address);
+        }
+        task
     }
 
     pub(super) fn spawn_into<T, F>(

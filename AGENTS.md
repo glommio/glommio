@@ -87,6 +87,23 @@ cargo test -- --nocapture
 ```
 The `--nocapture` flag tells the test harness not to swallow `stdout`/`stderr`, so you can read logs directly.
 
+#### Modelled code: the preempted window
+Items in `glommio/src/executor` and `glommio/src/task/raw.rs` whose docs say "Modelled by the test-only
+`executor::window_model`" are mirrored by an exhaustive model of how a preempted slice orders tasks and queues. A change to one's code, as opposed to its docs,
+comments or layout, must be mirrored in `glommio/src/executor/window_model.rs`, whose tests must still find every
+earlier design's bug, and its source fingerprints updated. The `mirrored_code_is_unchanged` test fails until they are:
+```bash
+cargo test -p glommio --lib -- window_model                          # quick local check
+cargo test -p glommio --lib --release -- window_model --nocapture    # wider bounds, with traces
+WINDOW_MODEL_EVENTS=16 cargo test -p glommio --lib --release -- window_model::tests::current_rule  # deep
+WINDOW_MODEL_PRINT_FINGERPRINTS=1 cargo test -p glommio --lib -- window_model::tests::mirrored --nocapture
+```
+The model also relies on `Reactor::react` running timer wakers before `sys.wait` drains the rings, which no
+fingerprint covers: review the model by hand if that order changes.
+CI runs these tests under nextest, with the `ci` profile and, in one job, the musl target; reproduce that with
+`.github/scripts/run-tests.sh` (or `.github/scripts/run-tests.sh x86_64-unknown-linux-musl`).
+
+
 ### Benchmarks (optional)
 If an agent wants to measure performance changes it may run the built‑in benches:
 ```bash

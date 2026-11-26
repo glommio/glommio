@@ -29,6 +29,12 @@ reviews:
         - Plain `//` and `/* */` comments are not allowed under glommio/src; prose goes in `///` or `//!` docs. The dylint job enforces this, so only point it out when CI would miss it.
         - Public API changes must be additive for the current minor release (cargo-semver-checks runs in CI). New public API needs an integration test under glommio/tests that drives it from outside the crate.
         - Prefer findings you can show with a concrete sequence or input over style remarks.
+    - path: "glommio/src/executor/**"
+      instructions: |
+        Items whose docs say "Modelled by the test-only `executor::window_model`" are mirrored by an exhaustive model of preemption ordering. Flag a change to the code of such an item (not to its docs, comments or layout, which the fingerprint ignores) that does not also update glommio/src/executor/window_model.rs: its rule and its `MIRRORED` fingerprints. The `mirrored_code_is_unchanged` test fails until they match.
+    - path: "glommio/src/task/raw.rs"
+      instructions: |
+        `do_wake`, `cancel` and `run` are marked "Modelled by the test-only `executor::window_model`": the same rule as for glommio/src/executor applies to a change to their code.
     - path: "glommio/tests/**/*.rs"
       instructions: |
         Tests here compile as a separate crate and see only the public API. Flag tests that can pass without the behaviour happening: fixed sleeps standing in for synchronisation, assertions that hold when nothing was measured, timing bounds that pass if the work never ran.

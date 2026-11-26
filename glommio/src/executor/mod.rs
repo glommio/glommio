@@ -370,6 +370,10 @@ pub(crate) struct TaskQueue {
     active: bool,
     shares: Shares,
     vruntime: u64,
+    /// When this queue last entered the heap of runnable queues, by the
+    /// executor's count of entries: between queues of equal vruntime, the
+    /// one that entered first runs first.
+    entry: u64,
     io_requirements: IoRequirements,
     name: String,
     last_adjustment: Instant,
@@ -378,12 +382,16 @@ pub(crate) struct TaskQueue {
     stats: TaskQueueStats,
 }
 
-/// Impl a custom order so we use a min-heap.
+/// Impl a custom order so we use a min-heap: the least vruntime first, and
+/// between queues of equal vruntime the one that entered the heap first.
 ///
 /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
 impl Ord for TaskQueue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.vruntime.cmp(&self.vruntime)
+        other
+            .vruntime
+            .cmp(&self.vruntime)
+            .then_with(|| other.entry.cmp(&self.entry))
     }
 }
 
@@ -393,9 +401,10 @@ impl PartialOrd for TaskQueue {
     }
 }
 
+/// Equal exactly when `Ord` finds them equal.
 impl PartialEq for TaskQueue {
     fn eq(&self, other: &Self) -> bool {
-        self.vruntime == other.vruntime
+        self.vruntime == other.vruntime && self.entry == other.entry
     }
 }
 
@@ -428,6 +437,7 @@ impl TaskQueue {
             stats: TaskQueueStats::new(index, shares.reciprocal_shares()),
             shares,
             vruntime: 0,
+            entry: 0,
             io_requirements: ioreq,
             name: name.into(),
             last_adjustment: Instant::now(),
@@ -742,6 +752,10 @@ struct ExecutorQueues {
     active_executing: Option<Rc<RefCell<TaskQueue>>>,
     executor_index: usize,
     default_vruntime: u64,
+    /// How many times a queue has entered `active_executors`: the next
+    /// `TaskQueue::entry`. At one entry a nanosecond it would take 584 years
+    /// to wrap.
+    entries: u64,
     preempted: Option<Preempted>,
     /// Whether a task queue's slice is running. Only then can a window open:
     /// the executor also polls tasks while it cleans up between runs and when
@@ -771,6 +785,7 @@ impl ExecutorQueues {
             active_executing: None,
             executor_index: 1,
             default_vruntime: 0,
+            entries: 0,
             preempted: None,
             in_slice: false,
             slice_owner: None,
@@ -990,9 +1005,35 @@ impl ExecutorQueues {
             state.vruntime = self.activation_vruntime(&state);
             state.active = true;
             drop(state);
-            self.active_executors.push(queue);
+            self.push_runnable(queue);
             self.reevaluate_preempt_timer();
         }
+    }
+
+    /// Resets every queue's vruntime to zero, as charging a run overflowed,
+    /// and rebuilds the heap: the queues it holds now differ only by when
+    /// they entered it, which the order it kept did not follow.
+    #[cold]
+    #[inline(never)]
+    fn reset_vruntimes(&mut self) {
+        for queue in self.available_executors.values() {
+            queue.borrow_mut().vruntime = 0;
+        }
+        let heap = std::mem::take(&mut self.active_executors).into_vec();
+        self.active_executors = BinaryHeap::from(heap);
+    }
+
+    /// Pushes `queue` onto the heap of runnable queues, behind every queue of
+    /// the same vruntime already there, so that such queues run in the order
+    /// they became runnable. That holds for a queue its slice leaves runnable
+    /// too: it goes behind the queues of its vruntime that waited during the
+    /// slice, not back to the place it had when the slice was picked.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
+    fn push_runnable(&mut self, queue: Rc<RefCell<TaskQueue>>) {
+        queue.borrow_mut().entry = self.entries;
+        self.entries += 1;
+        self.active_executors.push(queue);
     }
 }
 
@@ -2160,6 +2201,9 @@ impl LocalExecutor {
     /// the window holds the queue's only runnable is asked however the run
     /// ended.
     ///
+    /// When charging the run overflows, every queue's vruntime is reset to
+    /// zero and the heap rebuilt.
+    ///
     /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn finish_task_queue_run(
         &self,
@@ -2182,10 +2226,7 @@ impl LocalExecutor {
         let vruntime = match vruntime {
             Some(x) => x,
             None => {
-                for queue in tq.available_executors.values() {
-                    let mut q = queue.borrow_mut();
-                    q.vruntime = 0;
-                }
+                tq.reset_vruntimes();
                 0
             }
         };
@@ -2207,7 +2248,7 @@ impl LocalExecutor {
         }
 
         if need_repush {
-            tq.active_executors.push(queue);
+            tq.push_runnable(queue);
         } else {
             tq.reevaluate_preempt_timer();
         }
@@ -4034,7 +4075,7 @@ mod test {
             queues.default_vruntime = 200;
             busy.borrow_mut().vruntime = 200;
             busy.borrow_mut().active = true;
-            queues.active_executors.push(busy.clone());
+            queues.push_runnable(busy.clone());
             queues.preempted = Some(Preempted::new(100, usize::MAX));
             queues.maybe_activate(woken.clone());
         }
@@ -4077,7 +4118,7 @@ mod test {
             queues.default_vruntime = 0;
             least.borrow_mut().vruntime = 0;
             least.borrow_mut().active = true;
-            queues.active_executors.push(least.clone());
+            queues.push_runnable(least.clone());
             woken.borrow_mut().vruntime = 4;
             preempted.borrow_mut().vruntime = 3;
             let mut window = Preempted::new(0, preempted.borrow().index());
@@ -4443,6 +4484,122 @@ mod test {
                 .collect();
         assert_eq!(order, ["woken", "preempted"]);
         ex.context.end_preempted_window();
+    }
+
+    /// Idle queues of equal shares woken one after another run in the order
+    /// they were woken.
+    ///
+    /// Each is activated just behind the least vruntime, so all five tie.
+    /// The heap alone breaks such a tie in no particular order: it ran these
+    /// as 0, 2, 4, 1, 3.
+    ///
+    /// The preempt timer is pushed out of reach: a slice it ended before its
+    /// first poll would put its queue back behind the others.
+    #[test]
+    fn idle_queues_of_equal_shares_run_in_the_order_they_were_woken() {
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_secs(3600))
+            .make()
+            .unwrap();
+        let order = ex.run(async {
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let tasks: Vec<_> = (0..5)
+                .map(|i| {
+                    let queue = crate::executor().create_task_queue(
+                        Shares::default(),
+                        Latency::NotImportant,
+                        "woken",
+                    );
+                    crate::spawn_local_into(
+                        enclose! { (order) async move { order.borrow_mut().push(i) }},
+                        queue,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for task in tasks {
+                task.await;
+            }
+            Rc::try_unwrap(order).unwrap().into_inner()
+        });
+        assert_eq!(order, [0, 1, 2, 3, 4]);
+    }
+
+    /// A queue its slice leaves runnable goes back behind the queues of the
+    /// same vruntime that were waiting, though it entered the heap before
+    /// any of them, so that queues of equal vruntime take turns.
+    #[test]
+    fn a_queue_repushed_after_its_slice_goes_behind_queues_of_equal_vruntime() {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let repushed = queue("repushed");
+        let waiting = ["a", "b", "c", "d"].map(queue);
+        let (runnable, _, _) = unscheduled_in(&ex, repushed.clone());
+        repushed.borrow_mut().runnables.push_back(runnable);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 10;
+            queues.maybe_activate(repushed.clone());
+            let running = queues.active_executors.pop().unwrap();
+            assert!(Rc::ptr_eq(&running, &repushed));
+            queues.active_executing = Some(running);
+            queues.in_slice = true;
+            for queue in &waiting {
+                queues.maybe_activate(queue.clone());
+            }
+        }
+        ex.finish_task_queue_run(repushed.clone(), Duration::ZERO, 1, None);
+        assert_eq!(repushed.borrow().vruntime, waiting[0].borrow().vruntime);
+        let order: Vec<String> =
+            std::iter::from_fn(|| ex.context.queues.borrow_mut().active_executors.pop())
+                .map(|queue| queue.borrow().name.clone())
+                .collect();
+        assert_eq!(order, ["a", "b", "c", "d", "repushed"]);
+    }
+
+    /// The queues waiting when charging a slice overflows its queue's
+    /// vruntime, all reset to zero, run in the order they entered the heap.
+    ///
+    /// `a` entered first and `b` second, at a lower vruntime, so `b` is at
+    /// the top of the heap when the reset levels them.
+    #[test]
+    fn queues_reset_by_a_vruntime_overflow_run_in_the_order_they_entered() {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let overflowed = queue("overflowed");
+        let a = queue("a");
+        let b = queue("b");
+        let (runnable, _, _) = unscheduled_in(&ex, overflowed.clone());
+        overflowed.borrow_mut().runnables.push_back(runnable);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            for (queue, vruntime) in [(&a, 10), (&b, 5)] {
+                queue.borrow_mut().vruntime = vruntime;
+                queue.borrow_mut().active = true;
+                queues.push_runnable(queue.clone());
+            }
+            overflowed.borrow_mut().vruntime = u64::MAX;
+            overflowed.borrow_mut().active = true;
+            queues.active_executing = Some(overflowed.clone());
+            queues.in_slice = true;
+        }
+        ex.finish_task_queue_run(overflowed.clone(), Duration::from_micros(1), 1, None);
+        assert_eq!(overflowed.borrow().vruntime, 0);
+        let order: Vec<String> =
+            std::iter::from_fn(|| ex.context.queues.borrow_mut().active_executors.pop())
+                .map(|queue| queue.borrow().name.clone())
+                .collect();
+        assert_eq!(order, ["a", "b", "overflowed"]);
     }
 
     #[test]

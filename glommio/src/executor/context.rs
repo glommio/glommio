@@ -60,6 +60,8 @@ impl ExecutorContext {
     }
 
     /// Provides queue and I/O context without retaining the public executor.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(super) fn with_cleanup<T>(
         &self,
         queue: Option<Rc<RefCell<TaskQueue>>>,
@@ -131,6 +133,8 @@ impl ExecutorContext {
     /// default queue idle with the cleanup still to run. No borrow is held
     /// while it is cancelled, since cancelling wakes a task awaiting it, whose
     /// schedule borrows the queues.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(super) fn schedule_cleanup(&self, runnable: multitask::Runnable) {
         self.forget_preempted(&runnable);
         runnable.cancel();
@@ -143,6 +147,8 @@ impl ExecutorContext {
     ///
     /// The task that was running when the last slice was preempted is held
     /// rather than queued, until the window that slice opened ends.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     #[inline]
     pub(super) fn schedule(&self, queue: Rc<RefCell<TaskQueue>>, runnable: multitask::Runnable) {
         let mut queues = self.queues.borrow_mut();
@@ -168,6 +174,8 @@ impl ExecutorContext {
     /// holds nothing of it, before the task is destroyed without being held:
     /// cancelled for cleanup, or dropped in cleanup for another executor. A
     /// task allocated at its address later is then not taken for it.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(super) fn forget_preempted(&self, runnable: &multitask::Runnable) {
         if let Some(preempted) = self.queues.borrow_mut().preempted.as_mut() {
             preempted.forget(runnable.raw_task.as_ptr().addr());
@@ -177,6 +185,8 @@ impl ExecutorContext {
     /// Queues a runnable a window held or displaced at the back of its queue,
     /// as a wake would, without holding it again. One whose queue is gone goes
     /// to cleanup.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(super) fn requeue(&self, runnable: multitask::Runnable) {
         let Some(queue) = self.get_queue(&TaskQueueHandle {
             index: runnable.task_queue_index(),
@@ -196,6 +206,8 @@ impl ExecutorContext {
     /// `run` returns, so a held runnable is never left behind for a park,
     /// another `run`, or shutdown. Each is queued the way a wake would queue
     /// it, so a queue that is gone sends it to cleanup.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(super) fn end_preempted_window(&self) {
         let Some(preempted) = self.queues.borrow_mut().close_window() else {
             return;
@@ -313,6 +325,8 @@ impl ExecutorContext {
     /// before anything its spawner queues after it. The timer is sampled
     /// before the poll as well, so that a task spawned after it fired is not
     /// taken for the one that spent the slice.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(super) fn spawn_internal<T>(&self, future: impl Future<Output = T>) -> multitask::Task<T> {
         let tq = self
             .queues

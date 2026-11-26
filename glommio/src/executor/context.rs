@@ -73,16 +73,30 @@ impl ExecutorContext {
                 .unwrap_or_else(|| self.cleanup_queue());
             let requirements = queue.borrow().io_requirements;
             let previous_requirements = self.reactor.io_requirements();
-            let previous = self.queues.borrow_mut().active_executing.replace(queue);
+            let (previous, owner) = {
+                let mut queues = self.queues.borrow_mut();
+                let previous = queues.active_executing.replace(queue);
+                let owner = queues.slice_owner;
+                if queues.in_slice && owner.is_none() {
+                    queues.slice_owner = Some(
+                        previous
+                            .as_ref()
+                            .and_then(|queue| queue.try_borrow().ok())
+                            .map_or(usize::MAX, |queue| queue.index()),
+                    );
+                }
+                (previous, owner)
+            };
             self.reactor.inform_io_requirements(requirements);
             defer! {
                 if !was_active && self.tasks.is_shutting_down() {
                     self.finish_shutdown();
                 }
-                let current = std::mem::replace(
-                    &mut self.queues.borrow_mut().active_executing,
-                    previous,
-                );
+                let current = {
+                    let mut queues = self.queues.borrow_mut();
+                    queues.slice_owner = owner;
+                    std::mem::replace(&mut queues.active_executing, previous)
+                };
                 self.reactor.inform_io_requirements(previous_requirements);
                 drop(current);
             }
@@ -183,7 +197,7 @@ impl ExecutorContext {
     /// another `run`, or shutdown. Each is queued the way a wake would queue
     /// it, so a queue that is gone sends it to cleanup.
     pub(super) fn end_preempted_window(&self) {
-        let Some(preempted) = self.queues.borrow_mut().preempted.take() else {
+        let Some(preempted) = self.queues.borrow_mut().close_window() else {
             return;
         };
         for held in preempted.inline.into_iter().chain(preempted.last) {

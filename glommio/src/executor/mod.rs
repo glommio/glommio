@@ -671,13 +671,19 @@ struct Preempted {
     inline: SmallVec<[Held; 2]>,
     /// The task the run loop polled last, once the slice has ended.
     last: Option<Held>,
+    /// The least vruntime of the runnable queues as the slice began.
+    vruntime: u64,
+    /// The index of the queue whose slice it is.
+    queue: usize,
 }
 
 impl Preempted {
-    fn new() -> Self {
+    fn new(vruntime: u64, queue: usize) -> Self {
         Self {
             inline: SmallVec::new(),
             last: None,
+            vruntime,
+            queue,
         }
     }
 
@@ -727,6 +733,12 @@ struct ExecutorQueues {
     /// the executor also polls tasks while it cleans up between runs and when
     /// it shuts down, with `active_executing` set but no slice spent.
     in_slice: bool,
+    /// The index of the queue whose slice is running, while cleanup during
+    /// that slice has made another queue the executing one, so that a window
+    /// cleanup opens belongs to the slice that spent the time. It is
+    /// `usize::MAX`, which names no queue, while cleanup runs as the slice is
+    /// set up, with its queue borrowed, and the end of the slice names it.
+    slice_owner: Option<usize>,
     preempt_timer_duration: Duration,
     default_preempt_timer_duration: Duration,
     spin_before_park: Option<Duration>,
@@ -745,6 +757,7 @@ impl ExecutorQueues {
             default_vruntime: 0,
             preempted: None,
             in_slice: false,
+            slice_owner: None,
             preempt_timer_duration,
             default_preempt_timer_duration: preempt_timer_duration,
             spin_before_park,
@@ -797,7 +810,8 @@ impl ExecutorQueues {
     ///
     /// Only within a slice: tasks polled inline while the executor cleans up
     /// between runs or shuts down spent no slice, and no run would end the
-    /// window.
+    /// window. A task polled inline by cleanup during a slice is found in the
+    /// queue cleanup runs it in, and the window belongs to the slice's queue.
     #[cold]
     fn preempted_inline(&mut self, task: usize) {
         if !self.in_slice {
@@ -806,13 +820,26 @@ impl ExecutorQueues {
         let Some(queue) = self.active_executing.clone() else {
             return;
         };
-        let preempted = self.preempted.get_or_insert_with(Preempted::new);
+        let vruntime = self.default_vruntime;
+        let index = self.slice_owner.unwrap_or_else(|| queue.borrow().index());
+        let preempted = self
+            .preempted
+            .get_or_insert_with(|| Preempted::new(vruntime, index));
         let runnable = Self::take_from_back(&queue, task);
         preempted.inline.push(Held { task, runnable });
     }
 
     /// Remembers `task`, the task the run loop polled last in a slice of
-    /// `queue` that `need_preempt` ended, and holds it if it yielded.
+    /// `queue` that `need_preempt` ended, if it polled any, and `vruntime`,
+    /// the least vruntime as that slice began, and holds the task if it
+    /// yielded. A slice that ended before it polled any task opens no window
+    /// of its own, but keeps one that cleanup opened as it was set up.
+    ///
+    /// Charges `queue` one step past the slice and names it the window's
+    /// queue, so that a queue the window wakes that was charged the same sorts
+    /// ahead of it, whether it stays runnable or goes idle and is reactivated
+    /// in the window. A run that unwinds is not charged the step, and needs
+    /// none: the window ends with the run, before anything is placed in it.
     ///
     /// Returns a runnable held already for a last task, which a window that
     /// ends before the next round cannot have; the caller queues it once the
@@ -821,14 +848,45 @@ impl ExecutorQueues {
     fn preempted_last(
         &mut self,
         queue: &Rc<RefCell<TaskQueue>>,
-        task: usize,
+        task: Option<usize>,
+        vruntime: u64,
     ) -> Option<multitask::Runnable> {
-        let runnable = Self::take_from_back(queue, task);
-        let preempted = self.preempted.get_or_insert_with(Preempted::new);
+        if task.is_none() && self.preempted.is_none() {
+            return None;
+        }
+        let runnable = task.and_then(|task| Self::take_from_back(queue, task));
+        let index = {
+            let mut state = queue.borrow_mut();
+            state.vruntime = state.vruntime.saturating_add(1);
+            state.index()
+        };
+        let preempted = self
+            .preempted
+            .get_or_insert_with(|| Preempted::new(vruntime, index));
+        preempted.queue = index;
+        let task = task?;
         preempted
             .last
             .replace(Held { task, runnable })
             .and_then(|held| held.runnable)
+    }
+
+    /// Ends the open window, if any, and hands it back.
+    ///
+    /// The window placed the queues it woke by their charge, which can be
+    /// below the cached least vruntime, so that is lowered to the least
+    /// vruntime of the runnable queues as the window ends. A queue activated
+    /// after the window is placed behind the least runnable queue then, as
+    /// one activated before it was.
+    fn close_window(&mut self) -> Option<Preempted> {
+        let preempted = self.preempted.take();
+        if preempted.is_some() {
+            if let Some(least) = self.active_executors.peek() {
+                let least = least.borrow().vruntime;
+                self.default_vruntime = self.default_vruntime.min(least);
+            }
+        }
+        preempted
     }
 
     /// Holds `runnable` if the open window remembers its task, activating its
@@ -857,10 +915,50 @@ impl ExecutorQueues {
         Ok(displaced)
     }
 
+    /// The vruntime a queue that was idle is activated with.
+    ///
+    /// A queue is activated just behind the least vruntime of the runnable
+    /// queues, so it waits for none of them to catch up and gains no credit
+    /// for the time it slept. Between a preempted slice and the next round,
+    /// though, that least vruntime already includes the slice, and a queue
+    /// woken by an event that came during it would sort behind the preempted
+    /// queue and wait a second slice. So in that window a queue is placed by
+    /// the vruntime it has been charged, no earlier than it would have been
+    /// placed when woken during the slice and no later than usual. Being
+    /// placed by its own charge, a queue that used up its slice and slept
+    /// gets nothing for it, and neither does one that ran a lot before it
+    /// slept.
+    ///
+    /// The queue whose slice it was can be reactivated in the window too,
+    /// when its slice ended on a task that awaited something and left it
+    /// idle. The end of the slice charged it one step past the slice, so it
+    /// sorts behind every queue the window woke that was charged no more than
+    /// it, ties included, and it is placed between bounds one step behind the
+    /// other queues' bounds: behind any queue the window placed at the
+    /// earliest mark, and no further back than just behind the usual place,
+    /// so that a queue with few shares is not held back by the charge for the
+    /// slice it just spent any more than an idle queue is.
+    fn activation_vruntime(&self, queue: &TaskQueue) -> u64 {
+        let usual = self.default_vruntime.saturating_add(1);
+        let Some(preempted) = self.preempted.as_ref() else {
+            return usual;
+        };
+        let woken = preempted
+            .vruntime
+            .min(self.default_vruntime)
+            .saturating_add(1);
+        if preempted.queue == queue.index() {
+            return queue
+                .vruntime
+                .clamp(woken.saturating_add(1), usual.saturating_add(1));
+        }
+        queue.vruntime.clamp(woken, usual)
+    }
+
     fn maybe_activate(&mut self, queue: Rc<RefCell<TaskQueue>>) {
         let mut state = queue.borrow_mut();
         if !state.is_active() {
-            state.vruntime = self.default_vruntime + 1;
+            state.vruntime = self.activation_vruntime(&state);
             state.active = true;
             drop(state);
             self.active_executors.push(queue);
@@ -1956,10 +2054,12 @@ impl LocalExecutor {
         let queue = candidate.unwrap();
         tq.active_executing = Some(queue.clone());
         tq.in_slice = true;
+        let least_vruntime = tq.default_vruntime;
         drop(tq);
 
         let time = Instant::now();
         let mut run = scopeguard::guard((queue, 0, None), |(queue, tasks_executed, preempted)| {
+            let preempted = preempted.map(|task| (task, least_vruntime));
             self.finish_task_queue_run(queue, time.elapsed(), tasks_executed, preempted)
         });
         {
@@ -2010,9 +2110,9 @@ impl LocalExecutor {
     /// queue left active outside the heap is never pushed again, so the
     /// executor would park forever on its next `run`.
     ///
-    /// `preempted` is set if `need_preempt` ended the run, to the address of
-    /// the task that was running, or to `None` if it ended the run before any
-    /// task was polled.
+    /// `preempted` is set if `need_preempt` ended the run: the address of
+    /// the task that was running, or `None` if it ended the run before any
+    /// task was polled, and the least vruntime as the run began.
     /// The task polled last is remembered alongside any task a window opened
     /// earlier in the run already remembers, from a task's inline first poll.
     /// A queue whose only runnable is held stays runnable, so that it keeps
@@ -2031,7 +2131,7 @@ impl LocalExecutor {
         queue: Rc<RefCell<TaskQueue>>,
         runtime: Duration,
         tasks_executed_this_loop: u64,
-        preempted: Option<Option<usize>>,
+        preempted: Option<(Option<usize>, u64)>,
     ) {
         let (mut need_repush, vruntime) = {
             let mut state = queue.borrow_mut();
@@ -2042,24 +2142,6 @@ impl LocalExecutor {
         let mut tq = self.context.queues.borrow_mut();
         tq.active_executing = None;
         tq.in_slice = false;
-        let displaced = match preempted {
-            Some(Some(last)) => tq.preempted_last(&queue, last),
-            Some(None) => None,
-            None => {
-                debug_assert!(
-                    tq.preempted.is_none() || std::thread::panicking(),
-                    "a window opened in a slice that need_preempt did not end"
-                );
-                None
-            }
-        };
-        if !need_repush && tq.preempted.is_some() {
-            let index = queue.borrow().index();
-            if tq.preempted.as_ref().is_some_and(|p| p.holds_for(index)) {
-                queue.borrow_mut().active = true;
-                need_repush = true;
-            }
-        }
         tq.stats.executor_runtime += runtime;
         tq.stats.tasks_executed += tasks_executed_this_loop;
         let vruntime = match vruntime {
@@ -2072,6 +2154,22 @@ impl LocalExecutor {
                 0
             }
         };
+        let displaced = if let Some((last, least)) = preempted {
+            tq.preempted_last(&queue, last, least)
+        } else {
+            debug_assert!(
+                tq.preempted.is_none() || std::thread::panicking(),
+                "a window opened in a slice that need_preempt did not end"
+            );
+            None
+        };
+        if !need_repush && tq.preempted.is_some() {
+            let index = queue.borrow().index();
+            if tq.preempted.as_ref().is_some_and(|p| p.holds_for(index)) {
+                queue.borrow_mut().active = true;
+                need_repush = true;
+            }
+        }
 
         if need_repush {
             tq.active_executors.push(queue);
@@ -3851,6 +3949,465 @@ mod test {
             queue.borrow_mut().account_vruntime(Duration::MAX),
             Some(u64::MAX)
         );
+    }
+
+    /// A queue activated with the least vruntime at the top of its range is
+    /// placed at the top, in the window after a preempted slice and outside
+    /// it, rather than wrapping to zero.
+    #[test]
+    fn activation_at_the_top_of_the_vruntime_range_saturates() {
+        let ex = LocalExecutor::default();
+        let queue = TaskQueue::new(
+            Default::default(),
+            "top",
+            Shares::Static(1),
+            IoRequirements::default(),
+            0,
+            ex.task_registry(),
+        );
+        let mut queues = ExecutorQueues::new(Duration::from_millis(20), None);
+        queues.default_vruntime = u64::MAX;
+        assert_eq!(queues.activation_vruntime(&queue.borrow()), u64::MAX);
+        queues.preempted = Some(Preempted::new(u64::MAX, usize::MAX));
+        assert_eq!(queues.activation_vruntime(&queue.borrow()), u64::MAX);
+        queues.preempted = Some(Preempted::new(5, usize::MAX));
+        assert_eq!(queues.activation_vruntime(&queue.borrow()), 6);
+    }
+
+    /// The least vruntime is lowered as a window ends, so a queue activated
+    /// after it is placed behind the least runnable queue, not behind the
+    /// cached value.
+    ///
+    /// The window placed `woken` by its charge, below the cached least
+    /// vruntime that `busy` left as its slice ended. Activated once the window
+    /// has ended, `late` goes ahead of `busy`, as it would have had it been
+    /// activated just before the window ended.
+    #[test]
+    fn a_queue_activated_after_a_window_is_placed_by_the_least_runnable_queue() {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let busy = queue("busy");
+        let woken = queue("woken");
+        let late = queue("late");
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 200;
+            busy.borrow_mut().vruntime = 200;
+            busy.borrow_mut().active = true;
+            queues.active_executors.push(busy.clone());
+            queues.preempted = Some(Preempted::new(100, usize::MAX));
+            queues.maybe_activate(woken.clone());
+        }
+        assert_eq!(woken.borrow().vruntime, 101);
+        ex.context.end_preempted_window();
+        ex.context.queues.borrow_mut().maybe_activate(late.clone());
+        assert!(
+            late.borrow().vruntime < busy.borrow().vruntime,
+            "the late queue was placed at {} behind the busy one at {}",
+            late.borrow().vruntime,
+            busy.borrow().vruntime
+        );
+    }
+
+    /// The queue whose slice a window opened for is placed behind a queue the
+    /// window woke when the window reactivates it.
+    ///
+    /// From a model trace with three queues of equal shares: `preempted`'s
+    /// slice ended with its task awaiting I/O, so the queue went idle at the
+    /// 3 it was charged, while `least` holds the least vruntime, 0. The window
+    /// wakes `woken`, idle at 4, and places it at 1. Then it holds the
+    /// preempted task, whose wake reactivates `preempted`: placed by the
+    /// window like any woken queue it would land at 1 as well, tie with
+    /// `woken` and could run first.
+    #[test]
+    fn a_preempted_queue_reactivated_in_its_window_goes_behind_the_queues_it_woke() {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let least = queue("least");
+        let woken = queue("woken");
+        let preempted = queue("preempted");
+        let (runnable, address, _) = unscheduled_in(&ex, preempted.clone());
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 0;
+            least.borrow_mut().vruntime = 0;
+            least.borrow_mut().active = true;
+            queues.active_executors.push(least.clone());
+            woken.borrow_mut().vruntime = 4;
+            preempted.borrow_mut().vruntime = 3;
+            let mut window = Preempted::new(0, preempted.borrow().index());
+            window.last = Some(Held {
+                task: address,
+                runnable: None,
+            });
+            queues.preempted = Some(window);
+            queues.maybe_activate(woken.clone());
+            assert!(matches!(queues.hold(&preempted, runnable), Ok(None)));
+        }
+        assert_eq!(woken.borrow().vruntime, 1);
+        assert!(
+            woken.borrow().vruntime < preempted.borrow().vruntime,
+            "the woken queue at {} does not go ahead of the preempted one at {}",
+            woken.borrow().vruntime,
+            preempted.borrow().vruntime
+        );
+        let order: Vec<String> =
+            std::iter::from_fn(|| ex.context.queues.borrow_mut().active_executors.pop())
+                .map(|queue| queue.borrow().name.clone())
+                .collect();
+        assert_eq!(order, ["least", "woken", "preempted"]);
+        ex.context.end_preempted_window();
+    }
+
+    /// A queue whose slice a window opened for, reactivated in that window, is
+    /// placed no further back than just behind the usual place, however much
+    /// its slice was charged.
+    ///
+    /// A queue with one share is charged a thousand times as much for a slice
+    /// as one with a thousand. Placed by that charge after sleeping through
+    /// the window, it would wait for every other queue to catch up, which an
+    /// idle queue is never made to do.
+    #[test]
+    fn a_preempted_queue_charged_far_ahead_is_placed_just_behind_the_usual_place() {
+        let ex = LocalExecutor::default();
+        let handle =
+            ex.context
+                .create_task_queue(Shares::Static(1), Latency::NotImportant, "preempted");
+        let preempted = ex.context.get_queue(&handle).unwrap();
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 100;
+            preempted.borrow_mut().vruntime = 1_000_000;
+            queues.preempted = Some(Preempted::new(50, preempted.borrow().index()));
+            queues.maybe_activate(preempted.clone());
+        }
+        assert_eq!(preempted.borrow().vruntime, 102);
+        ex.context.end_preempted_window();
+    }
+
+    /// A window opened by a task that cleanup polls inline during a slice
+    /// belongs to the queue whose slice it is, and holds the task in the queue
+    /// cleanup ran it in.
+    ///
+    /// A task of `other`, another executor, owns through `slot` the handle of
+    /// a task parked in `cleanup`, a queue of this one. Dropping `other` during
+    /// a slice of the default queue cancels the parked task from `other`'s
+    /// context, so this executor drops it in cleanup, in `cleanup`, and its
+    /// destructor spawns a task that spins until the preempt timer fires and
+    /// wakes itself. A try in which the timer had fired before that task began
+    /// proves nothing and is made again.
+    #[test]
+    fn a_window_opened_by_cleanup_during_a_slice_belongs_to_the_slice() {
+        struct SpawnOnDrop(Rc<Cell<bool>>);
+
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                let crossed = self.0.clone();
+                crate::spawn_local(async move {
+                    let before = crate::executor().need_preempt();
+                    while !crate::executor().need_preempt() {}
+                    crossed.set(!before);
+                    crate::executor().yield_now().await;
+                })
+                .detach();
+            }
+        }
+
+        for _ in 0..10 {
+            let slot: Rc<RefCell<Option<crate::Task<()>>>> = Rc::new(RefCell::new(None));
+            let other = LocalExecutor::default();
+            other.run(enclose! { (slot) async move {
+                crate::spawn_local(async move {
+                    let _slot = slot;
+                    Timer::new(Duration::from_secs(3600)).await;
+                })
+                .detach();
+            }});
+            let ex = LocalExecutorBuilder::default()
+                .preempt_timer(Duration::from_millis(5))
+                .make()
+                .unwrap();
+            let crossed = Rc::new(Cell::new(false));
+            let (slice, cleanup, window, restored) = ex.run(enclose! { (crossed) async move {
+                let cleanup = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::NotImportant,
+                    "cleanup",
+                );
+                let started = Rc::new(Cell::new(false));
+                let parked = crate::spawn_local_into(
+                    enclose! { (started) async move {
+                        let _spawns = SpawnOnDrop(crossed);
+                        started.set(true);
+                        std::future::pending::<()>().await;
+                    }},
+                    cleanup,
+                )
+                .unwrap();
+                while !started.get() {
+                    crate::executor().yield_now().await;
+                }
+                *slot.borrow_mut() = Some(parked);
+                drop(slot);
+                let slice = with_running_queues(|queues| {
+                    queues
+                        .active_executing
+                        .as_ref()
+                        .map(|queue| queue.borrow().index())
+                });
+                drop(other);
+                let window = with_running_queues(|queues| {
+                    queues.preempted.as_ref().map(|preempted| {
+                        let held: Vec<usize> = preempted
+                            .inline
+                            .iter()
+                            .filter_map(|held| held.runnable.as_ref())
+                            .map(|runnable| runnable.task_queue_index())
+                            .collect();
+                        (preempted.queue, held)
+                    })
+                });
+                let restored = with_running_queues(|queues| queues.slice_owner.is_none());
+                (slice, cleanup.index, window, restored)
+            }});
+            if !crossed.get() {
+                continue;
+            }
+            assert_eq!(window, Some((slice.unwrap(), vec![cleanup])));
+            assert!(
+                restored,
+                "the slice's queue was left recorded after cleanup"
+            );
+            return;
+        }
+        panic!("the preempt timer had always fired before the task cleanup spawned began");
+    }
+
+    /// A slice that `need_preempt` ended before it polled any task opens no
+    /// window of its own and charges its queue nothing past its runtime.
+    #[test]
+    fn a_slice_preempted_before_it_polled_a_task_opens_no_window() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queue.borrow_mut().vruntime = 7;
+            queue.borrow_mut().active = true;
+            queues.active_executing = Some(queue.clone());
+            queues.in_slice = true;
+        }
+        ex.finish_task_queue_run(queue.clone(), Duration::ZERO, 0, Some((None, 5)));
+        assert!(
+            ex.context.queues.borrow().preempted.is_none(),
+            "a window opened"
+        );
+        assert_eq!(queue.borrow().vruntime, 7);
+    }
+
+    /// A slice that `need_preempt` ended before it polled any task keeps the
+    /// window cleanup opened as it was set up, names its queue the window's,
+    /// and charges it the step, as a slice that polled a task does.
+    #[test]
+    fn a_slice_preempted_before_it_polled_a_task_keeps_the_window_set_up_opened() {
+        let ex = LocalExecutor::default();
+        let queue = ex.context.get_queue(&TaskQueueHandle::default()).unwrap();
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queue.borrow_mut().vruntime = 7;
+            queue.borrow_mut().active = true;
+            queues.preempted = Some(window(1));
+            queues.active_executing = Some(queue.clone());
+            queues.in_slice = true;
+        }
+        ex.finish_task_queue_run(queue.clone(), Duration::ZERO, 0, Some((None, 5)));
+        {
+            let queues = ex.context.queues.borrow();
+            let preempted = queues.preempted.as_ref().expect("the window was dropped");
+            assert_eq!(preempted.queue, queue.borrow().index());
+            assert!(preempted.last.is_none(), "a last task was remembered");
+            assert_eq!(preempted.inline.len(), 1);
+        }
+        assert_eq!(queue.borrow().vruntime, 8);
+        ex.context.end_preempted_window();
+    }
+
+    /// A queue the window woke goes ahead of the queue whose slice opened the
+    /// window when the slice charged that queue nothing.
+    ///
+    /// The slice began with the least vruntime at 100 and left the preempted
+    /// queue idle at 100. `woken`, charged 90, is placed no earlier than it
+    /// would have been woken during the slice, just behind 100, which is where
+    /// the preempted queue's charge for its slice puts it too.
+    #[test]
+    fn a_woken_queue_goes_ahead_of_a_preempted_queue_its_slice_charged_nothing() {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let preempted = queue("preempted");
+        let woken = queue("woken");
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 100;
+            preempted.borrow_mut().vruntime = 100;
+            preempted.borrow_mut().active = true;
+            woken.borrow_mut().vruntime = 90;
+            queues.active_executing = Some(preempted.clone());
+            queues.in_slice = true;
+        }
+        ex.finish_task_queue_run(preempted.clone(), Duration::ZERO, 1, Some((Some(1), 100)));
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.maybe_activate(woken.clone());
+            queues.maybe_activate(preempted.clone());
+        }
+        assert!(
+            woken.borrow().vruntime < preempted.borrow().vruntime,
+            "the woken queue at {} does not go ahead of the preempted one at {}",
+            woken.borrow().vruntime,
+            preempted.borrow().vruntime
+        );
+        ex.context.end_preempted_window();
+    }
+
+    /// Ends a preempted slice of a queue charged 7, which began with the least
+    /// vruntime at 5, on a task that yielded and is held, with `others` more
+    /// tasks queued ahead of it, then wakes another queue charged the same in
+    /// the window, and returns the order the scheduler takes the two in.
+    fn order_after_a_preempted_slice_that_keeps_its_queue_runnable(others: usize) -> Vec<String> {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let preempted = queue("preempted");
+        let woken = queue("woken");
+        for _ in 0..others {
+            let (runnable, _, _) = unscheduled_in(&ex, preempted.clone());
+            preempted.borrow_mut().runnables.push_back(runnable);
+        }
+        let (last, address, _) = unscheduled_in(&ex, preempted.clone());
+        preempted.borrow_mut().runnables.push_back(last);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 5;
+            preempted.borrow_mut().vruntime = 7;
+            preempted.borrow_mut().active = true;
+            woken.borrow_mut().vruntime = 7;
+            queues.active_executing = Some(preempted.clone());
+            queues.in_slice = true;
+        }
+        ex.finish_task_queue_run(
+            preempted.clone(),
+            Duration::ZERO,
+            1,
+            Some((Some(address), 5)),
+        );
+        assert!(
+            preempted.borrow().is_active(),
+            "the preempted queue went idle"
+        );
+        ex.context.queues.borrow_mut().maybe_activate(woken.clone());
+        assert!(
+            woken.borrow().vruntime < preempted.borrow().vruntime,
+            "the woken queue at {} does not go ahead of the preempted one at {}",
+            woken.borrow().vruntime,
+            preempted.borrow().vruntime
+        );
+        let order = std::iter::from_fn(|| ex.context.queues.borrow_mut().active_executors.pop())
+            .map(|queue| queue.borrow().name.clone())
+            .collect();
+        ex.context.end_preempted_window();
+        order
+    }
+
+    /// A queue the window woke goes ahead of the queue whose slice opened the
+    /// window when both were charged the same and the preempted queue stayed
+    /// runnable because the window holds its only task.
+    #[test]
+    fn a_woken_queue_charged_the_same_goes_ahead_of_a_preempted_queue_left_holding() {
+        assert_eq!(
+            order_after_a_preempted_slice_that_keeps_its_queue_runnable(0),
+            ["woken", "preempted"]
+        );
+    }
+
+    /// A queue the window woke goes ahead of the queue whose slice opened the
+    /// window when both were charged the same and the preempted queue stayed
+    /// runnable with tasks of its own queued.
+    #[test]
+    fn a_woken_queue_charged_the_same_goes_ahead_of_a_preempted_queue_with_tasks() {
+        assert_eq!(
+            order_after_a_preempted_slice_that_keeps_its_queue_runnable(1),
+            ["woken", "preempted"]
+        );
+    }
+
+    /// A queue the window woke goes ahead of the queue whose slice opened the
+    /// window when both were charged the same, whichever woke first.
+    ///
+    /// The slice began with the least vruntime at 100, and the preempted queue
+    /// went idle at the 150 it was charged, with no other queue runnable, so
+    /// 150 is the cached least vruntime. The preempted queue and `woken`, also
+    /// charged 150, both wake in the window, the preempted one first.
+    #[test]
+    fn a_woken_queue_charged_the_same_goes_ahead_of_the_preempted_queue() {
+        let ex = LocalExecutor::default();
+        let queue = |name: &str| {
+            let handle =
+                ex.context
+                    .create_task_queue(Shares::default(), Latency::NotImportant, name);
+            ex.context.get_queue(&handle).unwrap()
+        };
+        let preempted = queue("preempted");
+        let woken = queue("woken");
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.default_vruntime = 100;
+            preempted.borrow_mut().vruntime = 150;
+            preempted.borrow_mut().active = true;
+            woken.borrow_mut().vruntime = 150;
+            queues.active_executing = Some(preempted.clone());
+            queues.in_slice = true;
+        }
+        ex.finish_task_queue_run(preempted.clone(), Duration::ZERO, 1, Some((Some(1), 100)));
+        assert!(
+            !preempted.borrow().is_active(),
+            "the preempted queue is runnable"
+        );
+        assert_eq!(ex.context.queues.borrow().default_vruntime, 150);
+        {
+            let mut queues = ex.context.queues.borrow_mut();
+            queues.maybe_activate(preempted.clone());
+            queues.maybe_activate(woken.clone());
+        }
+        assert!(
+            woken.borrow().vruntime < preempted.borrow().vruntime,
+            "the woken queue at {} does not go ahead of the preempted one at {}",
+            woken.borrow().vruntime,
+            preempted.borrow().vruntime
+        );
+        let order: Vec<String> =
+            std::iter::from_fn(|| ex.context.queues.borrow_mut().active_executors.pop())
+                .map(|queue| queue.borrow().name.clone())
+                .collect();
+        assert_eq!(order, ["woken", "preempted"]);
+        ex.context.end_preempted_window();
     }
 
     #[test]
@@ -6259,7 +6816,7 @@ mod test {
     /// A window that remembers the task at `task` as the inline one, holding
     /// nothing yet.
     fn window(task: usize) -> Preempted {
-        let mut window = Preempted::new();
+        let mut window = Preempted::new(0, usize::MAX);
         window.inline.push(Held {
             task,
             runnable: None,
@@ -6346,7 +6903,12 @@ mod test {
             queues.active_executors.clear();
             queues.active_executing = Some(queue.clone());
         }
-        ex.finish_task_queue_run(queue.clone(), Duration::from_millis(1), 1, Some(Some(1)));
+        ex.finish_task_queue_run(
+            queue.clone(),
+            Duration::from_millis(1),
+            1,
+            Some((Some(1), 0)),
+        );
         assert!(queue.borrow().is_active(), "the queue went idle");
         assert_eq!(
             ex.context.queues.borrow().active_executors.len(),
@@ -6417,7 +6979,12 @@ mod test {
             queues.active_executing = Some(queue.clone());
         }
         queue.borrow_mut().active = true;
-        ex.finish_task_queue_run(queue.clone(), Duration::from_millis(1), 1, Some(Some(1)));
+        ex.finish_task_queue_run(
+            queue.clone(),
+            Duration::from_millis(1),
+            1,
+            Some((Some(1), 0)),
+        );
         assert!(
             !queue.borrow().is_active(),
             "the finishing queue was kept runnable for another queue's task"
@@ -6471,18 +7038,18 @@ mod test {
         let (first, first_address, first_dropped) = unscheduled(&ex);
         let (second, second_address, _) = unscheduled(&ex);
         queue.borrow_mut().runnables.push_back(first);
-        let displaced = ex
-            .context
-            .queues
-            .borrow_mut()
-            .preempted_last(&queue, first_address);
+        let displaced =
+            ex.context
+                .queues
+                .borrow_mut()
+                .preempted_last(&queue, Some(first_address), 0);
         assert!(displaced.is_none());
         queue.borrow_mut().runnables.push_back(second);
         let displaced = ex
             .context
             .queues
             .borrow_mut()
-            .preempted_last(&queue, second_address)
+            .preempted_last(&queue, Some(second_address), 0)
             .expect("the first task was not displaced");
         ex.context.requeue(displaced);
         assert_eq!(queued(&queue), [first_address]);
@@ -6956,8 +7523,9 @@ mod test {
     }
 
     /// A window that cleanup opens as a slice is set up, before the slice
-    /// polls any task, holds the task cleanup polled inline, and the run that
-    /// the preempt timer then ends at its first check keeps it.
+    /// polls any task, holds the task cleanup polled inline, names no queue
+    /// until the slice ends, since the slice's queue is borrowed then, and the
+    /// run that the preempt timer then ends at its first check keeps it.
     ///
     /// The shares manager of `dynamic` drops `other`, another executor, as the
     /// slice is set up. A task of `other` owns through `slot` the handle of a
@@ -6983,7 +7551,7 @@ mod test {
             }
         }
 
-        type Window = Option<Vec<usize>>;
+        type Window = Option<(usize, Vec<usize>)>;
 
         struct DropsOnAdjustment(
             Rc<RefCell<Option<LocalExecutor>>>,
@@ -7001,12 +7569,13 @@ mod test {
                     drop(other);
                     let window = with_running_queues(|queues| {
                         queues.preempted.as_ref().map(|preempted| {
-                            preempted
+                            let held: Vec<usize> = preempted
                                 .inline
                                 .iter()
                                 .filter_map(|held| held.runnable.as_ref())
                                 .map(|runnable| runnable.task_queue_index())
-                                .collect::<Vec<_>>()
+                                .collect();
+                            (preempted.queue, held)
                         })
                     });
                     *self.1.borrow_mut() = Some(window);
@@ -7065,7 +7634,7 @@ mod test {
             if !crossed.get() {
                 continue;
             }
-            assert_eq!(window.take(), Some(Some(vec![cleanup])));
+            assert_eq!(window.take(), Some(Some((usize::MAX, vec![cleanup]))));
             return;
         }
         panic!("the preempt timer had always fired before the task cleanup spawned began");
@@ -7537,9 +8106,146 @@ mod test {
         );
     }
 
+    /// How the sleeping queue in the share tests spends each turn.
+    #[derive(Clone, Copy, Debug)]
+    enum Turn {
+        /// Spins for three quarters of a slice.
+        Part,
+        /// Spins until it is preempted.
+        Whole,
+    }
+
+    /// Returns the runtime a queue that sleeps for 1 ms after every turn gets,
+    /// divided by the runtime of a queue that only yields when preempted.
+    ///
+    /// Each queue must take twenty turns or more, so the ratio is never one
+    /// or two turns against each other.
+    ///
+    /// The queues hold `sleeper` and `busy` shares. A queue is placed afresh
+    /// each time it wakes, which forgets part of what its shares charged it,
+    /// so the tests hold a sleeping queue to an equal turn with `busy` at most
+    /// rather than to its shares.
+    fn sleeper_runtime_ratio(turn: Turn, sleeper: usize, busy: usize) -> f64 {
+        const TURNS: usize = 20;
+        const PERIOD: Duration = Duration::from_millis(20);
+        const RUN: Duration = Duration::from_millis(1500);
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(PERIOD)
+            .make()
+            .unwrap();
+        ex.run(async move {
+            let sleeper = crate::executor().create_task_queue(
+                Shares::Static(sleeper),
+                Latency::NotImportant,
+                "sleeper",
+            );
+            let busy = crate::executor().create_task_queue(
+                Shares::Static(busy),
+                Latency::NotImportant,
+                "busy",
+            );
+            let start = Instant::now();
+            let sleeper = crate::spawn_local_into(
+                async move {
+                    let mut ran = Duration::ZERO;
+                    let mut turns = 0usize;
+                    while start.elapsed() < RUN {
+                        turns += 1;
+                        let turn_start = Instant::now();
+                        match turn {
+                            Turn::Part => while turn_start.elapsed() < PERIOD * 3 / 4 {},
+                            Turn::Whole => while !crate::executor().need_preempt() {},
+                        }
+                        ran += turn_start.elapsed();
+                        Timer::new(Duration::from_millis(1)).await;
+                    }
+                    (ran, turns)
+                },
+                sleeper,
+            )
+            .unwrap();
+            let busy = crate::spawn_local_into(
+                async move {
+                    let mut ran = Duration::ZERO;
+                    let mut turns = 0usize;
+                    while start.elapsed() < RUN {
+                        turns += 1;
+                        let turn_start = Instant::now();
+                        while !crate::executor().need_preempt() && start.elapsed() < RUN {}
+                        ran += turn_start.elapsed();
+                        crate::yield_if_needed().await;
+                    }
+                    (ran, turns)
+                },
+                busy,
+            )
+            .unwrap();
+            let ((sleeper, sleeper_turns), (busy, busy_turns)) = join(sleeper, busy).await;
+            assert!(
+                sleeper_turns >= TURNS && busy_turns >= TURNS,
+                "the sleeping queue took {sleeper_turns} turns and the busy one {busy_turns}"
+            );
+            sleeper.as_secs_f64() / busy.as_secs_f64()
+        })
+    }
+
+    /// A queue of equal shares that sleeps after part of each slice gets an
+    /// equal turn, no more and no less.
+    ///
+    /// Woken while the busy queue runs, it goes ahead of that queue's next
+    /// slice. Placed as usual it waited for that slice and got about 0.6 of
+    /// the busy queue's runtime; placed ahead with no regard for its charge,
+    /// it got three times the busy queue's runtime.
+    #[test]
+    fn a_queue_that_sleeps_after_part_of_a_slice_gets_an_equal_turn() {
+        let ratio = sleeper_runtime_ratio(Turn::Part, 1000, 1000);
+        assert!(
+            (0.75..1.25).contains(&ratio),
+            "the sleeping queue ran {ratio:.2} times as long as the busy one"
+        );
+    }
+
+    /// A queue of equal shares that uses up its slice and then sleeps gets an
+    /// equal turn.
+    ///
+    /// It is preempted, and so charged for its slice before it sleeps. Placed
+    /// as usual when it wakes it waited a second slice of the busy queue and
+    /// got half the busy queue's runtime.
+    #[test]
+    fn a_queue_that_sleeps_after_a_whole_slice_gets_an_equal_turn() {
+        let ratio = sleeper_runtime_ratio(Turn::Whole, 1000, 1000);
+        assert!(
+            (0.75..1.25).contains(&ratio),
+            "the sleeping queue ran {ratio:.2} times as long as the busy one"
+        );
+    }
+
+    /// A queue with one share against a thousand that sleeps after part of
+    /// each slice gets what it got before: less than an equal turn, but a
+    /// turn behind every second slice of the busy queue.
+    ///
+    /// Its charge for a turn is a thousand times the busy queue's, so it is
+    /// placed as usual. Placed ahead regardless of its charge it got three
+    /// times the busy queue's runtime, and placed no earlier than its charge
+    /// with nothing to bring it back it got a hundredth.
+    #[test]
+    fn a_low_share_queue_that_sleeps_keeps_its_turn_behind_two_slices() {
+        let ratio = sleeper_runtime_ratio(Turn::Part, 1, 1000);
+        assert!(
+            (0.3..1.0).contains(&ratio),
+            "the sleeping queue ran {ratio:.2} times as long as the busy one"
+        );
+    }
+
     #[test]
     fn a_due_timer_runs_ahead_of_io_that_completed_in_the_same_idle_poll() {
         assert_a_woken_task_waits_one_slice(SliceEnd::Nop, Wake::Timer, 1);
+    }
+
+    #[test]
+    fn a_due_timer_in_another_queue_runs_ahead_of_io_that_completed_in_the_same_idle_poll() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::Nop, Wake::Timer, 2);
     }
 
     /// A task polled inline by a waker the reactor runs is not taken for the
@@ -7575,12 +8281,27 @@ mod test {
     }
 
     #[test]
+    fn a_due_timer_in_another_queue_runs_ahead_of_a_queue_that_yielded_when_preempted() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::Yield, Wake::Timer, 2);
+    }
+
+    #[test]
     fn completed_io_runs_ahead_of_a_task_that_yielded_when_preempted() {
         assert_a_woken_task_waits_one_slice(SliceEnd::Yield, Wake::Nop, 1);
     }
 
     #[test]
+    fn completed_io_in_another_queue_runs_ahead_of_a_queue_that_yielded_when_preempted() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::Yield, Wake::Nop, 2);
+    }
+
+    #[test]
     fn completed_io_runs_ahead_of_a_preempted_task_whose_timer_came_due() {
         assert_a_woken_task_waits_one_slice(SliceEnd::DueTimer, Wake::Nop, 1);
+    }
+
+    #[test]
+    fn completed_io_in_another_queue_runs_ahead_of_a_preempted_queue_whose_timer_came_due() {
+        assert_a_woken_task_waits_one_slice(SliceEnd::DueTimer, Wake::Nop, 2);
     }
 }

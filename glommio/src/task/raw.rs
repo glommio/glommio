@@ -249,6 +249,8 @@ where
     }
 
     /// Wakes a task. Only the owning executor may access its local state.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     unsafe fn do_wake(ptr: *const ()) {
         let raw = Self::from_ptr(ptr);
         if !(*raw.header).active.load(Ordering::Acquire) {
@@ -495,6 +497,7 @@ where
         }
     }
 
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     unsafe fn cancel(ptr: *const ()) {
         let header = ptr as *mut Header;
         let state = (*header).state;
@@ -587,6 +590,8 @@ where
     /// wake received during polling schedules the task again. After the
     /// transfer the schedule callback owns the runnable, whether it runs,
     /// drops, or panics synchronously.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     unsafe fn run(ptr: *const ()) -> bool {
         let raw = Self::from_ptr(ptr);
         let header = raw.header as *mut Header;
@@ -647,6 +652,7 @@ where
     F: Future<Output = R>,
     S: Fn(Task);
 
+/// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
 impl<F, R, S> Drop for PollGuard<F, R, S>
 where
     F: Future<Output = R>,

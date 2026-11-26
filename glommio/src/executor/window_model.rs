@@ -84,6 +84,19 @@
 //! searches of the current rule are opt in: `WINDOW_MODEL_EVENTS=16` with
 //! `--release` takes a few minutes and tens of millions of states.
 //!
+//! # Drift
+//!
+//! Every item it mirrors carries the line "Modelled by the test-only
+//! `executor::window_model`: mirror changes there and rerun it." in its
+//! docs, and `MIRRORED` holds a fingerprint of each one's source, layout and
+//! docs stripped; `task/raw.rs`'s `do_wake`, `cancel`, `run` and
+//! `PollGuard`'s `Drop` included, since the model relies on their wake,
+//! cancel and unwind semantics. `react`'s
+//! order is not fingerprinted: a change there needs this model reviewed. `mirrored_code_is_unchanged` fails when one changes. Then
+//! mirror the change here, keep every earlier rule's test passing, rerun the
+//! deep searches, and update the fingerprints, which
+//! `WINDOW_MODEL_PRINT_FINGERPRINTS=1` prints.
+//!
 //! # Assumptions, and what it does not cover
 //!
 //! - Up to five task addresses, three queues and three nested inline polls.
@@ -2657,6 +2670,299 @@ impl Model {
     }
 }
 
+/// The executor sources the model mirrors, read at compile time for the
+/// drift tripwire.
+const SOURCES: [(&str, &str); 4] = [
+    ("mod.rs", include_str!("mod.rs")),
+    ("context.rs", include_str!("context.rs")),
+    ("multitask.rs", include_str!("multitask.rs")),
+    ("task/raw.rs", include_str!("../task/raw.rs")),
+];
+
+/// The items the model mirrors: the file, the text the item's line starts
+/// with, and the fingerprint of its source with layout and docs stripped.
+/// `mirrored_code_is_unchanged` fails when any of them changes.
+const MIRRORED: &[(&str, &str, u64)] = &[
+    ("mod.rs", "impl Ord for TaskQueue {", 0x14a06031a6195825),
+    ("mod.rs", "struct Held {", 0x42c70e03b6beb9e3),
+    ("mod.rs", "struct Preempted {", 0x7e738adafadfe413),
+    ("mod.rs", "impl Preempted {", 0x22a14af581d732b3),
+    ("mod.rs", "struct ExecutorQueues {", 0x85dc834c794463c0),
+    ("mod.rs", "fn take_from_back(", 0x67a9a075df2f2f82),
+    ("mod.rs", "fn preempted_inline(", 0x659550d6696aad80),
+    ("mod.rs", "fn preempted_last(", 0x3e1893d3a36eba17),
+    ("mod.rs", "fn close_window(", 0xd4f1f318e1f4ce02),
+    ("mod.rs", "fn hold(", 0x595f37c5c85e6609),
+    ("mod.rs", "fn activation_vruntime(", 0xd7c963cdb438af51),
+    ("mod.rs", "fn maybe_activate(", 0x49fa7deb303b478c),
+    ("mod.rs", "fn run_task_queues(", 0x2bb66f39a7fd05ae),
+    ("mod.rs", "fn run_one_task_queue(", 0xf426337dbccdb8f7),
+    ("mod.rs", "fn finish_task_queue_run(", 0xfd65f70f46630194),
+    ("mod.rs", "pub fn run<T>(", 0xe42fa887fcd45e87),
+    (
+        "context.rs",
+        "pub(super) fn with_cleanup<T>(",
+        0xf6db0da5d75f6489,
+    ),
+    (
+        "context.rs",
+        "pub(super) fn schedule_cleanup(",
+        0xe209b8eacea650ba,
+    ),
+    ("context.rs", "pub(super) fn schedule(", 0xcdab855177f815a2),
+    ("context.rs", "pub(super) fn requeue(", 0x04909e000a2653ee),
+    (
+        "context.rs",
+        "pub(super) fn end_preempted_window(",
+        0x78df80de4e7b65c7,
+    ),
+    (
+        "context.rs",
+        "pub(super) fn spawn_internal<T>(",
+        0x465ae9c1fe18b181,
+    ),
+    (
+        "multitask.rs",
+        "fn schedule(&self, runnable: Runnable)",
+        0x507c1e64bc2b0975,
+    ),
+    ("multitask.rs", "fn schedule_inactive(", 0xad3ecbd1cc2686cd),
+    (
+        "multitask.rs",
+        "pub(crate) fn spawn_and_run<T>(",
+        0x9ae028c8a7560f05,
+    ),
+    ("task/raw.rs", "unsafe fn do_wake(", 0x9cbfb2252ef17828),
+    ("task/raw.rs", "unsafe fn cancel(ptr", 0xdc7d5a5b06e5f53f),
+    ("task/raw.rs", "unsafe fn run(ptr", 0x597be6465e69c934),
+    (
+        "task/raw.rs",
+        "impl<F, R, S> Drop for PollGuard<F, R, S>",
+        0xac6d12b89252e442,
+    ),
+    (
+        "context.rs",
+        "pub(super) fn forget_preempted(",
+        0x353ceeb4272b403f,
+    ),
+];
+
+/// What a span of Rust source is, as far as the tripwire needs to know.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lexeme {
+    /// One character of code.
+    Code(char),
+    /// Whitespace.
+    Space,
+    /// A line, doc or block comment.
+    Comment,
+    /// A string, raw string or char literal, kept whole.
+    Literal,
+}
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Splits `source` into lexemes with their byte ranges. It knows comments,
+/// strings, raw strings, char literals and lifetimes, which is enough to
+/// match braces and to tell layout from code; it is not a Rust lexer.
+fn lex(source: &str) -> Vec<(usize, usize, Lexeme)> {
+    let chars: Vec<(usize, char)> = source.char_indices().collect();
+    let end_of = |i: usize| chars.get(i).map_or(source.len(), |(at, _)| *at);
+    let at = |i: usize| chars.get(i).map(|(_, c)| *c);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i].1;
+        let start = chars[i].0;
+        let prev_ident = i > 0 && is_ident(chars[i - 1].1);
+        let (len, lexeme) = if c == '/' && at(i + 1) == Some('/') {
+            let mut j = i;
+            while j < chars.len() && chars[j].1 != '\n' {
+                j += 1;
+            }
+            (j - i, Lexeme::Comment)
+        } else if c == '/' && at(i + 1) == Some('*') {
+            let mut depth = 0;
+            let mut j = i;
+            while j < chars.len() {
+                if chars[j].1 == '/' && at(j + 1) == Some('*') {
+                    depth += 1;
+                    j += 2;
+                } else if chars[j].1 == '*' && at(j + 1) == Some('/') {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            (j - i, Lexeme::Comment)
+        } else if c == '"' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].1 != '"' {
+                if chars[j].1 == '\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            (j + 1 - i, Lexeme::Literal)
+        } else if c == 'r'
+            && (!prev_ident || (chars[i - 1].1 == 'b' && (i < 2 || !is_ident(chars[i - 2].1))))
+            && matches!(at(i + 1), Some('#' | '"'))
+            && {
+                let mut j = i + 1;
+                while at(j) == Some('#') {
+                    j += 1;
+                }
+                at(j) == Some('"')
+            }
+        {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while at(j) == Some('#') {
+                hashes += 1;
+                j += 1;
+            }
+            j += 1;
+            loop {
+                if j >= chars.len() {
+                    break;
+                }
+                if chars[j].1 == '"' && (1..=hashes).all(|k| at(j + k) == Some('#')) {
+                    j += 1 + hashes;
+                    break;
+                }
+                j += 1;
+            }
+            (j - i, Lexeme::Literal)
+        } else if c == '\'' && at(i + 1) == Some('\\') {
+            let mut j = i + 2;
+            while j < chars.len() && chars[j].1 != '\'' {
+                j += 1;
+            }
+            (j + 1 - i, Lexeme::Literal)
+        } else if c == '\'' && at(i + 2) == Some('\'') {
+            (3, Lexeme::Literal)
+        } else if c.is_whitespace() {
+            (1, Lexeme::Space)
+        } else {
+            (1, Lexeme::Code(c))
+        };
+        let next = (i + len).min(chars.len());
+        out.push((start, end_of(next), lexeme));
+        i = next;
+    }
+    out
+}
+
+/// The source of the item whose line, trimmed, starts with `start`: from
+/// there to the brace that closes its body, braces in comments and literals
+/// not counted. Fails if no line or more than one starts so, which is what
+/// a rename or a duplicate looks like.
+fn mirrored_item<'a>(source: &'a str, start: &str) -> Result<&'a str, String> {
+    let mut found = None;
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(start) {
+            if found.is_some() {
+                return Err(format!("more than one item starts with `{start}`"));
+            }
+            found = Some(offset + line.len() - trimmed.len());
+        }
+        offset += line.len();
+    }
+    let begin = found
+        .ok_or_else(|| format!("no item starts with `{start}`, so it was renamed or removed"))?;
+    let mut depth = 0usize;
+    for (_, end, lexeme) in lex(&source[begin..]) {
+        match lexeme {
+            Lexeme::Code('{') => depth += 1,
+            Lexeme::Code('}') => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| format!("unbalanced braces after `{start}`"))?;
+                if depth == 0 {
+                    return Ok(&source[begin..begin + end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!("the body of `{start}` never closes"))
+}
+
+/// Fingerprints an item's source so that layout does not count. Comments
+/// and docs go, and whitespace goes except where it separates two words.
+/// Literals are kept whole. A trailing comma before a closing bracket goes,
+/// which is what rustfmt adds or removes when it reflows a line, unless it
+/// makes a parenthesised group a 1-tuple; a group right after a word or a
+/// closing bracket is taken for a call's arguments.
+///
+/// What remains: a 1-tuple right after a keyword, as in `match (x,)`, is
+/// taken for a call and loses its comma, and so does one whose single
+/// element holds a comma inside angle brackets.
+fn source_fingerprint(item: &str) -> u64 {
+    struct Group {
+        commas: usize,
+        call: bool,
+    }
+    let mut out = String::new();
+    let mut groups: Vec<Group> = Vec::new();
+    let mut space = false;
+    for (start, end, lexeme) in lex(item) {
+        match lexeme {
+            Lexeme::Space | Lexeme::Comment => space = true,
+            Lexeme::Literal => {
+                out.push_str(&item[start..end]);
+                space = false;
+            }
+            Lexeme::Code(c) => {
+                let last = out.chars().last();
+                if space && last.is_some_and(is_ident) && is_ident(c) {
+                    out.push(' ');
+                }
+                space = false;
+                match c {
+                    '(' | '[' | '{' => {
+                        let call = c == '('
+                            && last
+                                .is_some_and(|l| is_ident(l) || matches!(l, ')' | ']' | '>' | '!'));
+                        groups.push(Group { commas: 0, call });
+                    }
+                    ')' | ']' | '}' => {
+                        let group = groups.pop();
+                        if out.ends_with(',') {
+                            let one_tuple =
+                                c == ')' && group.is_some_and(|g| g.commas == 1 && !g.call);
+                            if !one_tuple {
+                                out.pop();
+                            }
+                        }
+                    }
+                    '>' if out.ends_with(',') => {
+                        out.pop();
+                    }
+                    ',' => {
+                        if let Some(group) = groups.last_mut() {
+                            group.commas += 1;
+                        }
+                    }
+                    _ => {}
+                }
+                out.push(c);
+            }
+        }
+    }
+    let mut h = Fnv128::default();
+    h.write(out.as_bytes());
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3376,5 +3682,83 @@ mod tests {
             "{report}"
         );
         assert!(report.found.is_empty(), "{report}");
+    }
+
+    /// The tripwire: every item the model mirrors still has the source it
+    /// had when the model was last brought up to date with it.
+    #[test]
+    fn mirrored_code_is_unchanged() {
+        let print = std::env::var_os("WINDOW_MODEL_PRINT_FINGERPRINTS").is_some();
+        let mut failures = Vec::new();
+        for (file, start, expected) in MIRRORED {
+            let source = SOURCES
+                .iter()
+                .find(|(name, _)| name == file)
+                .map(|(_, source)| *source)
+                .expect("a mirrored file is in SOURCES");
+            match mirrored_item(source, start) {
+                Err(e) => failures.push(format!(
+                    "{file}: {e}. The preempted-window rule may have moved: update MIRRORED in \
+                     window_model.rs"
+                )),
+                Ok(item) => {
+                    let actual = source_fingerprint(item);
+                    if print {
+                        println!("    (\"{file}\", \"{start}\", 0x{actual:016x}),");
+                    }
+                    if actual != *expected {
+                        failures.push(format!(
+                            "the preempted-window rule changed in `{start}` ({file}): update \
+                             window_model.rs to mirror it, rerun the model, then update the \
+                             fingerprint (print the new values with \
+                             WINDOW_MODEL_PRINT_FINGERPRINTS=1)"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn fingerprint_ignores_layout_but_not_logic() {
+        let source = "impl X {\n    fn f(a: u8, b: u8) -> u8 {\n        a.saturating_add(b).min(1)\n    }\n}\n";
+        let reflowed = "impl X {\n    /// Docs do not count.\n    fn f(\n        a: u8,\n        b: u8,\n    ) -> u8 {\n        a.saturating_add(b)\n            .min(1)\n    }\n}\n";
+        let changed = "impl X {\n    fn f(a: u8, b: u8) -> u8 {\n        a.saturating_add(b).min(2)\n    }\n}\n";
+        let print = |s: &str| source_fingerprint(mirrored_item(s, "fn f(").unwrap());
+        assert_eq!(print(source), print(reflowed));
+        assert_ne!(print(source), print(changed));
+        assert!(mirrored_item(source, "fn g(").is_err());
+        assert!(mirrored_item("fn f() {}\nfn f() {}\n", "fn f(").is_err());
+        assert_eq!(
+            mirrored_item("fn f() { \"}\" }\n", "fn f(").unwrap(),
+            "fn f() { \"}\" }"
+        );
+    }
+
+    /// A brace in a comment or a literal inside an item does not end it.
+    #[test]
+    fn item_extraction_skips_comments_and_literals() {
+        let source = "fn f<'a>(x: &'a str) {\n    /// a doc line with a } in it\n    // a comment with a }\n    let c = '}';\n    let s = \"}\";\n    let r = r#\"}\"#;\n    let b = br#\"a\"}\"#;\n    g(c, s, r, b, x)\n}\nfn h() {}\n";
+        let item = mirrored_item(source, "fn f<").unwrap();
+        assert!(item.ends_with("g(c, s, r, b, x)\n}"), "{item}");
+    }
+
+    /// Literal contents and 1-tuples survive normalization; optional
+    /// trailing commas do not.
+    #[test]
+    fn fingerprint_keeps_literals_and_one_tuples() {
+        let print = |s: &str| source_fingerprint(mirrored_item(s, "fn f(").unwrap());
+        assert_ne!(
+            print("fn f() { g(\"a b\") }"),
+            print("fn f() { g(\"ab\") }")
+        );
+        assert_ne!(print("fn f() { g((x,)) }"), print("fn f() { g((x)) }"));
+        assert_eq!(print("fn f() { g(x,) }"), print("fn f() { g(x) }"));
+        assert_eq!(print("fn f() { [1, 2,] }"), print("fn f() { [1, 2] }"));
+        assert_ne!(
+            print("fn f() { let mut x = 1; }"),
+            print("fn f() { let mutx = 1; }")
+        );
     }
 }

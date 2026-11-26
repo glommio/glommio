@@ -379,6 +379,8 @@ pub(crate) struct TaskQueue {
 }
 
 /// Impl a custom order so we use a min-heap.
+///
+/// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
 impl Ord for TaskQueue {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         other.vruntime.cmp(&self.vruntime)
@@ -624,6 +626,8 @@ impl TaskQueueStats {
 
 /// A task the window a preempted slice opens holds back: its address, and
 /// its runnable while it is held.
+///
+/// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
 #[derive(Debug)]
 struct Held {
     /// The task's address. It identifies the task's runnable when it is
@@ -665,6 +669,8 @@ struct Held {
 /// can wait longer than the pass: one taken for the last task is queued after
 /// those polled inline, so it waits one slice per inline task released ahead of
 /// it, which is one slice unless inline polls nest.
+///
+/// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
 #[derive(Debug)]
 struct Preempted {
     /// The tasks polled inline during whose polls the preempt timer fired,
@@ -690,6 +696,8 @@ impl Preempted {
     }
 
     /// The slot for the task at `task`, if the window remembers it.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn slot(&mut self, task: usize) -> Option<&mut Option<multitask::Runnable>> {
         self.inline
             .iter_mut()
@@ -701,6 +709,8 @@ impl Preempted {
     /// Forgets the task at `task` if nothing of it is held, as it is about to
     /// be destroyed, so that a task allocated at its address later is not
     /// taken for it.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn forget(&mut self, task: usize) {
         self.inline
             .retain(|held| held.task != task || held.runnable.is_some());
@@ -714,6 +724,8 @@ impl Preempted {
     }
 
     /// Whether a runnable of the queue at `index` is held.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn holds_for(&self, index: usize) -> bool {
         self.inline
             .iter()
@@ -734,6 +746,8 @@ struct ExecutorQueues {
     /// Whether a task queue's slice is running. Only then can a window open:
     /// the executor also polls tasks while it cleans up between runs and when
     /// it shuts down, with `active_executing` set but no slice spent.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     in_slice: bool,
     /// The index of the queue whose slice is running, while cleanup during
     /// that slice has made another queue the executing one, so that a window
@@ -791,6 +805,8 @@ impl ExecutorQueues {
     /// task that woke itself during its poll is when the poll returns: it is
     /// queued then, after anything it woke. A task that is not at the back
     /// did not queue itself, and its wake, if any, comes through `schedule`.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn take_from_back(queue: &Rc<RefCell<TaskQueue>>, task: usize) -> Option<multitask::Runnable> {
         let mut state = queue.borrow_mut();
         if state
@@ -814,6 +830,8 @@ impl ExecutorQueues {
     /// between runs or shuts down spent no slice, and no run would end the
     /// window. A task polled inline by cleanup during a slice is found in the
     /// queue cleanup runs it in, and the window belongs to the slice's queue.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     #[cold]
     fn preempted_inline(&mut self, task: usize) {
         if !self.in_slice {
@@ -847,6 +865,8 @@ impl ExecutorQueues {
     /// ends before the next round cannot have; the caller queues it once the
     /// queues are no longer borrowed rather than dropping it here, where its
     /// destructor would run user code under the borrow.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn preempted_last(
         &mut self,
         queue: &Rc<RefCell<TaskQueue>>,
@@ -880,6 +900,8 @@ impl ExecutorQueues {
     /// vruntime of the runnable queues as the window ends. A queue activated
     /// after the window is placed behind the least runnable queue then, as
     /// one activated before it was.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn close_window(&mut self) -> Option<Preempted> {
         let preempted = self.preempted.take();
         if preempted.is_some() {
@@ -898,6 +920,8 @@ impl ExecutorQueues {
     /// Returns a runnable the slot held already, which cannot happen while a
     /// task is queued at most once; the caller queues it once the queues are
     /// no longer borrowed rather than dropping it here.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     #[cold]
     fn hold(
         &mut self,
@@ -940,6 +964,8 @@ impl ExecutorQueues {
     /// earliest mark, and no further back than just behind the usual place,
     /// so that a queue with few shares is not held back by the charge for the
     /// slice it just spent any more than an idle queue is.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn activation_vruntime(&self, queue: &TaskQueue) -> u64 {
         let usual = self.default_vruntime.saturating_add(1);
         let Some(preempted) = self.preempted.as_ref() else {
@@ -957,6 +983,7 @@ impl ExecutorQueues {
         queue.vruntime.clamp(woken, usual)
     }
 
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn maybe_activate(&mut self, queue: Rc<RefCell<TaskQueue>>) {
         let mut state = queue.borrow_mut();
         if !state.is_active() {
@@ -2014,6 +2041,8 @@ impl LocalExecutor {
     /// question with the same shape: being interrupted before servicing a queue
     /// is not the same as having nothing to run, and the caller parks on the
     /// answer.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn run_task_queues(&self) -> TaskQueueRun {
         self.context.end_preempted_window();
         loop {
@@ -2044,6 +2073,8 @@ impl LocalExecutor {
     /// guard reports a stall through user code that can take a while, and the
     /// queue must not be charged for it. A run that unwinds drops the stall
     /// guard first.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn run_one_task_queue(&self) -> bool {
         let mut tq = self.context.queues.borrow_mut();
         let candidate = tq.active_executors.pop();
@@ -2128,6 +2159,8 @@ impl LocalExecutor {
     /// task. A run that unwinds can end before that check, though, so whether
     /// the window holds the queue's only runnable is asked however the run
     /// ended.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     fn finish_task_queue_run(
         &self,
         queue: Rc<RefCell<TaskQueue>>,

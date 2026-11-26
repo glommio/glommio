@@ -114,6 +114,7 @@ pub(super) struct Scheduler {
 }
 
 impl Scheduler {
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     #[inline]
     fn schedule(&self, runnable: Runnable) {
         with_executor_context(|context| match context {
@@ -129,6 +130,7 @@ impl Scheduler {
         });
     }
 
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     #[cold]
     fn schedule_inactive(&self, runnable: Runnable) {
         if let Some(context) = self.owner.upgrade().and_then(|owner| owner.context()) {
@@ -199,6 +201,8 @@ impl Scheduler {
     }
 
     /// Spawns a task and polls it once, returning the task and its address.
+    ///
+    /// Modelled by the test-only `executor::window_model`: mirror changes there and rerun it.
     pub(crate) fn spawn_and_run<T>(
         self: Rc<Self>,
         registry: &TaskRegistry,

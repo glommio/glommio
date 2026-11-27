@@ -31,7 +31,7 @@ use crate::{
         DmaSource, IoBuffer, PollableStatus, SleepNotifier, Source, SourceType, StatsCollection,
         Statx, MAX_RW_COUNT,
     },
-    IoRequirements, IoStats, TaskQueueHandle,
+    IoRequirements, IoStats, Latency, TaskQueueHandle,
 };
 use nix::poll::PollFlags;
 
@@ -100,8 +100,8 @@ impl Timers {
         }
     }
 
-    fn insert(&mut self, when: Instant, waker: Waker) -> TimerId {
-        self.wheel.insert(when, waker)
+    fn insert(&mut self, when: Instant, waker: Waker, latency: bool) -> TimerId {
+        self.wheel.insert(when, waker, latency)
     }
 
     fn remove(&mut self, id: TimerId) -> Option<Waker> {
@@ -123,7 +123,10 @@ impl Timers {
 
     /// The delay until the next armed timer.
     fn next_timer(&self) -> Option<Duration> {
-        self.wheel.next_timer()
+        self.wheel
+            .next_expiries()
+            .0
+            .map(|expires_at| expires_at.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -878,9 +881,16 @@ impl Reactor {
     ///
     /// The returned handle stays valid for the timer's whole life, however
     /// many times it cascades between levels.
+    ///
+    /// A timer registered while a `Latency::Matters` queue runs is a latency
+    /// timer, as I/O submitted then goes to the latency ring.
     pub(crate) fn insert_timer(&self, when: Instant, waker: Waker) -> TimerId {
+        let latency = matches!(
+            self.io_scheduler.requirements().latency_req,
+            Latency::Matters(_)
+        );
         let mut timers = self.timers.borrow_mut();
-        timers.insert(when, waker)
+        timers.insert(when, waker, latency)
     }
 
     /// Deregisters a timer, handing back its waker if it had not fired.

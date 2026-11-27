@@ -6,8 +6,9 @@
 //! glommio::timer is a module that provides timing related primitives.
 mod timer_impl;
 
-/// The wheel's handle type, named where the rest of the crate expects it.
-pub(crate) use wheel::Key as TimerId;
+/// The handle to a registered timer, named where the rest of the crate
+/// expects it.
+pub(crate) use reactor_adapter::TimerId;
 
 pub(crate) mod reactor_adapter;
 

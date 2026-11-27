@@ -593,7 +593,8 @@ pub enum Latency {
     /// the queue, such as a timer coming due, is noticed within it while
     /// another queue holds the CPU. A `Duration` longer than the timer
     /// configured with [`LocalExecutorBuilder::preempt_timer`] leaves that
-    /// timer as it is.
+    /// timer as it is. A queue created while another queue's slice runs
+    /// shortens the timer from the reactor's next pass, which re-arms it.
     Matters(Duration),
 
     /// Tasks marked as `Latency::NotImportant` will not signal to other tasks

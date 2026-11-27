@@ -6476,14 +6476,17 @@ mod test {
     /// Each nap is measured in this thread's CPU time, from the sleep to the
     /// wake. A loaded machine that takes the CPU away makes that smaller,
     /// never larger, so the bound can be a few times the promise without
-    /// being flaky. A nap during which the spinner did not run measures
-    /// nothing, so the test fails on one rather than passing for want of
-    /// competition.
+    /// being flaky. A nap during which the spinner did not run, as when the
+    /// machine took the CPU away until it was due, measures nothing and is
+    /// taken again, up to four times as many naps in all; a run that never
+    /// gets enough naps with the spinner beside them fails rather than
+    /// passing for want of competition.
     #[test]
     fn a_sleeping_latency_queue_is_woken_on_time_beside_a_cpu_heavy_queue() {
         const NAP: Duration = Duration::from_millis(5);
         const SLACK: Duration = Duration::from_millis(5);
         const NAPS: usize = 8;
+        const TRIES: usize = 4 * NAPS;
 
         let ex = LocalExecutorBuilder::default().make().unwrap();
         let (naps, unopposed) = ex.run(async {
@@ -6515,12 +6518,17 @@ mod test {
                 enclose! { (spins) async move {
                     let mut naps = Vec::with_capacity(NAPS);
                     let mut unopposed = 0;
-                    for _ in 0..NAPS {
+                    for _ in 0..TRIES {
+                        if naps.len() == NAPS {
+                            break;
+                        }
                         let (before, spun) = (thread_cpu_time(), spins.get());
                         sleep(NAP).await;
-                        naps.push(thread_cpu_time().saturating_sub(before));
+                        let took = thread_cpu_time().saturating_sub(before);
                         if spins.get() == spun {
                             unopposed += 1;
+                        } else {
+                            naps.push(took);
                         }
                     }
                     (naps, unopposed)
@@ -6533,7 +6541,13 @@ mod test {
             spinner.await;
             sleeper
         });
-        assert_eq!(unopposed, 0, "the spinner did not run during a nap");
+        assert_eq!(
+            naps.len(),
+            NAPS,
+            "the spinner ran during only {} of {} naps",
+            naps.len(),
+            naps.len() + unopposed
+        );
         let worst = naps.iter().copied().max().unwrap();
         assert!(
             worst <= NAP + SLACK,

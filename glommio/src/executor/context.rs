@@ -252,6 +252,12 @@ impl ExecutorContext {
         let mut queues = self.queues.borrow_mut();
         queues.available_executors.insert(index, tq);
         queues.add_latency(latency);
+        self.reactor
+            .inform_latency_queues(queues.latency_queues_exist());
+        drop(queues);
+        if let Latency::Matters(latency) = latency {
+            self.reactor.tighten_preempt_timer(latency);
+        }
         TaskQueueHandle { index }
     }
 
@@ -283,6 +289,8 @@ impl ExecutorContext {
             }
             let removed = entry.remove();
             queues.remove_latency(removed.borrow().io_requirements.latency_req);
+            self.reactor
+                .inform_latency_queues(queues.latency_queues_exist());
             removed
         };
         drop(removed);

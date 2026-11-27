@@ -249,10 +249,9 @@ impl ExecutorContext {
             &self.tasks,
         );
 
-        self.queues
-            .borrow_mut()
-            .available_executors
-            .insert(index, tq);
+        let mut queues = self.queues.borrow_mut();
+        queues.available_executors.insert(index, tq);
+        queues.add_latency(latency);
         TaskQueueHandle { index }
     }
 
@@ -282,7 +281,9 @@ impl ExecutorContext {
             if entry.get().borrow().is_active() {
                 return Err(GlommioError::queue_still_active(handle.index));
             }
-            entry.remove()
+            let removed = entry.remove();
+            queues.remove_latency(removed.borrow().io_requirements.latency_req);
+            removed
         };
         drop(removed);
         Ok(())

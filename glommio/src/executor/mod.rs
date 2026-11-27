@@ -49,7 +49,7 @@ pub use placement::{CpuSet, Placement, PoolPlacement};
 use smallvec::SmallVec;
 use std::{
     cell::RefCell,
-    collections::{BinaryHeap, VecDeque},
+    collections::{btree_map, BTreeMap, BinaryHeap, VecDeque},
     fmt,
     future::Future,
     io,
@@ -771,6 +771,10 @@ struct ExecutorQueues {
     /// `usize::MAX`, which names no queue, while cleanup runs as the slice is
     /// set up, with its queue borrowed, and the end of the slice names it.
     slice_owner: Option<usize>,
+    /// How many queues ask for each `Latency::Matters` duration, runnable or
+    /// idle, so that the preempt timer follows the tightest of them without a
+    /// scan.
+    latencies: BTreeMap<Duration, usize>,
     preempt_timer_duration: Duration,
     default_preempt_timer_duration: Duration,
     spin_before_park: Option<Duration>,
@@ -791,6 +795,7 @@ impl ExecutorQueues {
             preempted: None,
             in_slice: false,
             slice_owner: None,
+            latencies: BTreeMap::new(),
             preempt_timer_duration,
             default_preempt_timer_duration: preempt_timer_duration,
             spin_before_park,
@@ -798,24 +803,45 @@ impl ExecutorQueues {
         }
     }
 
-    /// Sets the preempt timer to the tightest latency among runnable queues.
+    /// Counts the latency of a queue being created toward the preempt timer.
+    fn add_latency(&mut self, latency: Latency) {
+        if let Latency::Matters(d) = latency {
+            *self.latencies.entry(d).or_insert(0) += 1;
+            self.reevaluate_preempt_timer();
+        }
+    }
+
+    /// Stops counting the latency of a queue being removed.
+    fn remove_latency(&mut self, latency: Latency) {
+        if let Latency::Matters(d) = latency {
+            if let btree_map::Entry::Occupied(mut queues) = self.latencies.entry(d) {
+                *queues.get_mut() -= 1;
+                if *queues.get() == 0 {
+                    queues.remove();
+                }
+            }
+            self.reevaluate_preempt_timer();
+        }
+    }
+
+    /// Sets the preempt timer to the tightest latency among the queues that
+    /// exist, or to the default if that is tighter.
     ///
-    /// The queue that is running counts: it was popped from the heap, but it
-    /// is pushed back if still runnable when its slice ends, and that repush
-    /// does not recompute. Leaving it out lets a queue it activated reset the
-    /// timer to the default, which the next slice then runs under while the
-    /// latency queue waits.
+    /// An idle queue counts as much as a runnable one. Its next event can come
+    /// due while another queue holds the CPU, and a timer in the wheel is
+    /// noticed only in a reactor pass, which comes when the preempt timer
+    /// ends the slice. Counting only runnable queues let a sleeping latency
+    /// queue wait out the default timer.
+    ///
+    /// Runs when a queue is created or removed, the only times the answer can
+    /// change, so nothing on the scheduling path pays for it.
     fn reevaluate_preempt_timer(&mut self) {
+        let default = self.default_preempt_timer_duration;
         self.preempt_timer_duration = self
-            .active_executors
-            .iter()
-            .chain(self.active_executing.as_ref())
-            .map(|tq| match tq.borrow().io_requirements.latency_req {
-                Latency::NotImportant => self.default_preempt_timer_duration,
-                Latency::Matters(d) => d,
-            })
-            .min()
-            .unwrap_or(self.default_preempt_timer_duration)
+            .latencies
+            .keys()
+            .next()
+            .map_or(default, |&tightest| tightest.min(default));
     }
 
     /// Takes the task at `task` from the back of `queue`, which is where a
@@ -1008,7 +1034,6 @@ impl ExecutorQueues {
             state.active = true;
             drop(state);
             self.push_runnable(queue);
-            self.reevaluate_preempt_timer();
         }
     }
 
@@ -2251,8 +2276,6 @@ impl LocalExecutor {
 
         if need_repush {
             tq.push_runnable(queue);
-        } else {
-            tq.reevaluate_preempt_timer();
         }
 
         tq.default_vruntime = tq
@@ -6390,6 +6413,133 @@ mod test {
         assert!(
             worst < BOUND,
             "the latency queue waited {worst:?} for the CPU, its promise is 5ms"
+        );
+    }
+
+    /// The preempt timer is the tightest latency of the queues that exist,
+    /// whether they have work or not, and no longer than the executor's own
+    /// timer. Removing a queue gives its latency back only when no other
+    /// queue asks for the same.
+    #[test]
+    fn the_preempt_timer_follows_the_tightest_latency_queue_that_exists() {
+        const DEFAULT: Duration = Duration::from_millis(100);
+        let ms = Duration::from_millis;
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(DEFAULT)
+            .make()
+            .unwrap();
+        let create = |d| ex.create_task_queue(Shares::default(), Latency::Matters(d), "latency");
+        assert_eq!(ex.preempt_timer_duration(), DEFAULT);
+
+        let five = create(ms(5));
+        assert_eq!(ex.preempt_timer_duration(), ms(5));
+        let loose = create(ms(1000));
+        assert_eq!(ex.preempt_timer_duration(), ms(5));
+        let one = create(ms(1));
+        let other_one = create(ms(1));
+        let plain = ex.create_task_queue(Shares::default(), Latency::NotImportant, "plain");
+        assert_eq!(ex.preempt_timer_duration(), ms(1));
+
+        ex.remove_task_queue(one).unwrap();
+        assert_eq!(
+            ex.preempt_timer_duration(),
+            ms(1),
+            "another 1ms queue is left"
+        );
+        ex.remove_task_queue(plain).unwrap();
+        assert_eq!(ex.preempt_timer_duration(), ms(1));
+        ex.remove_task_queue(other_one).unwrap();
+        assert_eq!(ex.preempt_timer_duration(), ms(5));
+        ex.remove_task_queue(five).unwrap();
+        assert_eq!(ex.preempt_timer_duration(), DEFAULT);
+        ex.remove_task_queue(loose).unwrap();
+        assert_eq!(ex.preempt_timer_duration(), DEFAULT);
+    }
+
+    /// CPU time the calling thread has used.
+    fn thread_cpu_time() -> Duration {
+        nix::time::clock_gettime(nix::time::ClockId::CLOCK_THREAD_CPUTIME_ID)
+            .expect("the thread CPU clock cannot fail")
+            .into()
+    }
+
+    /// A `Latency::Matters(1ms)` queue whose task sleeps is woken within a few
+    /// milliseconds of its deadline, though the deadline comes during the
+    /// slice of a CPU-heavy queue and the executor runs under the default
+    /// 100 ms preempt timer.
+    ///
+    /// Timers are noticed only in a reactor pass, and the spinner gives up the
+    /// CPU only when `need_preempt` says so. A sleeping latency queue used not
+    /// to count when the preempt timer was armed, so its deadline went
+    /// unnoticed until the spinner's 100 ms slice ran out.
+    ///
+    /// Each nap is measured in this thread's CPU time, from the sleep to the
+    /// wake. A loaded machine that takes the CPU away makes that smaller,
+    /// never larger, so the bound can be a few times the promise without
+    /// being flaky. A nap during which the spinner did not run measures
+    /// nothing, so the test fails on one rather than passing for want of
+    /// competition.
+    #[test]
+    fn a_sleeping_latency_queue_is_woken_on_time_beside_a_cpu_heavy_queue() {
+        const NAP: Duration = Duration::from_millis(5);
+        const SLACK: Duration = Duration::from_millis(5);
+        const NAPS: usize = 8;
+
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        let (naps, unopposed) = ex.run(async {
+            let latency = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_millis(1)),
+                "latency",
+            );
+            let cpu = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "spinner",
+            );
+            let done = Rc::new(Cell::new(false));
+            let spins = Rc::new(Cell::new(0u64));
+            let spinner = crate::spawn_local_into(
+                enclose! { (done, spins) async move {
+                    while !done.get() {
+                        spins.set(spins.get() + 1);
+                        if crate::executor().need_preempt() {
+                            crate::yield_if_needed().await;
+                        }
+                    }
+                }},
+                cpu,
+            )
+            .unwrap();
+            let sleeper = crate::spawn_local_into(
+                enclose! { (spins) async move {
+                    let mut naps = Vec::with_capacity(NAPS);
+                    let mut unopposed = 0;
+                    for _ in 0..NAPS {
+                        let (before, spun) = (thread_cpu_time(), spins.get());
+                        sleep(NAP).await;
+                        naps.push(thread_cpu_time().saturating_sub(before));
+                        if spins.get() == spun {
+                            unopposed += 1;
+                        }
+                    }
+                    (naps, unopposed)
+                }},
+                latency,
+            )
+            .unwrap()
+            .await;
+            done.set(true);
+            spinner.await;
+            sleeper
+        });
+        assert_eq!(unopposed, 0, "the spinner did not run during a nap");
+        let worst = naps.iter().copied().max().unwrap();
+        assert!(
+            worst <= NAP + SLACK,
+            "a {NAP:?} nap took up to {worst:?} of CPU time to be noticed, \
+             against {:?} allowed: {naps:?}",
+            NAP + SLACK
         );
     }
 

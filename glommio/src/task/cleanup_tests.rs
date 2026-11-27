@@ -452,6 +452,7 @@ fn foreign_cleanup_while_parking_closes_file() {
                 .wait(
                     || None,
                     None,
+                    None,
                     true,
                     0,
                     || {

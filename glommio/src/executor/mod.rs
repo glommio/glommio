@@ -811,6 +811,11 @@ impl ExecutorQueues {
         }
     }
 
+    /// Whether any `Latency::Matters` queue exists.
+    fn latency_queues_exist(&self) -> bool {
+        !self.latencies.is_empty()
+    }
+
     /// Stops counting the latency of a queue being removed.
     fn remove_latency(&mut self, latency: Latency) {
         if let Latency::Matters(d) = latency {
@@ -1846,6 +1851,21 @@ impl<T> PoolThreadHandles<T> {
             })
             .collect::<Vec<_>>()
     }
+}
+
+/// Whether a task queue's slice of the executor that owns `reactor` is known
+/// to be running on this thread: false outside its run, during another
+/// executor's, and while its queues are borrowed.
+pub(crate) fn slice_is_running_on(reactor: &reactor::Reactor) -> bool {
+    with_executor_context(|context| {
+        context.is_some_and(|context| {
+            std::ptr::eq(Rc::as_ptr(&context.reactor), reactor)
+                && context
+                    .queues
+                    .try_borrow()
+                    .is_ok_and(|queues| queues.in_slice)
+        })
+    })
 }
 
 /// Borrows the installed context once for scheduling on the owning executor.
@@ -6554,6 +6574,639 @@ mod test {
             "a {NAP:?} nap took up to {worst:?} of CPU time to be noticed, \
              against {:?} allowed: {naps:?}",
             NAP + SLACK
+        );
+    }
+
+    /// Runs a `Latency::Matters(50ms)` queue whose task takes eight 5 ms naps
+    /// beside a CPU-heavy queue that yields only when `need_preempt` says so,
+    /// and checks that each nap was noticed within 15 ms of its deadline,
+    /// which leaves a loaded machine room. The queue's latency keeps the
+    /// preempt timer at 50 ms, so a timer noticed only when a slice ends
+    /// would be about 45 ms late. With
+    /// `armed_later`, another task in the latency queue sleeps for 45 ms from
+    /// the start: close enough that the latency ring is armed for it, and as
+    /// long as the naps take, so that the naps are due before a timeout armed
+    /// already.
+    ///
+    /// Each nap is measured in this thread's CPU time, from the sleep to the
+    /// wake. A loaded machine that takes the CPU away makes that smaller,
+    /// never larger, so the bound can be a few times the promise without
+    /// being flaky. A nap during which the spinner did not run, as when the
+    /// machine took the CPU away until it was due, measures nothing and is
+    /// taken again, up to four times as many naps in all; a run that never
+    /// gets enough naps with the spinner beside them fails rather than
+    /// passing for want of competition. One late nap is let off: with every
+    /// core busy the kernel can post a timeout's completion tens of
+    /// milliseconds late, while the fault this catches makes every nap late.
+    /// The test below takes its naps alike.
+    fn latency_naps_are_noticed_on_time_beside_a_spinner(armed_later: bool) {
+        const NAP: Duration = Duration::from_millis(5);
+        const SLACK: Duration = Duration::from_millis(15);
+        const NAPS: usize = 8;
+        const TRIES: usize = 4 * NAPS;
+
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        let (naps, unopposed) = ex.run(async {
+            let latency = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_millis(50)),
+                "latency",
+            );
+            let cpu = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "spinner",
+            );
+            let later = armed_later.then(|| {
+                crate::spawn_local_into(sleep(Duration::from_millis(45)), latency).unwrap()
+            });
+            let done = Rc::new(Cell::new(false));
+            let spins = Rc::new(Cell::new(0u64));
+            let spinner = crate::spawn_local_into(
+                enclose! { (done, spins) async move {
+                    while !done.get() {
+                        spins.set(spins.get() + 1);
+                        if crate::executor().need_preempt() {
+                            crate::yield_if_needed().await;
+                        }
+                    }
+                }},
+                cpu,
+            )
+            .unwrap();
+            let sleeper = crate::spawn_local_into(
+                enclose! { (spins) async move {
+                    let mut naps = Vec::with_capacity(NAPS);
+                    let mut unopposed = 0;
+                    for _ in 0..TRIES {
+                        if naps.len() == NAPS {
+                            break;
+                        }
+                        let (before, spun) = (thread_cpu_time(), spins.get());
+                        sleep(NAP).await;
+                        let took = thread_cpu_time().saturating_sub(before);
+                        if spins.get() == spun {
+                            unopposed += 1;
+                        } else {
+                            naps.push(took);
+                        }
+                    }
+                    (naps, unopposed)
+                }},
+                latency,
+            )
+            .unwrap()
+            .await;
+            done.set(true);
+            spinner.await;
+            drop(later);
+            sleeper
+        });
+        assert_eq!(
+            naps.len(),
+            NAPS,
+            "the spinner ran during only {} of {} naps",
+            naps.len(),
+            naps.len() + unopposed
+        );
+        let late = naps.iter().filter(|&&nap| nap > NAP + SLACK).count();
+        assert!(
+            late <= 1,
+            "{late} of {NAPS} {NAP:?} naps took over {:?} of CPU time to be noticed: \
+             {naps:?}",
+            NAP + SLACK
+        );
+    }
+
+    /// A latency queue's timer that comes due during a CPU-heavy queue's
+    /// slice ends the slice then. Timers are noticed only in a reactor pass,
+    /// and a pass used to come only when the preempt timer, kept at the
+    /// queue's latency, ended the slice.
+    #[test]
+    fn a_latency_timer_ends_the_running_slice_when_it_is_due() {
+        latency_naps_are_noticed_on_time_beside_a_spinner(false);
+    }
+
+    /// A latency timer due before the one the latency ring is armed for
+    /// replaces it rather than waiting behind it.
+    #[test]
+    fn a_latency_timer_due_before_the_armed_one_replaces_it() {
+        latency_naps_are_noticed_on_time_beside_a_spinner(true);
+    }
+
+    thread_local! {
+        /// The task a nap registered by [`RegistersANap`] wakes.
+        static NAP_TASK: RefCell<Option<Waker>> = const { RefCell::new(None) };
+        /// The thread's CPU time when [`RegistersANap`] registered its nap.
+        static NAP_START: Cell<Option<Duration>> = const { Cell::new(None) };
+        /// Whether the timer [`RegistersALongTimer`] registered went among
+        /// the latency timers.
+        static LONG_TIMER_IS_LATENCY: Cell<Option<bool>> = const { Cell::new(None) };
+        /// The timer [`RegistersADistantTimer`] registered.
+        static DISTANT_TIMER: Cell<Option<crate::timer::TimerId>> = const { Cell::new(None) };
+    }
+
+    /// A waker that runs code: woken, it registers a timer two seconds away.
+    struct RegistersADistantTimer;
+
+    impl std::task::Wake for RegistersADistantTimer {
+        fn wake(self: Arc<Self>) {
+            let id = crate::executor().reactor().insert_timer(
+                Instant::now() + Duration::from_secs(2),
+                Waker::noop().clone(),
+            );
+            DISTANT_TIMER.with(|timer| timer.set(Some(id)));
+        }
+    }
+
+    /// A waker that runs code: woken, it registers a nap of its duration for
+    /// the task in [`NAP_TASK`].
+    struct RegistersANap(Duration);
+
+    impl std::task::Wake for RegistersANap {
+        fn wake(self: Arc<Self>) {
+            let task = NAP_TASK.with(|task| task.borrow_mut().take()).unwrap();
+            NAP_START.with(|start| start.set(Some(thread_cpu_time())));
+            crate::executor()
+                .reactor()
+                .insert_timer(Instant::now() + self.0, task);
+        }
+    }
+
+    /// A waker that runs code: woken, it registers a timer an hour away and
+    /// records in [`LONG_TIMER_IS_LATENCY`] which timers it went among.
+    struct RegistersALongTimer;
+
+    impl std::task::Wake for RegistersALongTimer {
+        fn wake(self: Arc<Self>) {
+            let reactor = crate::executor().reactor();
+            let id = reactor.insert_timer(
+                Instant::now() + Duration::from_secs(3600),
+                Waker::noop().clone(),
+            );
+            LONG_TIMER_IS_LATENCY.with(|latency| latency.set(Some(id.is_latency())));
+            reactor.remove_timer(id);
+        }
+    }
+
+    /// Polls a nop once with `waker`, which runs code, and returns the nop.
+    /// Its completion is consumed by the reactor inside its wait, in the pass
+    /// after the slice it was submitted in, and wakes `waker` there.
+    fn wake_inside_the_reactor_pass(
+        waker: Waker,
+    ) -> Pin<Box<impl Future<Output = io::Result<usize>>>> {
+        let source = crate::executor().reactor().nop();
+        let mut io = Box::pin(async move { source.collect_rw().await });
+        assert!(io
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending());
+        io
+    }
+
+    /// A latency timer registered by a waker that the reactor runs inside
+    /// its wait still ends the running slice when it is due.
+    ///
+    /// The pass reads the earliest latency deadline before its wait runs any
+    /// waker, and registering cannot arm the latency ring while the wait
+    /// holds it, so such a timer used to wait for the next slice to end:
+    /// here 50 ms, against 2 ms naps. Each nap is measured in this thread's
+    /// CPU time from its registration to its wake, which a loaded machine
+    /// makes smaller, never larger.
+    #[test]
+    fn a_latency_timer_registered_by_a_waker_inside_the_reactor_pass_preempts() {
+        const NAP: Duration = Duration::from_millis(2);
+        const SLACK: Duration = Duration::from_millis(15);
+        const NAPS: usize = 8;
+        const TRIES: usize = 4 * NAPS;
+
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        let (naps, unopposed) = ex.run(async {
+            let latency = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_millis(50)),
+                "latency",
+            );
+            let cpu = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "spinner",
+            );
+            let done = Rc::new(Cell::new(false));
+            let spins = Rc::new(Cell::new(0u64));
+            let spinner = crate::spawn_local_into(
+                enclose! { (done, spins) async move {
+                    while !done.get() {
+                        spins.set(spins.get() + 1);
+                        if crate::executor().need_preempt() {
+                            crate::yield_if_needed().await;
+                        }
+                    }
+                }},
+                cpu,
+            )
+            .unwrap();
+            let sleeper = crate::spawn_local_into(
+                enclose! { (spins) async move {
+                    let mut naps = Vec::with_capacity(NAPS);
+                    let mut unopposed = 0;
+                    for _ in 0..TRIES {
+                        if naps.len() == NAPS {
+                            break;
+                        }
+                        let spun = spins.get();
+                        let mut io = None;
+                        poll_fn(|cx| {
+                            if io.is_some() {
+                                return Poll::Ready(());
+                            }
+                            NAP_TASK.with(|task| *task.borrow_mut() = Some(cx.waker().clone()));
+                            io = Some(wake_inside_the_reactor_pass(Waker::from(Arc::new(
+                                RegistersANap(NAP),
+                            ))));
+                            Poll::Pending
+                        })
+                        .await;
+                        let start = NAP_START.with(|start| start.take()).unwrap();
+                        let took = thread_cpu_time().saturating_sub(start);
+                        if spins.get() == spun {
+                            unopposed += 1;
+                        } else {
+                            naps.push(took);
+                        }
+                    }
+                    (naps, unopposed)
+                }},
+                latency,
+            )
+            .unwrap()
+            .await;
+            done.set(true);
+            spinner.await;
+            sleeper
+        });
+        assert_eq!(
+            naps.len(),
+            NAPS,
+            "the spinner ran during only {} of {} naps",
+            naps.len(),
+            naps.len() + unopposed
+        );
+        let late = naps.iter().filter(|&&nap| nap > NAP + SLACK).count();
+        assert!(
+            late <= 1,
+            "{late} of {NAPS} {NAP:?} naps registered inside the reactor pass took over \
+             {:?} of CPU time to be noticed: {naps:?}",
+            NAP + SLACK
+        );
+    }
+
+    /// Whether a timer registered by a waker that the reactor runs inside its
+    /// pass, after a slice of a queue whose latency does not matter, goes
+    /// among the latency timers, in an executor with a latency queue or
+    /// without one. With `removed`, the latency queue is removed again
+    /// before the timer is registered.
+    fn registered_inside_the_reactor_pass_is_latency(
+        latency_queue_exists: bool,
+        removed: bool,
+    ) -> bool {
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        ex.run(async move {
+            let plain = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "plain",
+            );
+            if latency_queue_exists {
+                let latency = crate::executor().create_task_queue(
+                    Shares::default(),
+                    Latency::Matters(Duration::from_millis(1)),
+                    "latency",
+                );
+                if removed {
+                    crate::executor().remove_task_queue(latency).unwrap();
+                }
+            }
+            LONG_TIMER_IS_LATENCY.with(|latency| latency.set(None));
+            crate::spawn_local_into(
+                async {
+                    let _io =
+                        wake_inside_the_reactor_pass(Waker::from(Arc::new(RegistersALongTimer)));
+                    loop {
+                        if let Some(latency) = LONG_TIMER_IS_LATENCY.with(Cell::take) {
+                            return latency;
+                        }
+                        crate::executor().yield_task_queue_now().await;
+                    }
+                },
+                plain,
+            )
+            .unwrap()
+            .await
+        })
+    }
+
+    /// The reactor cannot tell which task a waker it runs belongs to, and
+    /// the I/O requirements it holds then are those of whichever queue ran
+    /// last, so a timer registered there is a latency timer whenever a
+    /// latency queue exists: at worst one preemption too many, against a
+    /// latency queue's timer going unnoticed for a slice.
+    #[test]
+    fn a_timer_registered_inside_the_reactor_pass_is_a_latency_timer_if_a_latency_queue_exists() {
+        assert!(
+            registered_inside_the_reactor_pass_is_latency(true, false),
+            "classed by the plain queue that ran last"
+        );
+        assert!(!registered_inside_the_reactor_pass_is_latency(false, false));
+        assert!(
+            !registered_inside_the_reactor_pass_is_latency(true, true),
+            "the removed latency queue still counted"
+        );
+    }
+
+    /// A timer registered on a thread whose executor is not running belongs
+    /// to no slice, so it is a latency timer if a latency queue exists,
+    /// whichever queue ran last.
+    #[test]
+    fn a_timer_registered_outside_a_run_is_a_latency_timer_if_a_latency_queue_exists() {
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        let reactor = ex.run(async {
+            crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_millis(1)),
+                "latency",
+            );
+            let plain = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "plain",
+            );
+            crate::spawn_local_into(async {}, plain).unwrap().await;
+            crate::executor().reactor()
+        });
+        let id = reactor.insert_timer(
+            Instant::now() + Duration::from_secs(3600),
+            Waker::noop().clone(),
+        );
+        reactor.remove_timer(id);
+        assert!(id.is_latency(), "classed by the queue that ran last");
+    }
+
+    /// A pass made again, because a waker in the first registered a latency
+    /// timer the ring could not take, does not park: the first pass woke a
+    /// task, which would otherwise wait for whatever ended the park, here the
+    /// timer two seconds away.
+    #[test]
+    fn a_pass_made_again_does_not_park_when_the_first_woke_a_task() {
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_secs(10))
+            .make()
+            .unwrap();
+        let took = ex.run(async {
+            let latency = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_secs(10)),
+                "latency",
+            );
+            crate::spawn_local_into(
+                async {
+                    let reactor = crate::executor().reactor();
+                    let _io =
+                        wake_inside_the_reactor_pass(Waker::from(Arc::new(RegistersADistantTimer)));
+                    let start = Instant::now();
+                    reactor.react(|| None, true).unwrap();
+                    let took = start.elapsed();
+                    if let Some(id) = DISTANT_TIMER.with(Cell::take) {
+                        reactor.remove_timer(id);
+                    }
+                    took
+                },
+                latency,
+            )
+            .unwrap()
+            .await
+        });
+        assert!(
+            took < Duration::from_secs(1),
+            "the pass parked for {took:?} after it woke a task"
+        );
+    }
+
+    /// A timer registered into one executor's reactor during another
+    /// executor's slice, on the same thread, belongs to no slice of its own
+    /// executor, so it is a latency timer if that executor has a latency
+    /// queue, whatever queue ran there last.
+    #[test]
+    fn a_timer_registered_into_another_executors_reactor_is_classed_by_its_own() {
+        let first = LocalExecutorBuilder::default().make().unwrap();
+        let reactor = first.run(async {
+            crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_millis(1)),
+                "latency",
+            );
+            crate::executor().reactor()
+        });
+        let second = LocalExecutorBuilder::default().make().unwrap();
+        let id = second.run(async move {
+            let id = reactor.insert_timer(
+                Instant::now() + Duration::from_secs(3600),
+                Waker::noop().clone(),
+            );
+            reactor.remove_timer(id);
+            id
+        });
+        assert!(
+            id.is_latency(),
+            "classed by the other executor's queue that ran last"
+        );
+        drop(first);
+    }
+
+    /// A timer registered within a slice is classed by the queue whose slice
+    /// it is, whatever other queues exist.
+    #[test]
+    fn a_timer_registered_in_a_slice_is_classed_by_its_queue() {
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        ex.run(async {
+            let latency = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::Matters(Duration::from_millis(1)),
+                "latency",
+            );
+            let plain = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "plain",
+            );
+            let is_latency = |queue| {
+                crate::spawn_local_into(
+                    async {
+                        let reactor = crate::executor().reactor();
+                        let id = reactor.insert_timer(
+                            Instant::now() + Duration::from_secs(3600),
+                            Waker::noop().clone(),
+                        );
+                        reactor.remove_timer(id);
+                        id.is_latency()
+                    },
+                    queue,
+                )
+                .unwrap()
+            };
+            assert!(!is_latency(plain).await, "a plain slice's timer preempts");
+            assert!(is_latency(latency).await);
+        });
+    }
+
+    /// How long, in this thread's CPU time, a task spawned into a
+    /// `Latency::Matters(5ms)` queue waits for its first poll, when the queue
+    /// is created at the start of a CPU-heavy queue's slice under the
+    /// default 100 ms preempt timer. `None` if the spinner did not run in
+    /// that time, which measures nothing.
+    fn first_poll_of_a_queue_created_mid_slice() -> Option<Duration> {
+        let ex = LocalExecutorBuilder::default().make().unwrap();
+        ex.run(async {
+            let cpu = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "spinner",
+            );
+            crate::spawn_local_into(
+                async {
+                    while !crate::executor().need_preempt() {}
+                    crate::yield_if_needed().await;
+                    let start = thread_cpu_time();
+                    let latency = crate::executor().create_task_queue(
+                        Shares::default(),
+                        Latency::Matters(Duration::from_millis(5)),
+                        "latency",
+                    );
+                    let first_poll = Rc::new(Cell::new(None));
+                    crate::spawn_local_into(
+                        enclose! { (first_poll) async move {
+                            first_poll.set(Some(thread_cpu_time()));
+                        }},
+                        latency,
+                    )
+                    .unwrap()
+                    .detach();
+                    let mut spun = false;
+                    while first_poll.get().is_none() {
+                        spun = true;
+                        if crate::executor().need_preempt() {
+                            crate::yield_if_needed().await;
+                        }
+                    }
+                    let waited = first_poll.get().unwrap().saturating_sub(start);
+                    spun.then_some(waited)
+                },
+                cpu,
+            )
+            .unwrap()
+            .await
+        })
+    }
+
+    /// A latency queue created during a CPU-heavy queue's slice, and given a
+    /// task that registers no timer, gets the CPU within a few times its
+    /// latency, though the preempt timer armed for that slice is the default
+    /// 100 ms: the queue's latency was not part of it.
+    ///
+    /// Measured in this thread's CPU time, which a loaded machine makes
+    /// smaller, never larger. A run in which the spinner never ran before
+    /// the first poll measures nothing and is made again, a few times. One
+    /// late run in three is let off, as one late nap is in the tests above.
+    #[test]
+    fn a_latency_queue_created_mid_slice_is_polled_within_its_latency() {
+        const LATENCY: Duration = Duration::from_millis(5);
+        const SLACK: Duration = Duration::from_millis(15);
+        const RUNS: usize = 3;
+        const TRIES: usize = 4 * RUNS;
+
+        let waits: Vec<Duration> = (0..TRIES)
+            .filter_map(|_| first_poll_of_a_queue_created_mid_slice())
+            .take(RUNS)
+            .collect();
+        assert_eq!(
+            waits.len(),
+            RUNS,
+            "the spinner did not run beside enough creations"
+        );
+        let late = waits.iter().filter(|&&wait| wait > LATENCY + SLACK).count();
+        assert!(
+            late <= 1,
+            "{late} of {RUNS} tasks in a {LATENCY:?} queue created mid-slice waited over \
+             {:?} of CPU time for their first poll: {waits:?}",
+            LATENCY + SLACK
+        );
+    }
+
+    /// A timer registered from a queue whose latency does not matter leaves
+    /// the CPU-heavy queue's slices as long as the preempt timer makes them:
+    /// only latency timers end a slice when they come due.
+    ///
+    /// A `NotImportant` queue takes 1 ms naps beside a spinner for 300 ms of
+    /// wall time under a 100 ms preempt timer. The spinner is preempted a
+    /// handful of times; were every timer to preempt it, it would be once a
+    /// nap. A loaded machine makes the count smaller, never larger.
+    #[test]
+    fn a_timer_whose_latency_does_not_matter_leaves_slices_alone() {
+        const RUN: Duration = Duration::from_millis(300);
+        const BOUND: u64 = 30;
+
+        let ex = LocalExecutorBuilder::default()
+            .preempt_timer(Duration::from_millis(100))
+            .make()
+            .unwrap();
+        let (preempted, naps) = ex.run(async {
+            let plain = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "napper",
+            );
+            let cpu = crate::executor().create_task_queue(
+                Shares::default(),
+                Latency::NotImportant,
+                "spinner",
+            );
+            let done = Rc::new(Cell::new(false));
+            let naps = Rc::new(Cell::new(0u64));
+            let napper = crate::spawn_local_into(
+                enclose! { (done, naps) async move {
+                    while !done.get() {
+                        sleep(Duration::from_millis(1)).await;
+                        naps.set(naps.get() + 1);
+                    }
+                }},
+                plain,
+            )
+            .unwrap();
+            let preempted = crate::spawn_local_into(
+                enclose! { (done) async move {
+                    let start = Instant::now();
+                    let mut preempted = 0u64;
+                    while start.elapsed() < RUN {
+                        if crate::executor().need_preempt() {
+                            preempted += 1;
+                            crate::yield_if_needed().await;
+                        }
+                    }
+                    done.set(true);
+                    preempted
+                }},
+                cpu,
+            )
+            .unwrap()
+            .await;
+            napper.await;
+            (preempted, naps.get())
+        });
+        assert!(naps > 0, "the napper never woke, so nothing was measured");
+        assert!(
+            preempted <= BOUND,
+            "the spinner was preempted {preempted} times in {RUN:?} under a 100ms timer, \
+             beside {naps} naps"
         );
     }
 

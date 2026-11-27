@@ -2096,6 +2096,32 @@ pub(crate) struct Reactor {
     /// unchanged request can keep it rather than cancel it and install an
     /// identical one.
     latency_preemption_armed_for: Cell<Option<Duration>>,
+    /// When the preempt timer armed for
+    /// [`Self::latency_preemption_armed_for`] fires, if an `Instant` can say.
+    /// Read only while that is set, so that registering a latency timer can
+    /// tell without reading the clock whether a pass comes before it.
+    latency_preemption_fires_by: Cell<Option<Instant>>,
+    /// A timeout for the earliest timer registered from a `Latency::Matters`
+    /// queue. Timers live in a wheel that only a reactor pass reads, so
+    /// without it a task holding the CPU would learn that such a timer came
+    /// due only when its slice ended. On the latency ring, it makes
+    /// `need_preempt` true at the deadline instead.
+    latency_timer_src: Cell<Option<Source>>,
+    /// The deadline [`Self::latency_timer_src`] was armed for, so that it is
+    /// kept until it fires or another deadline is wanted.
+    latency_timer_armed_for: Cell<Option<Instant>>,
+    /// Whether a latency timer was registered while `wait` held the latency
+    /// ring, so that it could not be armed then.
+    latency_timer_deferred: Cell<bool>,
+    /// Whether a pass gave up a latency timeout that had fired, which
+    /// [`Self::latency_timer_fired`] then still reports.
+    latency_timer_reaped: Cell<bool>,
+    /// Whether a registration armed the latency timeout since the pass began,
+    /// so possibly after the pass read the wheel.
+    latency_timer_hastened: Cell<bool>,
+    /// A latency deadline the pass left unarmed as further away than the
+    /// preempt timer, for the preempt timer's re-arm to look at again.
+    latency_timer_beyond: Cell<Option<Instant>>,
     throughput_preemption_timeout_src: Cell<Option<Source>>,
 
     /// The main and latency rings' fds. With a socket ring the reactor
@@ -2359,6 +2385,13 @@ impl Reactor {
             socket_ring: socket_ring.map(RefCell::new),
             latency_preemption_timeout_src: Cell::new(None),
             latency_preemption_armed_for: Cell::new(None),
+            latency_preemption_fires_by: Cell::new(None),
+            latency_timer_src: Cell::new(None),
+            latency_timer_armed_for: Cell::new(None),
+            latency_timer_deferred: Cell::new(false),
+            latency_timer_reaped: Cell::new(false),
+            latency_timer_hastened: Cell::new(false),
+            latency_timer_beyond: Cell::new(None),
             throughput_preemption_timeout_src: Cell::new(None),
             blocking_thread,
             link_fds,
@@ -3009,6 +3042,11 @@ impl Reactor {
     /// * The second is the user timer. It is installed per a user request when
     ///   the user creates a `Timer` (or `TimerAction`).
     ///
+    /// A third, the latency timer, is the deadline of the earliest user timer
+    /// registered from a `Latency::Matters` queue. Unlike the user timer it is
+    /// armed while tasks run, so that it can preempt them, see
+    /// [`Self::refresh_latency_timer`].
+    ///
     /// At some level, those are both just timers and can be coalesced. And they
     /// certainly are: if there is a user timer that needs to fire in 1ms, and
     /// we want the preempt_timer to also fire around 1ms, there is no need
@@ -3101,6 +3139,7 @@ impl Reactor {
         &self,
         preempt_timer: Preempt,
         user_timer: Option<Duration>,
+        latency_timer: Option<(Instant, Duration)>,
         may_sleep: bool,
         woke: usize,
         process_remote_channels: F,
@@ -3112,6 +3151,7 @@ impl Reactor {
         self.wait_with_after_drain(
             preempt_timer,
             user_timer,
+            latency_timer,
             may_sleep,
             woke,
             process_remote_channels,
@@ -3124,10 +3164,12 @@ impl Reactor {
     /// A rearm at the end can replace a timer that has not fired, so its
     /// cancellation is flushed with the new timer rather than left for the
     /// next pass.
+    #[allow(clippy::too_many_arguments)]
     fn wait_with_after_drain<Preempt, F, AfterDrain>(
         &self,
         preempt_timer: Preempt,
         user_timer: Option<Duration>,
+        latency_timer: Option<(Instant, Duration)>,
         may_sleep: bool,
         mut woke: usize,
         process_remote_channels: F,
@@ -3154,7 +3196,9 @@ impl Reactor {
         }
         consume_rings!(into &mut woke; lat_ring, poll_ring, main_ring);
 
-        self.discard_unusable_preempt_timer(preempt_timer(), may_sleep);
+        let preempt = preempt_timer();
+        self.discard_unusable_preempt_timer(preempt, may_sleep);
+        self.refresh_latency_timer(&mut lat_ring, latency_timer, preempt);
 
         self.throughput_preemption_timeout_src.replace(Some(
             main_ring.prepare_throughput_preemption_timer(
@@ -3241,9 +3285,13 @@ impl Reactor {
         if let PreemptAction::Rearm(preempt) =
             self.observe_preempt_timer(&preempt_timer, settled).decide()
         {
+            let now = Instant::now();
+            let fires_by = now.checked_add(preempt);
             self.latency_preemption_armed_for.set(Some(preempt));
+            self.latency_preemption_fires_by.set(fires_by);
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
+            self.arm_latency_timer_beyond(&mut lat_ring, now, fires_by);
             flush_cancellations!(into &mut 0; lat_ring);
             flush_rings!(lat_ring, main_ring)?;
         }
@@ -3273,6 +3321,236 @@ impl Reactor {
                 self.latency_preemption_armed_for.set(None);
             }
         }
+    }
+
+    /// Keeps a timeout on the latency ring armed for `deadline`, the earliest
+    /// timer registered from a `Latency::Matters` queue, if the preempt timer
+    /// would not end the slice before it. `deadline` comes with how far away
+    /// it was when the pass read the clock, which is what is armed.
+    ///
+    /// A deadline further away than `preempt` is not armed yet: the preempt
+    /// timer brings another pass before it, which looks again. Most such
+    /// timers are I/O timeouts that are withdrawn long before they are due,
+    /// and arming each would cost a submission and a cancellation for
+    /// nothing. With no preempt timer wanted, the executor is about to park,
+    /// and the user timer wakes it in time.
+    ///
+    /// One still armed for the same deadline is kept, so a deadline costs one
+    /// arm however many passes it spans, and it stays armed across a park,
+    /// which has to wake for it anyway. One that fired, or was armed for
+    /// another deadline, is given up. One that fired while the wheel still
+    /// lists its deadline is recorded: the timer it stood for came due after
+    /// the pass read the wheel, so nothing has woken its task yet.
+    /// Called before the flush, so the cancellation and the new timeout leave
+    /// with it. What is armed is what remains until the deadline as it is
+    /// armed; the remaining time handed in, read before the drain, only
+    /// decides. A deadline it puts out of reach is looked at again if the
+    /// pass re-arms the preempt timer, which then fires later than the one
+    /// the decision assumed.
+    ///
+    /// A timeout a registration armed since the pass began is kept too, if
+    /// due no later than `deadline`: a waker the pass ran before it drained
+    /// the rings can have registered its timer after the pass read the wheel.
+    #[inline(always)]
+    fn refresh_latency_timer(
+        &self,
+        ring: &mut SleepableRing,
+        deadline: Option<(Instant, Duration)>,
+        preempt: Option<Duration>,
+    ) {
+        if self.latency_timer_armed_for.get().is_none() && !self.latency_timer_hastened.get() {
+            match deadline {
+                None => {
+                    self.latency_timer_beyond.set(None);
+                    return;
+                }
+                Some((at, left)) if preempt.is_none_or(|slice| left > slice) => {
+                    self.latency_timer_beyond.set(Some(at));
+                    return;
+                }
+                Some(_) => {}
+            }
+        }
+        self.refresh_armed_latency_timer(ring, deadline, preempt);
+    }
+
+    /// [`Self::refresh_latency_timer`] when a timeout is held or one is to be
+    /// armed, kept out of the passes that need neither.
+    #[inline(never)]
+    fn refresh_armed_latency_timer(
+        &self,
+        ring: &mut SleepableRing,
+        deadline: Option<(Instant, Duration)>,
+        preempt: Option<Duration>,
+    ) {
+        let hastened = self.latency_timer_hastened.replace(false);
+        self.latency_timer_beyond.set(None);
+        let (deadline, remaining) = (deadline.map(|(at, _)| at), deadline.map(|(_, left)| left));
+        if let Some(held) = self.latency_timer_src.take() {
+            let fired = held.result().is_some();
+            let armed_for = self.latency_timer_armed_for.get();
+            let listed = armed_for == deadline;
+            let newer = hastened
+                && armed_for.is_some_and(|armed| deadline.is_none_or(|wanted| armed <= wanted));
+            if !fired && (listed || newer) {
+                self.latency_timer_src.set(Some(held));
+                return;
+            }
+            if fired && listed {
+                self.latency_timer_reaped.set(true);
+            }
+        }
+        let within = remaining.is_some_and(|left| preempt.is_some_and(|slice| left <= slice));
+        let arm = deadline.filter(|_| within);
+        if !within {
+            self.latency_timer_beyond.set(deadline);
+        }
+        self.latency_timer_armed_for.set(arm);
+        if let Some(deadline) = arm {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            self.latency_timer_src
+                .set(Some(ring.prepare_latency_preemption_timer(remaining)));
+        }
+    }
+
+    /// Arms the latency timeout for the deadline the pass left out of reach,
+    /// if the preempt timer just re-armed at `now` fires after it, at
+    /// `fires_by`. The pass decided on a time read before its drain, so a
+    /// deadline that was then beyond the preempt timer can be inside the one
+    /// re-armed after it.
+    fn arm_latency_timer_beyond(
+        &self,
+        ring: &mut SleepableRing,
+        now: Instant,
+        fires_by: Option<Instant>,
+    ) {
+        let Some(deadline) = self.latency_timer_beyond.take() else {
+            return;
+        };
+        if fires_by.is_some_and(|fires| fires <= deadline) {
+            return;
+        }
+        if let Some(held) = self.latency_timer_src.take() {
+            self.latency_timer_src.set(Some(held));
+            return;
+        }
+        self.latency_timer_armed_for.set(Some(deadline));
+        self.latency_timer_src.set(Some(
+            ring.prepare_latency_preemption_timer(deadline.saturating_duration_since(now)),
+        ));
+    }
+
+    /// Arms a latency timeout `latency` from now if the preempt timer armed
+    /// would end the running slice later than that, as when a queue of that
+    /// latency is created during the slice: it arms as for a latency timer
+    /// registered then, deferral included. With no preempt timer armed no
+    /// slice is bounded by one, and the next pass arms the right one.
+    pub(crate) fn tighten_preempt_timer(&self, latency: Duration) -> io::Result<()> {
+        if self
+            .latency_preemption_armed_for
+            .get()
+            .is_none_or(|armed| armed <= latency)
+        {
+            return Ok(());
+        }
+        match Instant::now().checked_add(latency) {
+            Some(deadline) => self.hasten_latency_timer(deadline),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether a latency timer was deferred since this was last asked, and
+    /// forgets it.
+    pub(crate) fn take_deferred_latency_timer(&self) -> bool {
+        self.latency_timer_deferred.replace(false)
+    }
+
+    /// Whether the preempt timeout held is still to fire. One a drain consumed
+    /// has fired, though the fields describing it stay set until the pass
+    /// ends.
+    fn preempt_timer_pending(&self) -> bool {
+        let held = self.latency_preemption_timeout_src.take();
+        let pending = held.as_ref().is_some_and(|held| held.result().is_none());
+        self.latency_preemption_timeout_src.set(held);
+        pending
+    }
+
+    /// Forgets what an earlier pass recorded about latency timers, as a pass
+    /// begins.
+    pub(crate) fn begin_pass(&self) {
+        self.latency_timer_deferred.set(false);
+        self.latency_timer_reaped.set(false);
+        self.latency_timer_hastened.set(false);
+    }
+
+    /// Whether a latency timeout fired and its completion was consumed in this
+    /// pass, whether the pass still holds it or gave it up. Either way it is
+    /// forgotten, so that the next pass does not report it again.
+    pub(crate) fn latency_timer_fired(&self) -> bool {
+        let held = self.latency_timer_src.take();
+        let fired = held.as_ref().is_some_and(|held| held.result().is_some());
+        if fired {
+            self.latency_timer_armed_for.set(None);
+        } else {
+            self.latency_timer_src.set(held);
+        }
+        self.latency_timer_reaped.replace(false) || fired
+    }
+
+    /// Arms the latency timer at once for `deadline`, that of a timer just
+    /// registered from a `Latency::Matters` queue, if neither the preempt
+    /// timer nor the timeout armed already would end the running slice by
+    /// then. An earlier latency timer that is not armed was further away than
+    /// the preempt timer when the last pass looked, so it cannot be the one
+    /// to arm in that case. The common case, a pass due before `deadline`,
+    /// reads no clock.
+    ///
+    /// The next pass would arm it otherwise, but that pass comes when the
+    /// slice ends, as late as the preempt timer allows, which a latency queue
+    /// keeps no longer than its latency. A timer due sooner would be noticed
+    /// late by the difference. Arming now costs a submission, so it is done
+    /// only when the pass would come too late. The armed timeout given up is cancelled with the next pass's
+    /// cancellations: flushing them here would consume the latency ring's
+    /// completions, and with them a fired preempt timer's.
+    ///
+    /// A ring that `wait` holds, while its wakers run, is left alone and the
+    /// timer recorded as deferred: that pass read the earliest deadline before
+    /// any waker ran, so it arms nothing for this one, and the reactor makes
+    /// the pass again. A submission the kernel refuses is left for the next
+    /// pass to flush, and to report.
+    pub(crate) fn hasten_latency_timer(&self, deadline: Instant) -> io::Result<()> {
+        let pass_comes_first = self.preempt_timer_pending()
+            && self.latency_preemption_armed_for.get().is_some()
+            && self
+                .latency_preemption_fires_by
+                .get()
+                .is_some_and(|fires| fires <= deadline);
+        if pass_comes_first {
+            return Ok(());
+        }
+        if let Some(held) = self.latency_timer_src.take() {
+            let armed_in_time = held.result().is_none()
+                && self
+                    .latency_timer_armed_for
+                    .get()
+                    .is_some_and(|armed| armed <= deadline);
+            self.latency_timer_src.set(Some(held));
+            if armed_in_time {
+                return Ok(());
+            }
+        }
+        let Ok(mut ring) = self.latency_ring.try_borrow_mut() else {
+            self.latency_timer_deferred.set(true);
+            return Ok(());
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        drop(self.latency_timer_src.take());
+        self.latency_timer_armed_for.set(Some(deadline));
+        self.latency_timer_hastened.set(true);
+        self.latency_timer_src
+            .set(Some(ring.prepare_latency_preemption_timer(remaining)));
+        flush_rings!(ring)?;
+        Ok(())
     }
 
     /// Reads the held timer and what is wanted into one [`PreemptObservation`].
@@ -3606,7 +3884,14 @@ mod tests {
             let started = Instant::now();
             let slept = reactor
                 .sys
-                .wait(|| None, Some(Duration::from_millis(500)), true, 0, || 0)
+                .wait(
+                    || None,
+                    Some(Duration::from_millis(500)),
+                    None,
+                    true,
+                    0,
+                    || 0,
+                )
                 .unwrap();
             assert!(
                 !slept && started.elapsed() < Duration::from_millis(250),
@@ -4047,7 +4332,7 @@ mod tests {
                 op,
                 &mut reactor.source_map.borrow_mut(),
             );
-            reactor.wait(|| None, None, true, 0, || 0).unwrap();
+            reactor.wait(|| None, None, None, true, 0, || 0).unwrap();
             assert!(timer.result().is_some());
         };
         let settled_sources = || {
@@ -4124,13 +4409,13 @@ mod tests {
         );
 
         let start = Instant::now();
-        reactor.wait(|| None, None, true, 0, || 0).unwrap();
+        reactor.wait(|| None, None, None, true, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
         assert!((50..100).contains(&elapsed_ms));
 
         drop(slow);
 
-        reactor.wait(|| None, None, true, 0, || 0).unwrap();
+        reactor.wait(|| None, None, None, true, 0, || 0).unwrap();
         let elapsed_ms = start.elapsed().as_millis();
         assert!((300..350).contains(&elapsed_ms));
     }
@@ -4155,6 +4440,7 @@ mod tests {
         reactor
             .wait_with_after_drain(
                 || Some(duration),
+                None,
                 None,
                 false,
                 0,
@@ -4190,6 +4476,7 @@ mod tests {
             .wait_with_after_drain(
                 || Some(requested.get()),
                 None,
+                None,
                 false,
                 0,
                 || 0,
@@ -4213,6 +4500,7 @@ mod tests {
             .wait(
                 || Some(requested.get()),
                 None,
+                None,
                 true,
                 0,
                 || {
@@ -4224,6 +4512,346 @@ mod tests {
         assert_eq!(reactor.latency_preemption_armed_for.get(), Some(short));
     }
 
+    /// A latency deadline as a pass hands it to `wait`: with what remains
+    /// until it, read now.
+    fn until(deadline: Instant) -> Option<(Instant, Duration)> {
+        Some((deadline, deadline.saturating_duration_since(Instant::now())))
+    }
+
+    /// A reactor with nothing registered, for the latency timer tests.
+    fn bare_reactor() -> Reactor {
+        let notifier = sys::new_sleep_notifier().unwrap();
+        let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
+        Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap()
+    }
+
+    /// The source of the latency timer, and the deadline it is armed for.
+    fn held_latency_timer(reactor: &Reactor) -> Option<(Pin<Rc<RefCell<InnerSource>>>, Instant)> {
+        let held = reactor.latency_timer_src.take()?;
+        let inner = held.inner.clone();
+        reactor.latency_timer_src.set(Some(held));
+        Some((inner, reactor.latency_timer_armed_for.get().unwrap()))
+    }
+
+    /// Marks the latency timeout held as fired and its completion consumed,
+    /// as a drain would, without waiting for the kernel.
+    fn fire_latency_timer(reactor: &Reactor) {
+        let (armed, _) = held_latency_timer(reactor).expect("a latency timeout is held");
+        armed.borrow_mut().wakers.result = Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
+    }
+
+    /// A pass keeps the latency timer armed for an unchanged deadline,
+    /// replaces it for an earlier one, leaves one further away than the
+    /// preempt timer unarmed, and replaces one that fired even when the
+    /// deadline it is asked for is the same.
+    #[test]
+    fn a_pass_keeps_replaces_or_skips_the_latency_timer() {
+        let reactor = bare_reactor();
+        let slice = Some(Duration::from_secs(60));
+        let pass = |deadline: Instant, preempt: Option<Duration>| {
+            reactor
+                .wait(|| preempt, None, until(deadline), false, 0, || 0)
+                .unwrap();
+        };
+        let now = Instant::now();
+        let later = now + Duration::from_secs(20);
+        pass(later, slice);
+        let (armed, at) = held_latency_timer(&reactor).expect("armed within the slice");
+        assert_eq!(at, later);
+        pass(later, slice);
+        let (kept, _) = held_latency_timer(&reactor).unwrap();
+        assert!(
+            std::ptr::eq(&*armed, &*kept),
+            "an unchanged deadline was rearmed"
+        );
+
+        let sooner = now + Duration::from_secs(10);
+        pass(sooner, slice);
+        assert_eq!(held_latency_timer(&reactor).map(|(_, at)| at), Some(sooner));
+
+        pass(later, Some(Duration::from_millis(1)));
+        assert!(
+            held_latency_timer(&reactor).is_none(),
+            "a deadline past the preempt timer was armed"
+        );
+
+        let due = Instant::now() + Duration::from_millis(1);
+        pass(due, slice);
+        let (first, _) = held_latency_timer(&reactor).unwrap();
+        first.borrow_mut().wakers.result = Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
+        assert!(
+            reactor.latency_timer_fired(),
+            "a completion the wait drained went unseen"
+        );
+        pass(due, slice);
+        let (second, _) = held_latency_timer(&reactor).unwrap();
+        assert!(
+            !std::ptr::eq(&*first, &*second),
+            "a timer that fired was kept for the same deadline"
+        );
+    }
+
+    /// A latency timeout that fired before the pass drained the ring is still
+    /// reported after the pass dropped it, so that the reactor makes the pass
+    /// again for the timer it stood for.
+    #[test]
+    fn a_latency_timeout_reaped_by_the_pass_is_still_reported() {
+        let reactor = bare_reactor();
+        let due = Instant::now() + Duration::from_secs(10);
+        reactor
+            .wait(
+                || Some(Duration::from_secs(60)),
+                None,
+                until(due),
+                false,
+                0,
+                || 0,
+            )
+            .unwrap();
+        fire_latency_timer(&reactor);
+        reactor
+            .wait(|| None, None, until(due), false, 0, || 0)
+            .unwrap();
+        assert!(
+            held_latency_timer(&reactor).is_none(),
+            "the pass kept a timeout that fired"
+        );
+        assert!(
+            reactor.latency_timer_fired(),
+            "a timeout the pass drained and dropped went unreported"
+        );
+    }
+
+    /// A latency timeout that fired is reported once: the pass made again
+    /// for it does not report it a second time as it gives it up.
+    #[test]
+    fn a_fired_latency_timeout_is_reported_once() {
+        let reactor = bare_reactor();
+        let due = Instant::now() + Duration::from_secs(10);
+        reactor
+            .wait(
+                || Some(Duration::from_secs(60)),
+                None,
+                until(due),
+                false,
+                0,
+                || 0,
+            )
+            .unwrap();
+        fire_latency_timer(&reactor);
+        assert!(reactor.latency_timer_fired());
+        reactor
+            .wait(|| None, None, until(due), false, 0, || 0)
+            .unwrap();
+        assert!(
+            !reactor.latency_timer_fired(),
+            "the same completion was reported twice"
+        );
+    }
+
+    /// A latency timeout reaped by a pass that already woke the timer it stood
+    /// for is not reported: the pass's own wheel read handled it.
+    #[test]
+    fn a_latency_timeout_for_a_handled_timer_is_not_reported() {
+        let reactor = bare_reactor();
+        let due = Instant::now() + Duration::from_secs(10);
+        reactor
+            .wait(
+                || Some(Duration::from_secs(60)),
+                None,
+                until(due),
+                false,
+                0,
+                || 0,
+            )
+            .unwrap();
+        fire_latency_timer(&reactor);
+        reactor
+            .wait(|| Some(Duration::from_secs(60)), None, None, false, 0, || 0)
+            .unwrap();
+        assert!(
+            !reactor.latency_timer_fired(),
+            "a pass was made again for a timer already woken"
+        );
+    }
+
+    /// What the latency timeout the reactor holds was armed for.
+    fn armed_latency_timeout(reactor: &Reactor) -> Option<Duration> {
+        let held = reactor.latency_timer_src.take()?;
+        let armed = match &*held.source_type() {
+            SourceType::Timeout(ts, _) => Duration::from(ts),
+            _ => unreachable!("the latency timer is a timeout"),
+        };
+        reactor.latency_timer_src.set(Some(held));
+        Some(armed)
+    }
+
+    /// A pass arms the latency timeout for what remains until its deadline as
+    /// it arms it, not for the remaining time it was handed, which was read
+    /// before the drain.
+    #[test]
+    fn a_pass_arms_the_latency_timeout_for_what_remains_when_it_arms() {
+        let reactor = bare_reactor();
+        let due = Instant::now() + Duration::from_millis(1);
+        reactor
+            .wait(
+                || Some(Duration::from_secs(60)),
+                None,
+                Some((due, Duration::from_secs(10))),
+                false,
+                0,
+                || 0,
+            )
+            .unwrap();
+        let armed = armed_latency_timeout(&reactor).expect("armed within the slice");
+        assert!(
+            armed <= Duration::from_millis(1),
+            "armed for {armed:?} rather than what remained"
+        );
+    }
+
+    /// A deadline the pass found further away than the preempt timer, on a
+    /// time read before its drain, is armed when the pass then re-arms the
+    /// preempt timer to fire after it.
+    #[test]
+    fn a_latency_deadline_inside_a_preempt_timer_rearmed_later_is_armed() {
+        let reactor = bare_reactor();
+        let slice = Duration::from_millis(50);
+        let due = Instant::now() + Duration::from_millis(30);
+        reactor
+            .wait(
+                || Some(slice),
+                None,
+                Some((due, Duration::from_millis(55))),
+                false,
+                0,
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(
+            held_latency_timer(&reactor).map(|(_, at)| at),
+            Some(due),
+            "a deadline inside the re-armed preempt timer was left unarmed"
+        );
+    }
+
+    /// A latency timeout armed by a registration after the pass read the
+    /// wheel, as by a waker the pass runs before it drains the rings, is kept
+    /// though the deadline the pass read does not list it, unless that
+    /// deadline is earlier. One armed before the pass began, whose timer is
+    /// gone from the wheel, is given up.
+    #[test]
+    fn a_latency_timeout_armed_after_the_pass_read_the_wheel_is_kept() {
+        let slice = Some(Duration::from_secs(60));
+        let due = Instant::now() + Duration::from_secs(10);
+        let sooner = due - Duration::from_secs(5);
+
+        let reactor = bare_reactor();
+        reactor.begin_pass();
+        reactor.hasten_latency_timer(due).unwrap();
+        reactor.wait(|| slice, None, None, false, 0, || 0).unwrap();
+        assert_eq!(
+            held_latency_timer(&reactor).map(|(_, at)| at),
+            Some(due),
+            "a timeout armed after the wheel was read was given up"
+        );
+
+        let reactor = bare_reactor();
+        reactor.begin_pass();
+        reactor.hasten_latency_timer(due).unwrap();
+        reactor
+            .wait(|| slice, None, until(sooner), false, 0, || 0)
+            .unwrap();
+        assert_eq!(
+            held_latency_timer(&reactor).map(|(_, at)| at),
+            Some(sooner),
+            "a later timeout armed after the wheel was read displaced an earlier one"
+        );
+
+        let reactor = bare_reactor();
+        reactor.hasten_latency_timer(due).unwrap();
+        reactor.begin_pass();
+        reactor.wait(|| slice, None, None, false, 0, || 0).unwrap();
+        assert!(
+            held_latency_timer(&reactor).is_none(),
+            "a timeout for a timer gone from the wheel was kept"
+        );
+    }
+
+    /// A latency timer registered while the pass holds the ring, after the
+    /// pass drained a preempt timeout that fired, is deferred to another
+    /// pass: the preempt timer it would otherwise wait for has fired already.
+    #[test]
+    fn a_latency_timer_is_deferred_past_a_preempt_timer_that_fired() {
+        let reactor = bare_reactor();
+        let slice = Duration::from_millis(1);
+        let preempt = Source::new(
+            IoRequirements::default(),
+            -1,
+            SourceType::Timeout(TimeSpec64::try_from(slice).unwrap(), 0),
+            None,
+            None,
+        );
+        preempt.inner.borrow_mut().wakers.result =
+            Some(Err(io::Error::from_raw_os_error(libc::ETIME)));
+        reactor.latency_preemption_timeout_src.set(Some(preempt));
+        reactor.latency_preemption_armed_for.set(Some(slice));
+        reactor
+            .latency_preemption_fires_by
+            .set(Some(Instant::now()));
+        let ring = reactor.latency_ring.borrow_mut();
+        reactor
+            .hasten_latency_timer(Instant::now() + Duration::from_millis(5))
+            .unwrap();
+        drop(ring);
+        assert!(
+            reactor.take_deferred_latency_timer(),
+            "trusted a preempt timer that had fired"
+        );
+    }
+
+    /// A latency timer is armed at registration only when nothing would end
+    /// the slice by its deadline: not when the timeout armed already comes
+    /// first, and not when the preempt timer does.
+    #[test]
+    fn a_latency_timer_is_hastened_only_when_the_slice_would_outlast_it() {
+        let reactor = bare_reactor();
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(5);
+
+        let preempt = |slice: Duration, fires: Instant| {
+            reactor.latency_preemption_timeout_src.set(Some(Source::new(
+                IoRequirements::default(),
+                -1,
+                SourceType::Timeout(TimeSpec64::try_from(slice).unwrap(), 0),
+                None,
+                None,
+            )));
+            reactor.latency_preemption_armed_for.set(Some(slice));
+            reactor.latency_preemption_fires_by.set(Some(fires));
+        };
+        preempt(Duration::from_millis(1), now + Duration::from_millis(1));
+        reactor.hasten_latency_timer(soon).unwrap();
+        assert!(
+            held_latency_timer(&reactor).is_none(),
+            "armed though the preempt timer ends the slice first"
+        );
+
+        preempt(Duration::from_millis(100), now + Duration::from_millis(100));
+        reactor.hasten_latency_timer(soon).unwrap();
+        let (armed, at) = held_latency_timer(&reactor).expect("the slice outlasts it");
+        assert_eq!(at, soon);
+
+        reactor
+            .hasten_latency_timer(now + Duration::from_millis(50))
+            .unwrap();
+        let (kept, at) = held_latency_timer(&reactor).unwrap();
+        assert!(
+            std::ptr::eq(&*armed, &*kept) && at == soon,
+            "an earlier timeout was replaced"
+        );
+    }
+
     /// The fast path this whole decision exists for.
     #[test]
     fn an_unchanged_preempt_timer_stays_armed_across_waits() {
@@ -4231,12 +4859,16 @@ mod tests {
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
         let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
         let wanted = Duration::from_millis(100);
-        reactor.wait(|| Some(wanted), None, false, 0, || 0).unwrap();
+        reactor
+            .wait(|| Some(wanted), None, None, false, 0, || 0)
+            .unwrap();
         let first = reactor.latency_preemption_timeout_src.take().unwrap();
         let armed = first.inner.clone();
         reactor.latency_preemption_timeout_src.set(Some(first));
         for _ in 0..3 {
-            reactor.wait(|| Some(wanted), None, false, 0, || 0).unwrap();
+            reactor
+                .wait(|| Some(wanted), None, None, false, 0, || 0)
+                .unwrap();
             let held = reactor.latency_preemption_timeout_src.take().unwrap();
             assert!(std::ptr::eq(&*armed, &*held.inner));
             reactor.latency_preemption_timeout_src.set(Some(held));
@@ -4251,12 +4883,19 @@ mod tests {
         let pool = BlockingThreadPool::new(PoolPlacement::Unbound(1), notifier.clone()).unwrap();
         let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
         reactor
-            .wait(|| None, Some(Duration::from_millis(20)), true, 0, || 1)
+            .wait(
+                || None,
+                Some(Duration::from_millis(20)),
+                None,
+                true,
+                0,
+                || 1,
+            )
             .unwrap();
         let held = reactor.latency_preemption_timeout_src.take();
         assert!(held.is_some());
         reactor.latency_preemption_timeout_src.set(held);
-        reactor.wait(|| None, None, false, 0, || 0).unwrap();
+        reactor.wait(|| None, None, None, false, 0, || 0).unwrap();
         assert!(reactor.latency_preemption_timeout_src.take().is_none());
     }
 
@@ -4271,7 +4910,9 @@ mod tests {
         let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
         prepare(&reactor);
         let start = Instant::now();
-        reactor.wait(|| wanted, Some(user), true, 0, || 0).unwrap();
+        reactor
+            .wait(|| wanted, Some(user), None, true, 0, || 0)
+            .unwrap();
         start.elapsed()
     }
 
@@ -4280,7 +4921,14 @@ mod tests {
         let parked = park_after(
             |reactor| {
                 reactor
-                    .wait(|| None, Some(Duration::from_millis(20)), true, 0, || 1)
+                    .wait(
+                        || None,
+                        Some(Duration::from_millis(20)),
+                        None,
+                        true,
+                        0,
+                        || 1,
+                    )
                     .unwrap();
             },
             None,
@@ -4298,7 +4946,7 @@ mod tests {
         let parked = park_after(
             |reactor| {
                 reactor
-                    .wait(|| Some(preempt), None, false, 0, || 0)
+                    .wait(|| Some(preempt), None, None, false, 0, || 0)
                     .unwrap();
             },
             Some(preempt),
@@ -4356,7 +5004,14 @@ mod tests {
             let reactor = Reactor::new(notifier, 0, 128, pool, crate::RecvBuffers::none()).unwrap();
             reactor.install_eventfd();
             sys::test_support::fail_next_submit("latency", libc::EBUSY);
-            let _ = done.send(reactor.wait(|| None, Some(Duration::from_secs(60)), true, 0, || 0));
+            let _ = done.send(reactor.wait(
+                || None,
+                Some(Duration::from_secs(60)),
+                None,
+                true,
+                0,
+                || 0,
+            ));
         });
         let slept = slept
             .recv_timeout(Duration::from_secs(10))
@@ -4383,7 +5038,7 @@ mod tests {
         };
         reactor.install_eventfd();
         assert_eq!(reads(), (1, 0), "(queued, in kernel)");
-        reactor.wait(|| None, None, false, 0, || 0).unwrap();
+        reactor.wait(|| None, None, None, false, 0, || 0).unwrap();
         assert_eq!(reads(), (0, 1), "(queued, in kernel)");
         assert!(reactor.eventfd_src.is_installed().unwrap());
     }

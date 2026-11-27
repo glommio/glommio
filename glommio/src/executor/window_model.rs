@@ -104,9 +104,12 @@
 //!
 //! - Up to five task addresses, three queues and three nested inline polls.
 //!   The main future is abstract: `run` may return wherever it is polled.
-//! - `need_preempt` is set only by the timer and cleared only by `react`; a
-//!   reactor pass delivers its wakes in any order, and the park's own pass is
-//!   folded into the next one. The idle spin pass, `spin_poll_io`, drains the
+//! - `need_preempt` is set only by the preempt timer or by a latency timer's
+//!   timeout on the latency ring, both the model's Timer event, and cleared
+//!   only by `react`. `react` repeats its pass when a latency timer fires
+//!   inside its wait, which only adds wakes to the same pass. A reactor pass
+//!   delivers its wakes in any order, and the park's own pass is folded into
+//!   the next one. The idle spin pass, `spin_poll_io`, drains the
 //!   rings before its timer wakers run, so in the code `need_preempt` reads
 //!   false there while the model keeps it set. Nothing in a pass reads it
 //!   but an inline poll, and an inline poll outside a slice opens no window;

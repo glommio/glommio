@@ -595,6 +595,14 @@ pub enum Latency {
     /// configured with [`LocalExecutorBuilder::preempt_timer`] leaves that
     /// timer as it is. A queue created while another queue's slice runs
     /// shortens the timer from the reactor's next pass, which re-arms it.
+    ///
+    /// A timer registered while a task in such a queue runs, a sleep or an
+    /// I/O timeout, makes [`ExecutorProxy::need_preempt`] true when it comes
+    /// due, so that a queue holding the CPU and yielding on it gives way then
+    /// rather than at the next preemption, however much sooner that is. A
+    /// timer keeps what it was registered as: one first awaited in another
+    /// queue's slice does not do this when a task here awaits it later, and
+    /// one registered outside any slice does whenever such a queue exists.
     Matters(Duration),
 
     /// Tasks marked as `Latency::NotImportant` will not signal to other tasks

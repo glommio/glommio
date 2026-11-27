@@ -6,7 +6,7 @@
 //!
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{btree_map::Entry, BTreeMap},
     fmt,
     future::Future,
@@ -121,12 +121,9 @@ impl Timers {
         self.wheel.process_timers(wakers)
     }
 
-    /// The delay until the next armed timer.
-    fn next_timer(&self) -> Option<Duration> {
-        self.wheel
-            .next_expiries()
-            .0
-            .map(|expires_at| expires_at.saturating_duration_since(Instant::now()))
+    /// When the next timer is due, and when the next latency timer is.
+    fn next_expiries(&self) -> (Option<Instant>, Option<Instant>) {
+        self.wheel.next_expiries()
     }
 }
 
@@ -157,6 +154,10 @@ pub(crate) struct Reactor {
     /// Whether the latency ring has events waiting. Taken once at startup:
     /// `need_preempt` runs constantly and must not borrow the ring to ask.
     preempt_status: CompletionStatus,
+
+    /// Whether any `Latency::Matters` queue exists, which is what a timer
+    /// registered outside a queue's slice is classed by.
+    latency_queues: Cell<bool>,
 }
 
 impl Reactor {
@@ -184,7 +185,22 @@ impl Reactor {
             io_scheduler: Rc::new(IoScheduler::new()),
             record_io_latencies,
             preempt_status,
+            latency_queues: Cell::new(false),
         })
+    }
+
+    /// Says whether any `Latency::Matters` queue exists.
+    pub(crate) fn inform_latency_queues(&self, exist: bool) {
+        self.latency_queues.set(exist);
+    }
+
+    /// Ends the running slice within `latency` of now, that of a queue just
+    /// created, if the preempt timer armed would end it later. The next pass
+    /// arms the preempt timer for the new queue; until then the slice runs
+    /// under the one armed before the queue existed. A submission the kernel
+    /// refuses is left for the next pass to report.
+    pub(crate) fn tighten_preempt_timer(&self, latency: Duration) {
+        let _ = self.sys.tighten_preempt_timer(latency);
     }
 
     pub(crate) fn io_stats(&self) -> IoStats {
@@ -883,14 +899,33 @@ impl Reactor {
     /// many times it cascades between levels.
     ///
     /// A timer registered while a `Latency::Matters` queue runs is a latency
-    /// timer, as I/O submitted then goes to the latency ring.
+    /// timer, as I/O submitted then goes to the latency ring: its deadline
+    /// preempts whatever holds the CPU when it comes due. A submission the
+    /// kernel refuses while arming it is left for the next pass to report.
+    ///
+    /// A timer registered outside any queue's slice of this reactor's
+    /// executor, such as by a waker the reactor runs in its pass, with no
+    /// executor running on the thread, or during another executor's slice,
+    /// would otherwise be classed by whichever queue ran last, and nothing
+    /// tells whose task the waker wakes. So it is a latency timer if any
+    /// latency queue exists: that costs a plain timer at most one preemption
+    /// too many, where the other way a latency queue's timer would go
+    /// unnoticed for a whole slice. A registration that cannot tell whether a
+    /// slice runs is treated alike.
     pub(crate) fn insert_timer(&self, when: Instant, waker: Waker) -> TimerId {
-        let latency = matches!(
-            self.io_scheduler.requirements().latency_req,
-            Latency::Matters(_)
-        );
-        let mut timers = self.timers.borrow_mut();
-        timers.insert(when, waker, latency)
+        let latency = if crate::executor::slice_is_running_on(self) {
+            matches!(
+                self.io_scheduler.requirements().latency_req,
+                Latency::Matters(_)
+            )
+        } else {
+            self.latency_queues.get()
+        };
+        let id = self.timers.borrow_mut().insert(when, waker, latency);
+        if latency {
+            let _ = self.sys.hasten_latency_timer(when);
+        }
+        id
     }
 
     /// Deregisters a timer, handing back its waker if it had not fired.
@@ -977,31 +1012,64 @@ impl Reactor {
         Ok(woke > 0)
     }
 
-    fn process_external_events(&self) -> (Option<Duration>, usize) {
+    /// Wakes what is due, and says how long until the next timer is due,
+    /// when the next latency timer is due and how long until then, and how
+    /// many tasks were woken. The clock is read once for both, and not at all
+    /// when no timer is armed.
+    fn process_external_events(&self) -> (Option<Duration>, Option<(Instant, Duration)>, usize) {
         let mut woke = self.process_timers();
         woke += self.process_shared_channels();
-        (self.timers.borrow().next_timer(), woke)
+        let (next, latency) = self.timers.borrow().next_expiries();
+        let Some(next) = next else {
+            return (None, None, woke);
+        };
+        let now = Instant::now();
+        let until = |at: Instant| at.saturating_duration_since(now);
+        (Some(until(next)), latency.map(|at| (at, until(at))), woke)
     }
 
     /// Processes new events, blocking until the first event or the timeout.
+    ///
+    /// A latency timer due within the `wait` itself fires there, and the
+    /// wait drains its completion with everything else, so nothing would
+    /// preempt the slice that follows for it. The timer it stands for is
+    /// due then, so the pass is made again to wake its task before any
+    /// queue runs. So is a pass in whose wait a waker registered a latency
+    /// timer: the wait read the earliest deadline before running any waker,
+    /// and the ring it held could not be armed for it. Each pass made again
+    /// needs another such timer, so the passes end. A pass made again never
+    /// parks: the one before it did not, and may have woken a task that
+    /// the new pass would not count.
     pub(crate) fn react(
         &self,
         timeout: impl Fn() -> Option<Duration>,
-        may_sleep: bool,
+        mut may_sleep: bool,
     ) -> io::Result<bool> {
-        let (next_timer, woke) = self.process_external_events();
+        loop {
+            self.sys.begin_pass();
+            let (next_timer, latency_timer, woke) = self.process_external_events();
 
-        match self.sys.wait(timeout, next_timer, may_sleep, woke, || {
-            self.process_shared_channels()
-        }) {
-            Ok(true) => {
-                self.process_external_events();
-                Ok(true)
+            match self
+                .sys
+                .wait(&timeout, next_timer, latency_timer, may_sleep, woke, || {
+                    self.process_shared_channels()
+                }) {
+                Ok(true) => {
+                    self.process_external_events();
+                    return Ok(true);
+                }
+
+                Ok(false)
+                    if self.sys.latency_timer_fired() || self.sys.take_deferred_latency_timer() =>
+                {
+                    may_sleep = false;
+                    continue;
+                }
+
+                Ok(false) => return Ok(false),
+
+                Err(err) => return Err(err),
             }
-
-            Ok(false) => Ok(false),
-
-            Err(err) => Err(err),
         }
     }
 

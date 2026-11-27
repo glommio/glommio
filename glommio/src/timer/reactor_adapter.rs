@@ -22,6 +22,14 @@ pub(crate) struct TimerId {
     latency: bool,
 }
 
+#[cfg(test)]
+impl TimerId {
+    /// Whether the timer is among the latency timers.
+    pub(crate) fn is_latency(&self) -> bool {
+        self.latency
+    }
+}
+
 type Wheel = TimingWheel<Waker, Millis>;
 
 #[derive(Debug)]
@@ -129,7 +137,11 @@ impl ReactorTimers {
     /// The latency timers are drained first, so that of the queues woken
     /// together, a latency queue enters the run queue first.
     pub(crate) fn process_timers(&mut self, wakers: &mut Vec<Waker>) {
-        let now = Instant::now();
+        self.process_timers_at(Instant::now(), wakers);
+    }
+
+    /// [`Self::process_timers`], as of `now`.
+    fn process_timers_at(&mut self, now: Instant, wakers: &mut Vec<Waker>) {
         if let Some(latency) = self.latency.as_deref_mut() {
             if self.latency_due.is_some_and(|due| due <= now) {
                 Self::expire(latency, now, &mut self.expired, wakers);
@@ -347,21 +359,20 @@ mod tests {
     fn a_latency_timer_registered_into_an_idle_wheel_fires_when_due() {
         let mut timers = ReactorTimers::new();
         let mut wakers = Vec::new();
-        let first = timers.insert(Instant::now(), dummy_waker(), true);
-        timers.process_timers(&mut wakers);
+        let base = Instant::now();
+        let first = timers.insert(base, dummy_waker(), true);
+        timers.process_timers_at(base + Duration::from_millis(1), &mut wakers);
         assert_eq!(wakers.len(), 1);
         assert!(!timers.contains(first));
         assert_eq!(timers.next_latency_expiry(), None);
 
-        std::thread::sleep(Duration::from_millis(300));
-        let due = Instant::now() + Duration::from_millis(20);
+        let due = base + Duration::from_millis(320);
         timers.insert(due, dummy_waker(), true);
         assert_eq!(timers.next_latency_expiry(), Some(due));
         wakers.clear();
-        timers.process_timers(&mut wakers);
+        timers.process_timers_at(due - Duration::from_millis(1), &mut wakers);
         assert!(wakers.is_empty(), "woken before it was due");
-        std::thread::sleep(Duration::from_millis(25));
-        timers.process_timers(&mut wakers);
+        timers.process_timers_at(due, &mut wakers);
         assert_eq!(wakers.len(), 1, "not woken when due");
         assert_eq!(timers.next_latency_expiry(), None);
     }

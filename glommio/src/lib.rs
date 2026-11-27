@@ -587,6 +587,14 @@ pub enum Latency {
     /// Tasks marked as `Latency::Matters` will cooperatively signal to other
     /// tasks that they should preempt often. The `Duration` argument
     /// contributes to the rate of preemption of the scheduler.
+    ///
+    /// For as long as such a queue exists, runnable or idle, the executor's
+    /// preempt timer is no longer than the `Duration`, so that an event for
+    /// the queue, such as a timer coming due, is noticed within it while
+    /// another queue holds the CPU. A `Duration` longer than the timer
+    /// configured with [`LocalExecutorBuilder::preempt_timer`] leaves that
+    /// timer as it is. A queue created while another queue's slice runs
+    /// shortens the timer from the reactor's next pass, which re-arms it.
     Matters(Duration),
 
     /// Tasks marked as `Latency::NotImportant` will not signal to other tasks

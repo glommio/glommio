@@ -222,7 +222,8 @@ impl DmaStreamReaderState {
     /// Starts reading the buffer at `pos` unless it is past the end, cached
     /// or being read already, and returns whether it did. A read skipped
     /// because another failed still releases and wakes its waiter, which
-    /// then asks for the buffer again.
+    /// then asks for the buffer again. The read holds the state weakly, so
+    /// dropping the reader drops the state, which cancels the read.
     fn fetch_buffer_at(
         &mut self,
         pos: u64,
@@ -240,15 +241,23 @@ impl DmaStreamReaderState {
             return false;
         }
 
+        let read_state = Rc::downgrade(&read_state);
         let pending = crate::spawn_local(async move {
             futures_lite::future::yield_now().await;
 
-            let buffer = if read_state.borrow().error.is_some() {
+            let failed = match read_state.upgrade() {
+                Some(state) => state.borrow().error.is_some(),
+                None => return,
+            };
+            let buffer = if failed {
                 None
             } else {
                 Some(file.read_at_aligned(pos, len as _).await)
             };
 
+            let Some(read_state) = read_state.upgrade() else {
+                return;
+            };
             let mut state = read_state.borrow_mut();
             match buffer {
                 Some(Ok(buf)) => {
@@ -262,6 +271,7 @@ impl DmaStreamReaderState {
             state.pending.remove(&buffer_id);
             let mut wakers = state.wakermap.remove(&buffer_id);
             drop(state);
+            drop(read_state);
             if let Some(w) = wakers.take() {
                 w.wake();
             }
@@ -1742,6 +1752,54 @@ mod test {
             }
             _ => panic!("unexpected success"),
         }
+        reader.close().await.unwrap();
+    });
+
+    file_stream_read_test!(dropping_a_reader_cancels_its_read_ahead, path, _k, file, _file_size: 262144, {
+        let reader = DmaStreamReaderBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_read_ahead(64)
+            .build();
+        let state = Rc::downgrade(&reader.state);
+        let file = Rc::downgrade(&reader.file);
+        drop(reader);
+        assert!(state.upgrade().is_none(), "the read-ahead outlived the reader");
+        futures_lite::future::yield_now().await;
+        assert!(file.upgrade().is_none(), "a cancelled read still holds the file");
+    });
+
+    file_stream_read_test!(dropping_a_reader_cancels_the_reads_it_has_in_flight, path, _k, file, _file_size: 262144, {
+        let reader = DmaStreamReaderBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_read_ahead(64)
+            .build();
+        let file = Rc::downgrade(&reader.file);
+        futures_lite::future::yield_now().await;
+        futures_lite::future::yield_now().await;
+        assert!(
+            reader.state.borrow().buffermap.is_empty(),
+            "a read completed before the reader was dropped"
+        );
+        drop(reader);
+        futures_lite::future::yield_now().await;
+        assert!(file.upgrade().is_none(), "a cancelled read still holds the file");
+    });
+
+    file_stream_read_test!(a_file_reads_after_a_reader_on_it_was_dropped_mid_read_ahead, path, _k, file, file_size: 262144, {
+        let reader = DmaStreamReaderBuilder::new(file)
+            .with_buffer_size(4096)
+            .with_read_ahead(64)
+            .build();
+        futures_lite::future::yield_now().await;
+        futures_lite::future::yield_now().await;
+        drop(reader);
+        Timer::new(Duration::from_millis(10)).await;
+        let file = DmaFile::open(path.join("testfile")).await.unwrap();
+        let mut reader = DmaStreamReaderBuilder::new(file).with_buffer_size(4096).build();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf.len(), file_size);
+        assert!(buf.iter().enumerate().all(|(i, &b)| b == i as u8));
         reader.close().await.unwrap();
     });
 
